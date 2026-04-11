@@ -126,6 +126,27 @@ def main():
                 R_new = R_level @ R_obj
                 obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
 
+    # Align room to axes: rotate around Z so dominant wall direction → X axis
+    # Extract yaw from first object's orientation (it's Manhattan-aligned)
+    if objects:
+        q0 = np.array(objects[0]['orientation']['quaternion'])
+        yaw = SciRot.from_quat(q0).as_euler('xyz')[2]  # Z-rotation
+        # Snap to nearest 90° and compute residual
+        snapped = round(yaw / (np.pi / 2)) * (np.pi / 2)
+        residual = yaw - snapped
+        if abs(residual) > 0.01:  # more than ~0.6° off axis
+            R_align = SciRot.from_euler('z', -residual).as_matrix()
+            print(f"[INFO] Aligning room to axes (rotating {np.degrees(-residual):.1f}° around Z)")
+            merged.rotate(R_align, center=(0, 0, 0))
+            for obj in objects:
+                c = np.array(obj['center'])
+                obj['center'] = (R_align @ c).tolist()
+                if 'orientation' in obj:
+                    q = np.array(obj['orientation']['quaternion'])
+                    R_obj = SciRot.from_quat(q).as_matrix()
+                    R_new = R_align @ R_obj
+                    obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+
     # Save colored map
     map_path = os.path.join(args.output, "colored_map.ply")
     o3d.io.write_point_cloud(map_path, merged)
