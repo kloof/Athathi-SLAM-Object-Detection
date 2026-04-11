@@ -6,9 +6,10 @@ extrinsics (lidar→camera) and intrinsics to produce colored point clouds.
 """
 
 import numpy as np
-import cv2
 import yaml
 from scipy.spatial.transform import Rotation
+
+from cloud_slam.projection import project_lidar_to_camera
 
 
 def load_calibration(intrinsics_path, extrinsics_path):
@@ -89,29 +90,16 @@ def colorize_cloud(xyz, image, calib, default_color=(128, 128, 128)):
     if N == 0:
         return colors
 
-    T = calib['T_lidar_cam']
-    K = calib['K']
-    dist = calib['dist_coeffs']
     H, W = image.shape[:2]
 
-    # Transform to camera frame
-    pts_cam = (T[:3, :3] @ xyz.T + T[:3, 3:4]).T  # (N, 3)
+    # Project lidar points to camera image plane
+    pts_cam, pixels, in_front = project_lidar_to_camera(xyz, calib)
 
-    # Keep only points in front of camera
-    in_front = pts_cam[:, 2] > 0
     if not in_front.any():
         return colors
 
-    # Project to pixels using OpenCV (handles distortion)
-    rvec, _ = cv2.Rodrigues(T[:3, :3])
-    tvec = T[:3, 3]
-    pixels, _ = cv2.projectPoints(
-        xyz[in_front].astype(np.float64), rvec, tvec, K, dist
-    )
-    pixels = pixels.squeeze(1)  # (M, 2)
-
-    u = pixels[:, 0]
-    v = pixels[:, 1]
+    u = pixels[in_front, 0]
+    v = pixels[in_front, 1]
     in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
 
     if not in_bounds.any():

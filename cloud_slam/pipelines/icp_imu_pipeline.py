@@ -36,7 +36,7 @@ def register_scan_to_map(scan, map_cloud, T_init, voxel_size=0.1):
     return result.transformation, result.fitness > 0.1
 
 
-def run(clouds, imus, voxel_size=0.005, images=None, calib=None):
+def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callback=None):
     """
     Process point cloud frames with ICP + IMU.
 
@@ -46,6 +46,8 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None):
         voxel_size: final downsample resolution in meters
         images: list of (timestamp, compressed_bytes, format_str) or None
         calib: dict from colorizer.load_calibration() or None
+        per_frame_callback: optional callable(frame_idx, stamp, xyz, pose, image)
+            Called after each frame's pose is computed. image may be None.
 
     Returns:
         merged: Open3D PointCloud (with colors if images+calib provided)
@@ -57,12 +59,14 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None):
     imu_times = np.array([t for t, _, _ in imus])
     imu_gyro = np.array([g for _, g, _ in imus])
 
-    # Build image timestamp index for color projection
-    do_color = images is not None and calib is not None and len(images) > 0
-    if do_color:
+    # Build image timestamp index for color projection or callback
+    need_images = images is not None and calib is not None and len(images) > 0
+    do_color = need_images
+    if need_images or per_frame_callback is not None:
         import cv2
+        image_timestamps = np.array([t for t, _, _ in images]) if images else np.array([])
+    if do_color:
         from cloud_slam.colorizer import colorize_cloud, match_nearest_image
-        image_timestamps = np.array([t for t, _, _ in images])
         color_match_count = 0
 
     merged = o3d.geometry.PointCloud()
@@ -77,17 +81,21 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None):
         scan = o3d.geometry.PointCloud()
         scan.points = o3d.utility.Vector3dVector(xyz)
 
-        # Colorize from camera if available
-        if do_color:
+        # Decode camera image if needed for color or callback
+        decoded_image = None
+        if (do_color or per_frame_callback) and len(image_timestamps) > 0:
+            from cloud_slam.colorizer import match_nearest_image
             img_idx = match_nearest_image(stamp, image_timestamps)
             if img_idx is not None:
                 _, compressed_bytes, _ = images[img_idx]
                 img_arr = np.frombuffer(compressed_bytes, dtype=np.uint8)
-                image = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
-                if image is not None:
-                    colors = colorize_cloud(xyz, image, calib)
-                    scan.colors = o3d.utility.Vector3dVector(colors)
-                    color_match_count += 1
+                decoded_image = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+
+        # Colorize from camera if available
+        if do_color and decoded_image is not None:
+            colors = colorize_cloud(xyz, decoded_image, calib)
+            scan.colors = o3d.utility.Vector3dVector(colors)
+            color_match_count += 1
 
         if len(scan.points) < 10:
             poses.append(T_current.copy())
@@ -126,6 +134,10 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None):
 
         poses.append(T_current.copy())
         prev_stamp = stamp
+
+        # Per-frame callback (after pose is finalized)
+        if per_frame_callback:
+            per_frame_callback(i, stamp, xyz, T_current, decoded_image)
 
     t_slam = time.time() - t0
 

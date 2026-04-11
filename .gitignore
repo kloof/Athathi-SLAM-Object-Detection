@@ -9,3 +9,8 @@ __pycache__/
 *.mcap
 data/slam_output/
 data/scan_002/
+
+# Model weights
+*.pt
+*.ts
+*.onnx
