@@ -7,7 +7,7 @@ and produces a merged point cloud using scan-to-scan ICP registration.
 
 This is MUCH faster than playing the bag through ROS2.
 
-Usage: python3 fast_process.py /path/to/rosbag_dir /path/to/output_dir
+Usage: python3 fast_process.py /path/to/rosbag_dir /path/to/output_dir [/path/to/calibration_dir]
 """
 
 import os
@@ -97,12 +97,19 @@ def register_scan_to_map(scan, map_cloud, T_init, voxel_size=0.1):
     return result.transformation, result.fitness > 0.1
 
 
-def process_with_imu_integration(cloud_msgs, imu_msgs):
+def process_with_imu_integration(cloud_msgs, imu_msgs, camera_imgs=None, calib=None):
     """
     Simple IMU-aided scan matching.
     Uses IMU for initial transform guess, then refines with ICP.
     """
     print(f"[INFO] Processing {len(cloud_msgs)} scans with {len(imu_msgs)} IMU messages")
+
+    do_color = camera_imgs is not None and calib is not None and len(camera_imgs) > 0
+    if do_color:
+        import cv2 as _cv2
+        from cloud_slam.colorizer import colorize_cloud, match_nearest_image
+        image_timestamps = np.array([t for t, _, _ in camera_imgs])
+        print(f"[INFO] Color projection enabled ({len(camera_imgs)} images)")
 
     # Sort by timestamp
     def get_stamp(msg):
@@ -130,6 +137,19 @@ def process_with_imu_integration(cloud_msgs, imu_msgs):
     for i, cloud_msg in enumerate(cloud_msgs):
         stamp = get_stamp(cloud_msg)
         scan = pointcloud2_to_o3d(cloud_msg)
+
+        # Colorize from camera if available
+        if do_color and len(scan.points) > 0:
+            import cv2 as _cv2
+            img_idx = match_nearest_image(stamp, image_timestamps)
+            if img_idx is not None:
+                _, compressed_bytes, _ = camera_imgs[img_idx]
+                img_arr = np.frombuffer(compressed_bytes, dtype=np.uint8)
+                image = _cv2.imdecode(img_arr, _cv2.IMREAD_COLOR)
+                if image is not None:
+                    xyz = np.asarray(scan.points)
+                    colors = colorize_cloud(xyz, image, calib)
+                    scan.colors = o3d.utility.Vector3dVector(colors)
 
         if len(scan.points) < 10:
             poses.append(T_current.copy())
@@ -189,16 +209,29 @@ def process_with_imu_integration(cloud_msgs, imu_msgs):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 fast_process.py /path/to/rosbag_dir /path/to/output_dir")
+        print("Usage: python3 fast_process.py /path/to/rosbag_dir /path/to/output_dir [/path/to/calibration_dir]")
         sys.exit(1)
 
     bag_dir = sys.argv[1]
     output_dir = sys.argv[2]
+    calibration_dir = sys.argv[3] if len(sys.argv) > 3 else None
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 60)
     print("  Fast Direct MCAP Processing (no ROS2 playback)")
     print("=" * 60)
+
+    # Load calibration for color projection
+    calib = None
+    if calibration_dir:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from cloud_slam.colorizer import load_calibration, colorize_cloud, match_nearest_image
+        intr = os.path.join(calibration_dir, "intrinsics.yaml")
+        extr = os.path.join(calibration_dir, "extrinsics.yaml")
+        if os.path.exists(intr) and os.path.exists(extr):
+            calib = load_calibration(intr, extr)
+            print(f"[INFO] Loaded camera calibration from {calibration_dir}")
+            import cv2
 
     # Read all messages at once (instant — no playback delay)
     t0 = time.time()
@@ -207,8 +240,26 @@ def main():
     t_read = time.time() - t0
     print(f"[INFO] Read {len(cloud_msgs)} clouds + {len(imu_msgs)} IMU in {t_read:.1f}s")
 
+    # Read camera images if calibration provided
+    camera_imgs = []
+    if calib:
+        from mcap_ros2.reader import read_ros2_messages as read_ros2
+        bag_path = Path(bag_dir)
+        for mcap_file in sorted(bag_path.glob("*.mcap")):
+            for msg in read_ros2(str(mcap_file)):
+                if msg.channel.topic == "/camera/image_raw/compressed":
+                    ros_msg = msg.ros_msg
+                    stamp = ros_msg.header.stamp.sec + ros_msg.header.stamp.nanosec * 1e-9
+                    camera_imgs.append((stamp, bytes(ros_msg.data), ros_msg.format))
+        camera_imgs.sort(key=lambda x: x[0])
+        print(f"[INFO] Read {len(camera_imgs)} camera images")
+
     # Process
-    merged, poses = process_with_imu_integration(cloud_msgs, imu_msgs)
+    merged, poses = process_with_imu_integration(
+        cloud_msgs, imu_msgs,
+        camera_imgs=camera_imgs if calib else None,
+        calib=calib
+    )
 
     # Downsample and clean
     print("[INFO] Downsampling at 5mm...")

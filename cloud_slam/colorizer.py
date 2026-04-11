@@ -1,0 +1,132 @@
+"""
+Camera-to-LiDAR color projection.
+
+Projects camera images onto lidar point clouds using calibrated
+extrinsics (lidar→camera) and intrinsics to produce colored point clouds.
+"""
+
+import numpy as np
+import cv2
+import yaml
+from scipy.spatial.transform import Rotation
+
+
+def load_calibration(intrinsics_path, extrinsics_path):
+    """
+    Load camera intrinsics and lidar→camera extrinsics from YAML files.
+
+    Returns dict with keys:
+        K:           (3,3) camera matrix
+        dist_coeffs: (5,) distortion coefficients
+        T_lidar_cam: (4,4) homogeneous transform lidar→camera
+        image_size:  (width, height)
+    """
+    with open(intrinsics_path) as f:
+        intr = yaml.safe_load(f)
+
+    with open(extrinsics_path) as f:
+        ext = yaml.safe_load(f)
+
+    K = np.array(intr['camera_matrix']['data'], dtype=np.float64).reshape(3, 3)
+    dist_coeffs = np.array(intr['distortion_coefficients']['data'], dtype=np.float64)
+    image_size = (intr['image_width'], intr['image_height'])
+
+    # Quaternion: YAML has (w,x,y,z), scipy wants (x,y,z,w)
+    q = ext['rotation']
+    quat = [q['x'], q['y'], q['z'], q['w']]
+    R = Rotation.from_quat(quat).as_matrix()
+    t = np.array([ext['translation']['x'], ext['translation']['y'], ext['translation']['z']])
+
+    T_lidar_cam = np.eye(4)
+    T_lidar_cam[:3, :3] = R
+    T_lidar_cam[:3, 3] = t
+
+    return {
+        'K': K,
+        'dist_coeffs': dist_coeffs,
+        'T_lidar_cam': T_lidar_cam,
+        'image_size': image_size,
+    }
+
+
+def match_nearest_image(cloud_stamp, image_timestamps, max_dt=0.15):
+    """
+    Find the nearest image timestamp to a cloud timestamp.
+    Returns index into image_timestamps, or None if beyond max_dt.
+    """
+    idx = np.searchsorted(image_timestamps, cloud_stamp)
+    candidates = []
+    if idx > 0:
+        candidates.append(idx - 1)
+    if idx < len(image_timestamps):
+        candidates.append(idx)
+
+    if not candidates:
+        return None
+
+    best = min(candidates, key=lambda i: abs(image_timestamps[i] - cloud_stamp))
+    if abs(image_timestamps[best] - cloud_stamp) > max_dt:
+        return None
+    return best
+
+
+def colorize_cloud(xyz, image, calib, default_color=(128, 128, 128)):
+    """
+    Project lidar points into camera image and sample RGB colors.
+
+    Args:
+        xyz:     (N, 3) float64, points in lidar frame
+        image:   (H, W, 3) uint8 BGR image from cv2
+        calib:   dict from load_calibration()
+        default_color: RGB tuple [0-255] for points outside camera FOV
+
+    Returns:
+        colors: (N, 3) float64 in [0, 1] range (Open3D convention)
+    """
+    N = len(xyz)
+    colors = np.full((N, 3), np.array(default_color, dtype=np.float64) / 255.0)
+
+    if N == 0:
+        return colors
+
+    T = calib['T_lidar_cam']
+    K = calib['K']
+    dist = calib['dist_coeffs']
+    H, W = image.shape[:2]
+
+    # Transform to camera frame
+    pts_cam = (T[:3, :3] @ xyz.T + T[:3, 3:4]).T  # (N, 3)
+
+    # Keep only points in front of camera
+    in_front = pts_cam[:, 2] > 0
+    if not in_front.any():
+        return colors
+
+    # Project to pixels using OpenCV (handles distortion)
+    rvec, _ = cv2.Rodrigues(T[:3, :3])
+    tvec = T[:3, 3]
+    pixels, _ = cv2.projectPoints(
+        xyz[in_front].astype(np.float64), rvec, tvec, K, dist
+    )
+    pixels = pixels.squeeze(1)  # (M, 2)
+
+    u = pixels[:, 0]
+    v = pixels[:, 1]
+    in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+    if not in_bounds.any():
+        return colors
+
+    ui = u[in_bounds].astype(int)
+    vi = v[in_bounds].astype(int)
+
+    # Sample BGR, convert to RGB, scale to [0,1]
+    bgr = image[vi, ui]  # (M', 3)
+    rgb = bgr[:, ::-1].astype(np.float64) / 255.0
+
+    # Map back through masks
+    idx_front = np.where(in_front)[0]
+    idx_visible = idx_front[in_bounds]
+    colors[idx_visible] = rgb
+
+    return colors

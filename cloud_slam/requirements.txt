@@ -6,3 +6,5 @@ fastapi>=0.100.0
 uvicorn>=0.25.0
 python-multipart>=0.0.6
 google-cloud-storage>=2.14.0
+opencv-python-headless>=4.8.0
+PyYAML>=6.0

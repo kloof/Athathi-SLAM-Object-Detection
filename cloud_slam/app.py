@@ -77,7 +77,8 @@ def generate_upload_url(blob_name):
     return url
 
 
-def process_mcap_file(mcap_local_path, job_id, voxel_size, output_format, t_start, extra_stats=None):
+def process_mcap_file(mcap_local_path, job_id, voxel_size, output_format, t_start,
+                      extra_stats=None, calibration_dir=None):
     """Core processing logic shared by both upload paths."""
     tmpdir = str(Path(mcap_local_path).parent)
 
@@ -98,14 +99,26 @@ def process_mcap_file(mcap_local_path, job_id, voxel_size, output_format, t_star
     t_decompress = time.time() - t_start
 
     # Read MCAP
-    clouds, imus = read_mcap(raw_path)
+    clouds, imus, images = read_mcap(raw_path)
     if not clouds:
         raise HTTPException(400, "No point cloud data found in MCAP file")
 
     t_read = time.time() - t_start
 
+    # Load calibration for color projection if available
+    calib = None
+    if images and calibration_dir:
+        from cloud_slam.colorizer import load_calibration
+        intr = os.path.join(calibration_dir, "intrinsics.yaml")
+        extr = os.path.join(calibration_dir, "extrinsics.yaml")
+        if os.path.exists(intr) and os.path.exists(extr):
+            calib = load_calibration(intr, extr)
+
     # Run SLAM
-    merged, poses, stats = icp_imu_pipeline.run(clouds, imus, voxel_size=voxel_size)
+    merged, poses, stats = icp_imu_pipeline.run(
+        clouds, imus, voxel_size=voxel_size,
+        images=images if calib else None, calib=calib
+    )
 
     # Write output
     import open3d as o3d

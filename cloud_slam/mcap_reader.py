@@ -18,7 +18,7 @@ PC_DTYPE = np.dtype({
 
 def read_mcap(mcap_path):
     """
-    Read an MCAP file and return cloud frames + IMU data.
+    Read an MCAP file and return cloud frames, IMU data, and camera images.
 
     Args:
         mcap_path: Path to .mcap file or directory containing .mcap files
@@ -26,6 +26,7 @@ def read_mcap(mcap_path):
     Returns:
         clouds: list of (timestamp, xyz_Nx3_float64, time_offsets_N_float64)
         imus: list of (timestamp, gyro_xyz_3, acc_xyz_3)
+        images: list of (timestamp, compressed_bytes, format_str)
     """
     from mcap_ros2.reader import read_ros2_messages
 
@@ -40,6 +41,7 @@ def read_mcap(mcap_path):
 
     clouds = []
     imus = []
+    images = []
 
     for mcap_file in mcap_files:
         for msg in read_ros2_messages(str(mcap_file)):
@@ -68,6 +70,12 @@ def read_mcap(mcap_path):
                 ])
                 imus.append((stamp, gyro, acc))
 
+            elif msg.channel.topic == "/camera/image_raw/compressed":
+                ros_msg = msg.ros_msg
+                stamp = ros_msg.header.stamp.sec + ros_msg.header.stamp.nanosec * 1e-9
+                images.append((stamp, bytes(ros_msg.data), ros_msg.format))
+
     clouds.sort(key=lambda x: x[0])
     imus.sort(key=lambda x: x[0])
-    return clouds, imus
+    images.sort(key=lambda x: x[0])
+    return clouds, imus, images
