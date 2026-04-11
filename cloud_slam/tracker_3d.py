@@ -138,29 +138,21 @@ class ObjectTracker3D:
         for tid in merged:
             del self.objects[tid]
 
-    def get_final_objects(self, gravity_up=None):
+    def get_final_objects(self, **kwargs):
         """
         Get finalized object list. Only returns confirmed objects (3+ observations).
-
-        Args:
-            gravity_up: (3,) unit vector for gravity-aligned OBB fitting
+        OBB fitting is deferred to box_refiner for single-pass computation.
 
         Returns:
-            list of dicts with object properties
+            list of dicts with object properties (no OBB yet — added by refiner)
         """
-        from cloud_slam.frustum import fit_gravity_aligned_obb
-
-        if gravity_up is None:
-            gravity_up = np.array([0.0, 0.0, 1.0])
-
         results = []
         for tid, obj in self.objects.items():
             if obj.status != 'confirmed':
                 continue
 
             pts = obj.get_accumulated_points()
-            obb = fit_gravity_aligned_obb(pts, gravity_up)
-            if obb is None:
+            if len(pts) < 10:
                 continue
 
             results.append({
@@ -168,13 +160,7 @@ class ObjectTracker3D:
                 'class': obj.class_name,
                 'confidence': float(max(obj.class_votes.values()) / obj.observation_count),
                 'center': obj.x.tolist(),
-                'dimensions': obb['dimensions'].tolist(),
-                'orientation': {
-                    'quaternion': obb['rotation_quat_xyzw'].tolist(),
-                    'format': 'xyzw',
-                },
-                'obb_confidence': obb['confidence'],
-                'num_points': obb['num_points'],
+                'num_points': len(pts),
                 'num_observations': obj.observation_count,
                 'first_frame': obj.first_frame,
                 'last_frame': obj.last_frame,

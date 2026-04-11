@@ -112,9 +112,20 @@ def estimate_gravity(imus, n_samples=50):
     acc_samples = np.array([acc for _, _, acc in imus[:n]])
     gravity = acc_samples.mean(axis=0)
     norm = np.linalg.norm(gravity)
-    if norm < 1e-6:
+
+    if norm < 5.0 or norm > 15.0:
+        # Unusual magnitude — fall back to Z-up
         return np.array([0.0, 0.0, 1.0])
-    return gravity / norm
+
+    gravity_up = gravity / norm
+
+    # IMU convention check: accelerometer at rest should report the support
+    # force (pointing UP). Some IMUs report gravity direction (pointing DOWN).
+    # For a roughly-upright sensor, gravity_up.z should be positive.
+    if gravity_up[2] < 0:
+        gravity_up = -gravity_up
+
+    return gravity_up
 
 
 def fit_gravity_aligned_obb(points, gravity_up, min_points=10):
@@ -177,8 +188,10 @@ def fit_gravity_aligned_obb(points, gravity_up, min_points=10):
     else:
         center_2d = np.asarray(obb_2d.center)[:2]
         extent_2d = np.asarray(obb_2d.extent)[:2]
-        # Extract yaw from the OBB rotation
-        R_obb = np.asarray(obb_2d.R)
+        # Extract yaw from the OBB rotation (fix det=-1 from Open3D)
+        R_obb = np.asarray(obb_2d.R).copy()
+        if np.linalg.det(R_obb) < 0:
+            R_obb[:, 2] *= -1
         yaw = np.arctan2(R_obb[1, 0], R_obb[0, 0])
 
     # Z range

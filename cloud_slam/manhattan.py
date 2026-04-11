@@ -90,6 +90,10 @@ def estimate_manhattan_frame(walls, gravity_up):
     ax0 = np.cross(ax1, ax2)
 
     R = np.column_stack([ax0, ax1, ax2])  # columns = Manhattan axes in world
+    # Ensure proper rotation (det=+1), not reflection
+    if np.linalg.det(R) < 0:
+        ax1 = -ax1
+        R = np.column_stack([ax0, ax1, ax2])
     R_world_to_manhattan = R.T  # rows = Manhattan axes
 
     return ManhattanFrame(R=R_world_to_manhattan, confidence=confidence)
@@ -139,7 +143,10 @@ def fit_manhattan_obb(points, manhattan_frame, min_points=10):
         center_m = (mins + maxs) / 2
         dims = np.maximum(maxs - mins, 0.02)
         center_w = R.T @ center_m
-        quat = Rotation.from_matrix(R.T).as_quat()  # (x,y,z,w)
+        R_inv = R.T.copy()
+        if np.linalg.det(R_inv) < 0:
+            R_inv[:, 2] *= -1
+        quat = Rotation.from_matrix(R_inv).as_quat()  # (x,y,z,w)
         return {
             'center': center_w,
             'dimensions': dims,
@@ -171,18 +178,20 @@ def fit_manhattan_obb(points, manhattan_frame, min_points=10):
 
             if swap:
                 # Undo the swap for center
-                center_m = np.array([-center_test[1], center_test[0], center_test[2]])
+                center_m = np.array([center_test[1], -center_test[0], center_test[2]])
                 # Additional 90° rotation around Z
                 R_extra = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float)
                 R_total = R.T @ R_extra.T
                 # Dimensions: swapped back
-                dims_out = np.array([dims[1], dims[0], dims[2]])
+                dims_out = dims.copy()
             else:
                 center_m = center_test
                 R_total = R.T
                 dims_out = dims
 
             center_w = R.T @ center_m
+            if np.linalg.det(R_total) < 0:
+                R_total[:, 2] *= -1
             quat = Rotation.from_matrix(R_total).as_quat()
 
             best_result = {

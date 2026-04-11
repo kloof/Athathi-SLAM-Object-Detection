@@ -32,7 +32,7 @@ class RoomStructure:
 
 
 def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
-                distance_threshold=0.02, max_walls=8, min_inlier_ratio=0.01):
+                distance_threshold=None, max_walls=8, min_inlier_ratio=0.01):
     """
     Detect room structure from merged point cloud.
 
@@ -49,6 +49,10 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
     """
     if gravity_up is None:
         gravity_up = np.array([0., 0., 1.])
+
+    # Default RANSAC threshold matches voxel quantization
+    if distance_threshold is None:
+        distance_threshold = voxel_size
 
     # Downsample for fast RANSAC
     pcd = merged_pcd.voxel_down_sample(voxel_size)
@@ -76,26 +80,37 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
         horiz_pcd = pcd.select_by_index(horiz_indices)
         horiz_pts = points[horiz_indices]
 
-        # Heights along gravity axis
-        heights = horiz_pts @ gravity_up
+        # Find ALL horizontal plane candidates, pick the LOWEST as floor
+        floor_candidates = []
+        remaining_horiz = horiz_pcd
+        for _ in range(5):
+            if len(remaining_horiz.points) < 100:
+                break
+            candidate = _ransac_plane(remaining_horiz, distance_threshold)
+            if candidate is None or candidate.num_inliers < 100:
+                break
+            floor_candidates.append(candidate)
+            remaining_horiz = _remove_plane_inliers(
+                remaining_horiz, candidate, distance_threshold
+            )
 
-        # Floor = dominant horizontal plane at lowest height
-        floor_plane = _ransac_plane(horiz_pcd, distance_threshold)
-        if floor_plane is not None:
+        if floor_candidates:
+            # Sort by height along gravity — lowest first
+            floor_candidates.sort(key=lambda p: p.centroid @ gravity_up)
+            floor_plane = floor_candidates[0]
             floor_h = floor_plane.centroid @ gravity_up
             result.floor = floor_plane
             result.floor_height = float(floor_h)
 
-            # Remove floor inliers, look for ceiling
-            remaining_horiz = horiz_pts[heights > floor_h + 1.5]
-            if len(remaining_horiz) > 50:
-                ceil_pcd = o3d.geometry.PointCloud()
-                ceil_pcd.points = o3d.utility.Vector3dVector(remaining_horiz)
-                ceil_plane = _ransac_plane(ceil_pcd, distance_threshold)
-                if ceil_plane is not None:
-                    ceil_h = ceil_plane.centroid @ gravity_up
-                    result.ceiling = ceil_plane
-                    result.ceiling_height = float(ceil_h)
+            # Ceiling = highest horizontal plane above floor + 1.0m
+            ceil_candidates = [
+                p for p in floor_candidates[1:]
+                if (p.centroid @ gravity_up) > floor_h + 1.0
+            ]
+            if ceil_candidates:
+                ceil_plane = max(ceil_candidates, key=lambda p: p.centroid @ gravity_up)
+                result.ceiling = ceil_plane
+                result.ceiling_height = float(ceil_plane.centroid @ gravity_up)
 
     # --- Detect walls from vertical points ---
     vert_indices = np.where(vertical_mask)[0]

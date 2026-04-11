@@ -7,6 +7,7 @@ and constraint-based post-processing to produce clean 3D bounding boxes.
 
 import numpy as np
 import open3d as o3d
+from scipy.spatial.transform import Rotation
 
 from cloud_slam.room_structure import detect_room
 from cloud_slam.manhattan import estimate_manhattan_frame, fit_manhattan_obb
@@ -82,14 +83,20 @@ def refine_objects(merged_pcd, objects_raw, imus, tracker):
             continue
 
         # 3c. Assign width/depth/height from OBB dimensions
-        raw_dims = obb['dimensions']
-        # For Manhattan OBB, dims are already in Manhattan frame order
-        # Height is the gravity-aligned dimension (last in Manhattan frame)
-        ordered_dims = np.array([
-            max(raw_dims[0], raw_dims[1]),  # width = larger horizontal
-            min(raw_dims[0], raw_dims[1]),  # depth = smaller horizontal
-            raw_dims[2],                     # height = vertical
-        ])
+        # If width < depth, swap and rotate quaternion 90° to compensate
+        raw_dims = obb['dimensions'].copy()
+        quat = obb['rotation_quat_xyzw'].copy()
+
+        if raw_dims[1] > raw_dims[0]:
+            # Swap width/depth and rotate quaternion 90° around Z
+            ordered_dims = np.array([raw_dims[1], raw_dims[0], raw_dims[2]])
+            R_box = Rotation.from_quat(quat).as_matrix()
+            R_swap = Rotation.from_euler('z', np.pi / 2).as_matrix()
+            quat = Rotation.from_matrix(R_box @ R_swap).as_quat()
+        else:
+            ordered_dims = np.array([raw_dims[0], raw_dims[1], raw_dims[2]])
+
+        obb['rotation_quat_xyzw'] = quat
 
         # 3d. Bayesian size refinement
         num_points = obj.get('num_points', len(pts))
@@ -122,7 +129,7 @@ def refine_objects(merged_pcd, objects_raw, imus, tracker):
 
     # Step 4: Global post-processing
     if room.floor is not None:
-        refined = _snap_to_floor(refined, room.floor_height)
+        refined = _snap_to_floor(refined, room.floor_height, gravity_up)
 
     if room.walls:
         refined = _snap_to_walls(refined, room.walls)
@@ -133,7 +140,7 @@ def refine_objects(merged_pcd, objects_raw, imus, tracker):
     return refined
 
 
-def _dbscan_filter(points, eps=0.05, min_points=5):
+def _dbscan_filter(points, eps=0.10, min_points=3):
     """Keep only the largest DBSCAN cluster."""
     if len(points) < min_points * 2:
         return points
@@ -150,7 +157,7 @@ def _dbscan_filter(points, eps=0.05, min_points=5):
     return points[labels == largest]
 
 
-def _snap_to_floor(objects, floor_height, max_gap=0.20):
+def _snap_to_floor(objects, floor_height, gravity_up, max_gap=0.20):
     """Snap floor-contact objects so bottom face touches floor."""
     for obj in objects:
         if not is_floor_contact(obj.get('class', '')):
@@ -159,11 +166,16 @@ def _snap_to_floor(objects, floor_height, max_gap=0.20):
         dims = np.array(obj['dimensions'])
         center = np.array(obj['center'])
         height = dims[2]
-        current_bottom = center[2] - height / 2
+
+        # Project center onto gravity axis (not hardcoded Z)
+        center_h = float(center @ gravity_up)
+        current_bottom = center_h - height / 2
 
         gap = abs(current_bottom - floor_height)
         if gap < max_gap:
-            center[2] = floor_height + height / 2
+            target_h = floor_height + height / 2
+            shift = target_h - center_h
+            center += shift * gravity_up
             obj['center'] = center.tolist()
 
     return objects
