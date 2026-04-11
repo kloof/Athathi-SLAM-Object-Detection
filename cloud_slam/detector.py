@@ -11,6 +11,7 @@ from dataclasses import dataclass
 DEFAULT_CLASSES = [
     "person", "chair", "table", "desk", "sofa", "bed",
     "shelf", "door", "monitor", "lamp", "plant",
+    "cabinet", "wardrobe",
 ]
 
 
@@ -96,4 +97,37 @@ class YOLODetector:
                 mask=mask,
             ))
 
+        return _cross_class_nms(detections)
+
+
+def _cross_class_nms(detections, iou_threshold=0.5):
+    """Suppress duplicate detections on the same object across classes."""
+    if len(detections) <= 1:
         return detections
+
+    # Sort by confidence descending
+    detections.sort(key=lambda d: -d.confidence)
+    keep = [True] * len(detections)
+
+    for i in range(len(detections)):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, len(detections)):
+            if not keep[j]:
+                continue
+            if _bbox_iou(detections[i].bbox_xyxy, detections[j].bbox_xyxy) > iou_threshold:
+                keep[j] = False
+
+    return [d for d, k in zip(detections, keep) if k]
+
+
+def _bbox_iou(a, b):
+    """Compute IoU between two [x1,y1,x2,y2] bboxes."""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / max(area_a + area_b - inter, 1e-6)

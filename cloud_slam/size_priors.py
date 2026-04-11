@@ -22,13 +22,15 @@ SIZE_PRIORS = {
     "person":  {"mean": [0.45, 0.30, 1.70], "std": [0.10, 0.10, 0.20]},
     "lamp":    {"mean": [0.30, 0.30, 0.50], "std": [0.15, 0.15, 0.30]},
     "plant":   {"mean": [0.40, 0.40, 0.60], "std": [0.20, 0.20, 0.40]},
+    "cabinet": {"mean": [0.80, 0.45, 0.90], "std": [0.30, 0.15, 0.30]},
+    "wardrobe":{"mean": [1.20, 0.60, 1.80], "std": [0.40, 0.15, 0.30]},
 }
 
 # Classes that sit on the floor
-FLOOR_CONTACT = {"chair", "table", "desk", "sofa", "bed", "shelf", "door", "person", "plant"}
+FLOOR_CONTACT = {"chair", "table", "desk", "sofa", "bed", "shelf", "door", "person", "plant", "cabinet", "wardrobe"}
 
 # Classes that typically sit against a wall
-WALL_ADJACENT = {"shelf", "desk", "monitor", "door"}
+WALL_ADJACENT = {"shelf", "desk", "monitor", "door", "cabinet", "wardrobe"}
 
 
 def assign_dimensions(obb_dims, obb_rotation, gravity_up):
@@ -83,15 +85,24 @@ def refine_dimensions(observed, class_name, num_points=100, confidence=0.5):
     prior_std = np.array(prior["std"])
 
     # Observation uncertainty: inversely proportional to sqrt(points) and confidence
-    point_factor = max(1.0, np.sqrt(num_points / 50.0))
+    # Cap at 3.0 so prior maintains >=50% weight even with many points
+    point_factor = min(3.0, max(1.0, np.log1p(num_points / 30.0)))
     conf_factor = max(0.3, confidence)
-    obs_std = (0.3 * np.maximum(observed, 0.05)) / (point_factor * conf_factor)
-    obs_std = np.maximum(obs_std, 0.05)  # floor at 5cm
+    # Use max(observed, prior_mean) so undersized observations (from aggressive
+    # structural filtering) don't get artificially high precision
+    obs_scale = np.maximum(observed, prior_mean)
+    obs_std = (0.3 * np.maximum(obs_scale, 0.05)) / (point_factor * conf_factor)
+    obs_std = np.maximum(obs_std, prior_std)  # floor at prior std (equal weight minimum)
 
     # Bayesian: posterior = weighted combination
     prior_prec = 1.0 / (prior_std ** 2)
     obs_prec = 1.0 / (obs_std ** 2)
     posterior_mean = (prior_prec * prior_mean + obs_prec * observed) / (prior_prec + obs_prec)
+
+    # Hard clamp to ±3σ — prevents physically impossible dimensions
+    dim_min = np.maximum(prior_mean - 3.0 * prior_std, 0.02)
+    dim_max = prior_mean + 3.0 * prior_std
+    posterior_mean = np.clip(posterior_mean, dim_min, dim_max)
 
     sigma_dev = (observed - prior_mean) / prior_std
 
@@ -117,6 +128,7 @@ def validate_dimensions(dims, class_name, sigma_threshold=3.0):
         "chair": 0.05, "table": 0.05, "desk": 0.05, "sofa": 0.10,
         "bed": 0.10, "shelf": 0.02, "monitor": 0.001, "door": 0.01,
         "person": 0.02, "lamp": 0.005, "plant": 0.005,
+        "cabinet": 0.05, "wardrobe": 0.10,
     }
     min_vol = min_volumes.get(class_name, 0.01)
     if volume < min_vol:
@@ -130,15 +142,17 @@ def validate_dimensions(dims, class_name, sigma_threshold=3.0):
     prior_std = np.array(prior["std"])
 
     bad_count = 0
+    worst_dev = 0.0
     for i in range(3):
         dev = abs(dims[i] - prior_mean[i]) / prior_std[i]
+        worst_dev = max(worst_dev, dev)
         if dev > sigma_threshold:
             bad_count += 1
 
-    if bad_count >= 3:
-        return False, f"all dimensions deviate > {sigma_threshold}σ from {class_name} prior"
-    if bad_count >= 2 and np.max(np.abs((dims - prior_mean) / prior_std)) > 5.0:
-        return False, f"multiple extreme deviations for {class_name}"
+    if worst_dev > 4.0:
+        return False, f"dimension deviates > 4σ from {class_name} prior"
+    if bad_count >= 2:
+        return False, f"multiple dimensions deviate > {sigma_threshold}σ from {class_name} prior"
 
     return True, None
 

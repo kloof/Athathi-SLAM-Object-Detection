@@ -10,6 +10,7 @@ import numpy as np
 from cloud_slam.detector import YOLODetector
 from cloud_slam.frustum import extract_frustum_points, filter_depth_mad, estimate_gravity
 from cloud_slam.tracker_3d import ObjectTracker3D
+from cloud_slam.spatial_memory import SpatialObjectMemory
 from cloud_slam.pipelines import icp_imu_pipeline
 
 
@@ -33,6 +34,7 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
     """
     detector = YOLODetector(**(detector_config or {}))
     tracker = ObjectTracker3D()
+    memory = SpatialObjectMemory()
     gravity_up = estimate_gravity(imus)
     detection_count = 0
 
@@ -56,9 +58,16 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
             world_pts = (pose[:3, :3] @ frustum_pts.T + pose[:3, 3:4]).T
             center_world = world_pts.mean(axis=0)
 
+            # Resolve canonical ID through spatial memory
+            canonical_id = memory.lookup_or_create(
+                det.track_id, center_world, det.class_name, det.confidence
+            )
+            resolved_class = memory.get_class(canonical_id)
+
             tracker.update(
-                det.track_id, center_world, world_pts,
-                det.class_name, frame_idx,
+                canonical_id, center_world, world_pts,
+                resolved_class, frame_idx, det.confidence,
+                gravity_up=gravity_up,
             )
             detection_count += 1
 
@@ -70,6 +79,7 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
     )
 
     # Post-processing
+    tracks_before_merge = len(tracker.objects)
     tracker.merge_fragmented_tracks()
     objects_raw = tracker.get_final_objects(gravity_up=gravity_up)
 
@@ -81,6 +91,6 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
     stats['total_detections'] = detection_count
     stats['objects_raw'] = len(objects_raw)
     stats['objects_refined'] = len(objects)
-    stats['tracks_before_merge'] = len(tracker.objects)
+    stats['tracks_before_merge'] = tracks_before_merge
 
     return merged, poses, objects, stats

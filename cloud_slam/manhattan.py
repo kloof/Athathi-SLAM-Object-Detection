@@ -182,7 +182,7 @@ def fit_manhattan_obb(points, manhattan_frame, min_points=10):
                 # Additional 90° rotation around Z
                 R_extra = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float)
                 R_total = R.T @ R_extra.T
-                # Dimensions: swapped back
+                # Dimensions stay in rotated frame (matches R_total)
                 dims_out = dims.copy()
             else:
                 center_m = center_test

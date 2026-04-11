@@ -6,6 +6,7 @@ Projects lidar points into camera image, extracts points within each
 """
 
 import numpy as np
+import cv2
 import open3d as o3d
 from scipy.spatial.transform import Rotation
 
@@ -43,9 +44,12 @@ def extract_frustum_points(xyz, detection, calib, padding=15):
 
     if detection.mask is not None:
         # Use segmentation mask for tighter extraction
+        # Mask may be at model resolution (e.g. 640x384), not image resolution
         mask_h, mask_w = detection.mask.shape
-        ui = np.clip(u[valid].astype(int), 0, mask_w - 1)
-        vi = np.clip(v[valid].astype(int), 0, mask_h - 1)
+        scale_x = mask_w / W
+        scale_y = mask_h / H
+        ui = np.clip((u[valid] * scale_x).astype(int), 0, mask_w - 1)
+        vi = np.clip((v[valid] * scale_y).astype(int), 0, mask_h - 1)
         in_mask = detection.mask[vi, ui] > 0.5
         valid_indices = np.where(valid)[0]
         return valid_indices[in_mask]
@@ -173,26 +177,23 @@ def fit_gravity_aligned_obb(points, gravity_up, min_points=10):
     # Rotate points so gravity is along Z
     aligned = (R_align @ points.T).T
 
-    # Fit 2D minimum bounding rectangle on XY plane
-    pcd_2d = o3d.geometry.PointCloud()
-    xy_points = np.column_stack([aligned[:, :2], np.zeros(len(aligned))])
-    pcd_2d.points = o3d.utility.Vector3dVector(xy_points)
-
-    try:
-        obb_2d = pcd_2d.get_minimal_oriented_bounding_box(robust=True)
-    except Exception:
-        obb_2d = pcd_2d.get_axis_aligned_bounding_box()
-        center_2d = obb_2d.get_center()[:2]
-        extent_2d = obb_2d.get_extent()[:2]
+    # Fit 2D minimum bounding rectangle on XY plane using cv2.minAreaRect
+    # (avoids Open3D det=-1 reflection bug on planar point sets)
+    pts_2d = aligned[:, :2].astype(np.float32)
+    if len(pts_2d) < 5:
+        center_2d = pts_2d.mean(axis=0)
+        extent_2d = pts_2d.ptp(axis=0)
         yaw = 0.0
     else:
-        center_2d = np.asarray(obb_2d.center)[:2]
-        extent_2d = np.asarray(obb_2d.extent)[:2]
-        # Extract yaw from the OBB rotation (fix det=-1 from Open3D)
-        R_obb = np.asarray(obb_2d.R).copy()
-        if np.linalg.det(R_obb) < 0:
-            R_obb[:, 2] *= -1
-        yaw = np.arctan2(R_obb[1, 0], R_obb[0, 0])
+        rect = cv2.minAreaRect(pts_2d)
+        (cx, cy), (w_rect, h_rect), angle_deg = rect
+        # Normalize: ensure width >= height, angle = long-axis rotation
+        if w_rect < h_rect:
+            w_rect, h_rect = h_rect, w_rect
+            angle_deg += 90
+        center_2d = np.array([cx, cy], dtype=np.float64)
+        extent_2d = np.array([w_rect, h_rect], dtype=np.float64)
+        yaw = np.radians(angle_deg)
 
     # Z range
     z_min = aligned[:, 2].min()

@@ -126,26 +126,47 @@ def main():
                 R_new = R_level @ R_obj
                 obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
 
-    # Align room to axes: rotate around Z so dominant wall direction → X axis
-    # Extract yaw from first object's orientation (it's Manhattan-aligned)
-    if objects:
-        q0 = np.array(objects[0]['orientation']['quaternion'])
-        yaw = SciRot.from_quat(q0).as_euler('xyz')[2]  # Z-rotation
-        # Snap to nearest 90° and compute residual
-        snapped = round(yaw / (np.pi / 2)) * (np.pi / 2)
-        residual = yaw - snapped
-        if abs(residual) > 0.01:  # more than ~0.6° off axis
-            R_align = SciRot.from_euler('z', -residual).as_matrix()
-            print(f"[INFO] Aligning room to axes (rotating {np.degrees(-residual):.1f}° around Z)")
-            merged.rotate(R_align, center=(0, 0, 0))
+    # Align room to axes: detect wall direction on the LEVELED cloud
+    from cloud_slam.room_structure import detect_room
+    from cloud_slam.manhattan import estimate_manhattan_frame
+
+    room_leveled = detect_room(merged, z_up)
+    if room_leveled.walls:
+        manhattan_leveled = estimate_manhattan_frame(room_leveled.walls, z_up)
+        if manhattan_leveled.confidence > 0.3:
+            # Manhattan X direction in the leveled frame
+            mx = manhattan_leveled.R.T[:, 0]
+            wall_yaw = np.arctan2(mx[1], mx[0])
+            snapped_wall = round(wall_yaw / (np.pi / 2)) * (np.pi / 2)
+            residual = wall_yaw - snapped_wall
+            if abs(residual) > 0.01:
+                R_align = SciRot.from_euler('z', -residual).as_matrix()
+                print(f"[INFO] Aligning room to axes (rotating {np.degrees(-residual):.1f}° around Z)")
+                merged.rotate(R_align, center=(0, 0, 0))
+                for obj in objects:
+                    c = np.array(obj['center'])
+                    obj['center'] = (R_align @ c).tolist()
+                    if 'orientation' in obj:
+                        q = np.array(obj['orientation']['quaternion'])
+                        R_obj = SciRot.from_quat(q).as_matrix()
+                        R_new = R_align @ R_obj
+                        obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+
+            # Re-snap object quaternions to the leveled+aligned Manhattan directions.
+            # The OBBs were fit in the raw world frame, so after R_level their yaw
+            # doesn't match the leveled Manhattan. Fix by snapping each object's yaw
+            # to the nearest 90° (which are now the aligned wall directions).
             for obj in objects:
-                c = np.array(obj['center'])
-                obj['center'] = (R_align @ c).tolist()
-                if 'orientation' in obj:
-                    q = np.array(obj['orientation']['quaternion'])
-                    R_obj = SciRot.from_quat(q).as_matrix()
-                    R_new = R_align @ R_obj
-                    obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+                if 'orientation' not in obj:
+                    continue
+                q = np.array(obj['orientation']['quaternion'])
+                R_obj = SciRot.from_quat(q).as_matrix()
+                # Extract yaw (Z rotation in leveled+aligned frame)
+                obj_yaw = np.arctan2(R_obj[1, 0], R_obj[0, 0])
+                snapped_yaw = round(obj_yaw / (np.pi / 2)) * (np.pi / 2)
+                # Rebuild quaternion: keep gravity alignment, fix yaw
+                R_snapped = SciRot.from_euler('z', snapped_yaw).as_matrix()
+                obj['orientation']['quaternion'] = SciRot.from_matrix(R_snapped).as_quat().tolist()
 
     # Save colored map
     map_path = os.path.join(args.output, "colored_map.ply")
