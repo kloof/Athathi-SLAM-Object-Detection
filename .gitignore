@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Large data files
+*.ply
+*.pcd
+*.mcap
+data/slam_output/
+data/scan_002/

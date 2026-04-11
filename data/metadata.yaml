@@ -1,0 +1,32 @@
+rosbag2_bagfile_information:
+  version: 5
+  storage_identifier: mcap
+  duration:
+    nanoseconds: 44955680751
+  starting_time:
+    nanoseconds_since_epoch: 1775154679910223995
+  message_count: 11820
+  topics_with_message_count:
+    - topic_metadata:
+        name: /unilidar/cloud
+        type: sensor_msgs/msg/PointCloud2
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 534
+    - topic_metadata:
+        name: /unilidar/imu
+        type: sensor_msgs/msg/Imu
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 3\n  depth: 0\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 11286
+  compression_format: ""
+  compression_mode: ""
+  relative_file_paths:
+    - rosbag_0.mcap
+  files:
+    - path: rosbag_0.mcap
+      starting_time:
+        nanoseconds_since_epoch: 1775154679910223995
+      duration:
+        nanoseconds: 44955680751
+      message_count: 11820
