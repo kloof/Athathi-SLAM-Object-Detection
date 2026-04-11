@@ -102,8 +102,31 @@ def main():
 
     t_total = time.time() - t0
 
-    # Save colored map
+    # Level the scan: rotate so gravity aligns with Z-up
     import open3d as o3d
+    from scipy.spatial.transform import Rotation as SciRot
+    from cloud_slam.frustum import estimate_gravity
+
+    gravity_up = estimate_gravity(imus)
+    z_up = np.array([0.0, 0.0, 1.0])
+    if not np.allclose(gravity_up, z_up, atol=0.01):
+        R_level = SciRot.align_vectors([z_up], [gravity_up])[0].as_matrix()
+        print(f"[INFO] Leveling scan (gravity was {gravity_up})")
+
+        # Rotate the point cloud
+        merged.rotate(R_level, center=(0, 0, 0))
+
+        # Rotate all object centers and orientations
+        for obj in objects:
+            c = np.array(obj['center'])
+            obj['center'] = (R_level @ c).tolist()
+            if 'orientation' in obj:
+                q = np.array(obj['orientation']['quaternion'])
+                R_obj = SciRot.from_quat(q).as_matrix()
+                R_new = R_level @ R_obj
+                obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+
+    # Save colored map
     map_path = os.path.join(args.output, "colored_map.ply")
     o3d.io.write_point_cloud(map_path, merged)
     print(f"[INFO] Saved colored map: {map_path} ({len(merged.points)} points)")
