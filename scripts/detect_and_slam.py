@@ -186,6 +186,28 @@ def main():
     o3d.io.write_point_cloud(map_path, merged)
     print(f"[INFO] Saved colored map: {map_path} ({len(merged.points)} points)")
 
+    # Post-process: run standalone RANSAC floor leveler on the merged cloud
+    # in-memory (level.py's own PLY reader doesn't handle uchar RGB, so we
+    # keep its algorithm verbatim but use Open3D for I/O).
+    try:
+        from cloud_slam.level import detect_floor_plane, level_points
+        print("[Level] Running RANSAC floor leveler on map...")
+        xyz = np.asarray(merged.points)
+        result = detect_floor_plane(xyz)
+        if result is None:
+            raise RuntimeError("No horizontal plane found")
+        normal, _ = result
+        leveled_xyz, _, _ = level_points(xyz, normal)
+        leveled_pcd = o3d.geometry.PointCloud()
+        leveled_pcd.points = o3d.utility.Vector3dVector(leveled_xyz.astype(np.float64))
+        if merged.has_colors():
+            leveled_pcd.colors = merged.colors
+        leveled_path = os.path.join(args.output, "colored_map_leveled.ply")
+        o3d.io.write_point_cloud(leveled_path, leveled_pcd)
+        print(f"[Level] Saved leveled map: {leveled_path}")
+    except Exception as e:
+        print(f"[WARNING] level.py post-process failed: {e}")
+
     # Save objects.json
     objects_path = os.path.join(args.output, "objects.json")
     output_json = {
