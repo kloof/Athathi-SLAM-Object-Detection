@@ -11,3 +11,4 @@ PyYAML>=6.0
 ultralytics>=8.4.0
 matplotlib>=3.7.0
 shapely>=2.0.0
+transformers>=4.35.0

@@ -71,6 +71,15 @@ def main():
                              "RANSAC floor detection (with IMU prior) applied "
                              "BEFORE refinement and shifts floor to Z=0 — "
                              "experimental, sharper leveling.")
+    parser.add_argument("--label-walls", action="store_true",
+                        help="Enable vision-based wall typing. Runs "
+                             "Mask2Former (ADE20K) on each camera frame, "
+                             "projects wall/window/door/glass pixel labels "
+                             "onto lidar points, and passes them into the "
+                             "floorplan refiner so each D_refined wall gets "
+                             "a `type` field in the metadata and a colored "
+                             "edge in floorplan_refined.png. Opt-in — off "
+                             "by default, zero regression otherwise.")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -99,13 +108,24 @@ def main():
     if args.classes:
         detector_config['classes'] = [c.strip() for c in args.classes.split(',')]
 
+    # Optional vision wall segmenter — built only if the user opted in.
+    # Any failure during segmenter init will flip it to a disabled state
+    # internally, so the pipeline still runs (just without vision labels).
+    wall_segmenter = None
+    if args.label_walls:
+        from cloud_slam.wall_segmenter import WallSegmenter
+        wall_segmenter = WallSegmenter()  # lazy-loads on first segment() call
+        print("[INFO] Vision wall labeling ENABLED "
+              "(Mask2Former ADE20K — loads on first frame)")
+
     # Run pipeline
     from cloud_slam.pipelines.detect_pipeline import run
-    merged, poses, objects, stats = run(
+    merged, poses, objects, stats, wall_labels = run(
         clouds, imus, images, calib,
         voxel_size=args.voxel_size,
         detector_config=detector_config,
         leveling_mode=args.leveling,
+        wall_segmenter=wall_segmenter,
     )
 
     t_total = time.time() - t0
@@ -128,6 +148,12 @@ def main():
 
             # Rotate the point cloud
             merged.rotate(R_level, center=(0, 0, 0))
+
+            # Rotate vision-labeled points in lockstep
+            if wall_labels is not None and len(wall_labels['xyz']) > 0:
+                wall_labels['xyz'] = (
+                    wall_labels['xyz'].astype(np.float64) @ R_level.T
+                ).astype(np.float32)
 
             # Rotate all object centers and orientations
             for obj in objects:
@@ -156,6 +182,11 @@ def main():
                 R_align = SciRot.from_euler('z', -residual).as_matrix()
                 print(f"[INFO] Aligning room to axes (rotating {np.degrees(-residual):.1f}° around Z)")
                 merged.rotate(R_align, center=(0, 0, 0))
+                # Rotate vision-labeled points in lockstep
+                if wall_labels is not None and len(wall_labels['xyz']) > 0:
+                    wall_labels['xyz'] = (
+                        wall_labels['xyz'].astype(np.float64) @ R_align.T
+                    ).astype(np.float32)
                 for obj in objects:
                     c = np.array(obj['center'])
                     obj['center'] = (R_align @ c).tolist()
@@ -223,6 +254,13 @@ def main():
         # with the leveled cloud.
         merged.points = leveled_pcd.points
         shift_vec = np.array([0.0, 0.0, -z_shift])
+        # Propagate to vision-labeled points as well so the floorplan
+        # receives labels in the same coordinate frame as the merged cloud.
+        if wall_labels is not None and len(wall_labels['xyz']) > 0:
+            wall_labels['xyz'] = (
+                (wall_labels['xyz'].astype(np.float64) @ R_level.T)
+                + shift_vec
+            ).astype(np.float32)
         for obj in objects:
             c = np.array(obj['center'])
             obj['center'] = (R_level @ c + shift_vec).tolist()
@@ -251,17 +289,30 @@ def main():
         fp_out_dir = os.path.join(scan_root, "results", scan_name)
         os.makedirs(fp_out_dir, exist_ok=True)
         print(f"[Floorplan] Generating floor plan -> {fp_out_dir}")
+        # Pass the vision-labeled buffer only when the --label-walls flag
+        # actually produced labels; otherwise leave it None so the
+        # floorplan path is byte-identical to the vision-less regression
+        # baseline.
+        fp_wall_labels = (wall_labels
+                          if wall_labels is not None
+                          and len(wall_labels.get('labels', [])) > 0
+                          else None)
         _variants, fp_meta = generate_floorplan(
             merged,
             fp_out_dir,
             name="floorplan",
             gravity_up=np.array([0.0, 0.0, 1.0]),
+            wall_labels=fp_wall_labels,
             verbose=False,
         )
         v = fp_meta['variants']
         print(f"[Floorplan] Saved ("
               f"A={v['A_natural']['area_m2']}m²/{v['A_natural']['n_walls']}w, "
               f"D={v['D_refined']['area_m2']}m²/{v['D_refined']['n_walls']}w)")
+        if 'vision_wall_point_count' in fp_meta:
+            print(f"[Floorplan] Vision: "
+                  f"wall_pts={fp_meta['vision_wall_point_count']}, "
+                  f"wall_blobs={fp_meta['vision_wall_blob_count']}")
     except Exception as e:
         print(f"[WARNING] floorplan.py post-process failed: {e}")
 

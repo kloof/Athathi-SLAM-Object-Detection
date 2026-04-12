@@ -597,7 +597,8 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
     g8v = (np.clip(gv, 0, p93) / p93 * 255).astype(np.uint8)
     extv = [xev[0], xev[-1], yev[0], yev[-1]]
 
-    # Per-snap-kind color
+    # Per-snap-kind color (used when no vision type is available OR
+    # the wall's type is 'wall'/'unknown').
     kind_color = {
         'dominant': '#2E7D32',    # green: learned-dominant snap
         'manhattan': '#1565C0',   # blue: 0°/90° snap
@@ -606,6 +607,20 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
         'free': '#D84315',        # red: preserved at fitted angle
         'fallback_a': '#616161',  # grey: fell back to variant A
     }
+    # Per-type color — overrides kind_color for window/door/glass. A
+    # wall typed as 'wall' or 'unknown' falls through to kind_color so
+    # the snap provenance stays visible.
+    type_color = {
+        'window': '#00BFFF',   # cyan
+        'door':   '#FF7F00',   # orange (distinct from diagonal orange)
+        'glass':  '#ADD8E6',   # light cyan
+    }
+
+    # Detect whether any wall has a vision-derived type — decides whether
+    # to draw the second legend (types) at all.
+    has_any_type = any(
+        isinstance(m, dict) and 'type' in m for m in walls_d_meta
+    ) if walls_d_meta else False
 
     fig, ax = plt.subplots(figsize=(14, 14), dpi=200)
     ax.imshow(g8v.T, origin='lower', cmap='gray_r', extent=extv, alpha=0.25)
@@ -614,22 +629,78 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
         rx, ry = poly_d.exterior.xy
         ax.fill(rx, ry, color='#E8F5E9', alpha=0.4)
 
-    legend_kinds = set()
+    legend_kinds = set()      # snap-kind legend entries (green/blue/...)
+    legend_types = set()      # type legend entries (cyan/orange/...)
+    type_handles = []         # keep matplotlib Line2D refs for the 2nd legend
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    # Track which feature-class markers we drew so the features legend can
+    # aggregate them (dashed-line markers drawn on walls that carry a
+    # feature but are not themselves typed as that class).
+    feature_markers_seen = set()
     for idx, (p1, p2, a, l) in enumerate(walls_d):
         kind = 'free'
+        wtype = None
+        wfeatures = []
         if idx < len(walls_d_meta) and walls_d_meta[idx] is not None:
             kind = walls_d_meta[idx].get('snapped_to', 'free')
-        color = kind_color.get(kind, '#000000')
-        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], '-',
-                color=color, linewidth=3.5, solid_capstyle='round',
-                label=kind if kind not in legend_kinds else None)
-        legend_kinds.add(kind)
+            wtype = walls_d_meta[idx].get('type')
+            wfeatures = walls_d_meta[idx].get('features', []) or []
+
+        # Primary line color: type color wins for window/door/glass;
+        # otherwise fall through to the snap-kind color so the kind is
+        # still visible.
+        if wtype in type_color:
+            color = type_color[wtype]
+            # Track for the types legend (not the kinds legend).
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], '-',
+                    color=color, linewidth=4.0, solid_capstyle='round')
+            if wtype not in legend_types:
+                type_handles.append(
+                    Line2D([0], [0], color=color, linewidth=4.0,
+                           label=wtype))
+                legend_types.add(wtype)
+        else:
+            color = kind_color.get(kind, '#000000')
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], '-',
+                    color=color, linewidth=3.5, solid_capstyle='round',
+                    label=kind if kind not in legend_kinds else None)
+            legend_kinds.add(kind)
+
+        # Secondary-feature overlay: for each feature present on this
+        # wall, draw a short dashed overlay in the feature's color
+        # centered on the wall midpoint (25 % of wall length, capped at
+        # 1.0 m). Also list features in the length-label text.
+        if wfeatures and l > 0.3:
+            d = p2 - p1
+            nm = np.linalg.norm(d)
+            udir = d / nm if nm > 1e-6 else np.array([1.0, 0.0])
+            mid = (p1 + p2) / 2
+            dash_len = min(1.0, 0.25 * l)
+            # Stack features: slight perpendicular offset per feature so
+            # multiple features on one wall don't overlap.
+            perp = np.array([-udir[1], udir[0]])
+            for j, feat in enumerate(wfeatures):
+                if feat not in type_color:
+                    continue
+                offset = (j - (len(wfeatures) - 1) / 2.0) * 0.08
+                a_pt = mid - udir * (dash_len / 2) + perp * offset
+                b_pt = mid + udir * (dash_len / 2) + perp * offset
+                ax.plot([a_pt[0], b_pt[0]], [a_pt[1], b_pt[1]],
+                        linestyle='--', color=type_color[feat],
+                        linewidth=2.8, solid_capstyle='round')
+                feature_markers_seen.add(feat)
+
         if l > 0.3:
             mid = (p1 + p2) / 2
             d = p2 - p1
             nm = np.linalg.norm(d)
             perp = np.array([-d[1], d[0]]) / nm * 0.18
-            ax.text(mid[0] + perp[0], mid[1] + perp[1], f'{l:.2f}m',
+            feature_str = ''
+            if wfeatures:
+                feature_str = ' [' + ','.join(wfeatures) + ']'
+            ax.text(mid[0] + perp[0], mid[1] + perp[1],
+                    f'{l:.2f}m{feature_str}',
                     ha='center', fontsize=7, color='#333',
                     rotation=a if a <= 90 else a - 180)
 
@@ -646,8 +717,24 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_aspect('equal')
-    ax.legend(loc='upper right', fontsize=9, framealpha=0.9,
-              title='Wall angle source')
+    # Primary legend: snap kinds (angle source)
+    first_legend = ax.legend(loc='upper right', fontsize=9, framealpha=0.9,
+                              title='Wall angle source')
+    # Secondary legend: vision types + features.
+    # Primary-type walls get a solid line; feature overlays get a dashed
+    # line in the same color — combined here so the user sees the full
+    # palette.
+    combined_type_handles = list(type_handles)
+    for feat in sorted(feature_markers_seen):
+        if feat in legend_types:
+            continue  # already in solid-line legend
+        combined_type_handles.append(
+            Line2D([0], [0], color=type_color[feat], linewidth=2.8,
+                   linestyle='--', label=f'{feat} (feature)'))
+    if combined_type_handles:
+        ax.add_artist(first_legend)
+        ax.legend(handles=combined_type_handles, loc='lower right',
+                  fontsize=9, framealpha=0.9, title='Vision type')
     plt.tight_layout()
     plt.savefig(f'{output_dir}/{name}_refined.png', bbox_inches='tight')
     plt.close()
@@ -1455,7 +1542,8 @@ def _stage6_gap_split(edges, gap_thresh=0.3, min_segment=0.2, verbose=False):
 
 # ----- Top-level orchestration for variant D_refined -----
 
-def _collect_wall_band(pts_3d, floor_z, ceiling_z, margin=0.3):
+def _collect_wall_band(pts_3d, floor_z, ceiling_z, margin=0.3,
+                        return_mask=False):
     """Return (M, 2) XY coords of points in the wall-band Z slice.
 
     Band: Z in [floor_z + margin, ceiling_z - margin] — the middle of the
@@ -1467,10 +1555,18 @@ def _collect_wall_band(pts_3d, floor_z, ceiling_z, margin=0.3):
     not, we fall back to percentile-derived bounds. This makes the
     wall-band extraction robust regardless of how the caller reports
     floor/ceiling heights.
+
+    If `return_mask` is True, additionally returns the boolean mask into
+    `pts_3d` — useful when a parallel per-point array (e.g. vision class
+    labels) must be sliced in lockstep.
     """
     z = pts_3d[:, 2]
     if z.size < 100:
-        return pts_3d[:, :2] if z.size else np.zeros((0, 2))
+        xy = pts_3d[:, :2] if z.size else np.zeros((0, 2))
+        if return_mask:
+            mask = np.ones(z.size, dtype=bool) if z.size else np.zeros(0, dtype=bool)
+            return xy, mask
+        return xy
 
     z_pts_lo = float(np.percentile(z, 2))
     z_pts_hi = float(np.percentile(z, 98))
@@ -1496,10 +1592,187 @@ def _collect_wall_band(pts_3d, floor_z, ceiling_z, margin=0.3):
 
     lo, hi = lo_raw + m, hi_raw - m
     mask = (z > lo) & (z < hi)
+    if return_mask:
+        return pts_3d[mask][:, :2], mask
     return pts_3d[mask][:, :2]
 
 
+# ----- Vision helpers (Tier 1 per-wall type, Tier 3 count sanity) -----
+
+_VISION_BUCKET_NAMES = ('other', 'wall', 'window', 'door', 'glass')
+
+
+def _classify_wall_from_endpoints(p1, p2, pts_3d, point_labels,
+                                   band_width=0.30, length_slack=0.30,
+                                   min_support=10,
+                                   special_threshold=0.45,
+                                   wall_threshold=0.35,
+                                   return_features=False):
+    """Classify a wall segment by its *dominant* vision bucket, plus
+    optional secondary features.
+
+    Labels mean "this wall IS a ___" (not "has a ___"). Rationale:
+    labeling a 5 m interior wall as 'door' just because 0.9 m of it is
+    a doorway is misleading — the wall as a whole is still a wall, with
+    a door in it. The door is already represented in `objects.json` via
+    the 3D YOLOE detector, so we don't need to re-encode it as a wall
+    type.
+
+    A wall is tagged 'door' / 'window' / 'glass' only when that class
+    is the clear majority (≥45 % of labeled band points). Walls with
+    plain wall dominant (≥35 %) get 'wall'. Everything else is
+    'unknown'.
+
+    When `return_features=True`, also returns a list of secondary
+    features seen at ≥10 % in the band — e.g. `('wall', ['door'])` for
+    a regular wall with a door embedded.
+
+    Args:
+        p1, p2:            wall endpoints in XY (2,).
+        pts_3d:            (N, 3) point cloud (same frame as refine_walls).
+        point_labels:      (N,) uint8 bucket ids aligned with pts_3d.
+        band_width:        perpendicular tolerance (m).
+        length_slack:      extra half-metre at each end.
+        min_support:       minimum non-'other' labeled points required.
+        special_threshold: fraction to label wall as window/door/glass
+                           (default 0.45 — clear majority).
+        wall_threshold:    fraction to label as plain 'wall'. Lower than
+                           `special_threshold` because walls can have
+                           features (doors/windows) eating into the
+                           majority.
+        return_features:   if True, return (primary_label, feature_list).
+
+    Returns:
+        primary_label (str) — one of
+          {'wall', 'window', 'door', 'glass', 'unknown'}.
+        Or, when return_features=True,
+          (primary_label, features) where features is a sorted list of
+          strings drawn from {'wall','window','door','glass'} that each
+          occupy ≥10 % of the band.
+    """
+    p1 = np.asarray(p1, dtype=np.float64)
+    p2 = np.asarray(p2, dtype=np.float64)
+    edge_vec = p2 - p1
+    edge_len = float(np.linalg.norm(edge_vec))
+    if edge_len < 1e-6:
+        return ('unknown', []) if return_features else 'unknown'
+    edge_dir = edge_vec / edge_len
+    edge_perp = np.array([-edge_dir[1], edge_dir[0]])
+    mid = (p1 + p2) / 2
+
+    rel = pts_3d[:, :2] - mid
+    perp_dist = np.abs(rel @ edge_perp)
+    along_dist = np.abs(rel @ edge_dir)
+    mask = (perp_dist < band_width) & (along_dist < edge_len / 2 + length_slack)
+    if not mask.any():
+        return ('unknown', []) if return_features else 'unknown'
+
+    labels = np.asarray(point_labels)[mask]
+    non_other = labels >= 1
+    if non_other.sum() < min_support:
+        return ('unknown', []) if return_features else 'unknown'
+
+    labels = labels[non_other]
+    counts = np.bincount(labels, minlength=len(_VISION_BUCKET_NAMES))
+    total = int(counts.sum())
+    if total == 0:
+        return ('unknown', []) if return_features else 'unknown'
+
+    wall_frac = counts[1] / total
+    window_frac = counts[2] / total
+    door_frac = counts[3] / total
+    glass_frac = counts[4] / total
+
+    # Primary label: clear majority wins. Specials outrank 'wall' only
+    # when the special class is dominant.
+    if glass_frac >= special_threshold:
+        primary = 'glass'
+    elif door_frac >= special_threshold:
+        primary = 'door'
+    elif window_frac >= special_threshold:
+        primary = 'window'
+    elif wall_frac >= wall_threshold:
+        primary = 'wall'
+    else:
+        primary = 'unknown'
+
+    if not return_features:
+        return primary
+
+    # Secondary features: anything ≥10 % and distinct from the primary.
+    feature_threshold = 0.10
+    feature_fracs = {
+        'wall': wall_frac, 'window': window_frac,
+        'door': door_frac, 'glass': glass_frac,
+    }
+    features = sorted(
+        name for name, f in feature_fracs.items()
+        if f >= feature_threshold and name != primary
+    )
+    return primary, features
+
+
+def _compute_vision_wall_stats(pts_3d, point_labels,
+                                grid_resolution=0.05, min_cluster_px=50):
+    """Tier-3 sanity diagnostics on wall-class vision labels.
+
+    Counts total wall-class points and how many connected XY blobs they
+    form on a coarse occupancy grid. This is a log-only diagnostic; we
+    do NOT override D_refined's wall count.
+
+    Returns a dict:
+        {'wall_point_count': int, 'wall_blob_count': int}
+    """
+    from scipy.ndimage import label as ndi_label
+
+    if point_labels is None or len(point_labels) != len(pts_3d):
+        return {'wall_point_count': 0, 'wall_blob_count': 0}
+
+    wall_mask = np.asarray(point_labels) == 1
+    n_pts = int(wall_mask.sum())
+    if n_pts < min_cluster_px:
+        return {'wall_point_count': n_pts, 'wall_blob_count': 0}
+
+    xy = pts_3d[wall_mask, :2]
+    x_min, y_min = xy.min(axis=0) - grid_resolution
+    x_max, y_max = xy.max(axis=0) + grid_resolution
+    W = max(int(np.ceil((x_max - x_min) / grid_resolution)), 1)
+    H = max(int(np.ceil((y_max - y_min) / grid_resolution)), 1)
+
+    grid = np.zeros((H, W), dtype=np.uint8)
+    ui = np.clip(((xy[:, 0] - x_min) / grid_resolution).astype(np.int32), 0, W - 1)
+    vi = np.clip(((xy[:, 1] - y_min) / grid_resolution).astype(np.int32), 0, H - 1)
+    grid[vi, ui] = 1
+
+    _, n_blobs = ndi_label(grid)
+    return {'wall_point_count': n_pts, 'wall_blob_count': int(n_blobs)}
+
+
+def _lookup_vision_labels_for_pts(pts, wall_labels_buffer, max_distance=0.5):
+    """For each point in `pts`, look up the nearest vision-labeled bucket.
+
+    `wall_labels_buffer` is the dict returned by detect_pipeline.run():
+        {'xyz': (M, 3) float32, 'labels': (M,) uint8}.
+    Returns a (len(pts),) uint8 array of bucket ids; points with no
+    labeled neighbor within `max_distance` get bucket 0 (other).
+    """
+    from scipy.spatial import cKDTree
+
+    xyz_labeled = wall_labels_buffer.get('xyz')
+    lbl = wall_labels_buffer.get('labels')
+    if xyz_labeled is None or lbl is None or len(lbl) == 0:
+        return np.zeros(len(pts), dtype=np.uint8)
+
+    tree = cKDTree(xyz_labeled)
+    d, idx = tree.query(pts, k=1, distance_upper_bound=max_distance)
+    out = np.zeros(len(pts), dtype=np.uint8)
+    valid = idx < len(lbl)
+    out[valid] = lbl[idx[valid]]
+    return out
+
+
 def refine_walls(walls_in, pts_3d, floor_z, ceiling_z, *,
+                 point_labels=None,
                  edge_band=0.25, min_inliers=20, k_dominant=3,
                  tol_dominant=7.0, tol_diagonal=4.0, tol_hex=3.0,
                  merge_angle_tol=3.0, gap_thresh=0.3, verbose=False):
@@ -1512,6 +1785,13 @@ def refine_walls(walls_in, pts_3d, floor_z, ceiling_z, *,
 
     If the refinement fails (e.g., not enough wall-band points), returns
     (walls_in, [None, ...]) as a safe fallback.
+
+    Optional `point_labels` is a (N,) uint8 array of bucket ids aligned
+    with `pts_3d` (0=other, 1=wall, 2=window, 3=door, 4=glass). When
+    provided, the wall-band points are pre-filtered to wall-like classes
+    (1..4) before Stage 1 RANSAC — Agent-4's "least invasive" Tier 2
+    recommendation. Results in cleaner inlier sets in cluttered corners
+    without touching the Stage 1-7 algorithms themselves.
     """
     if floor_z is None or ceiling_z is None:
         return walls_in, [None] * len(walls_in)
@@ -1520,7 +1800,23 @@ def refine_walls(walls_in, pts_3d, floor_z, ceiling_z, *,
     # they can be in either order; pick the pair that spans the room).
     z_lo = min(float(floor_z), float(ceiling_z))
     z_hi = max(float(floor_z), float(ceiling_z))
-    wall_band_xy = _collect_wall_band(pts_3d, z_lo, z_hi)
+
+    # Tier 2 — class-filter wall-band when vision labels are available.
+    if point_labels is not None and len(point_labels) == len(pts_3d):
+        wall_band_xy, wall_band_mask = _collect_wall_band(
+            pts_3d, z_lo, z_hi, return_mask=True)
+        wall_band_labels = np.asarray(point_labels)[wall_band_mask]
+        keep = wall_band_labels >= 1  # drop 'other' (clutter/furniture)
+        n_before = len(wall_band_xy)
+        wall_band_xy = wall_band_xy[keep]
+        if verbose:
+            n_after = len(wall_band_xy)
+            print(f"[D_refined][vision] wall-band filter: "
+                  f"{n_before} → {n_after} pts "
+                  f"({100.0 * n_after / max(n_before, 1):.0f}% kept)")
+    else:
+        wall_band_xy = _collect_wall_band(pts_3d, z_lo, z_hi)
+
     if verbose:
         print(f"[D_refined] wall-band: {len(wall_band_xy)} points "
               f"from Z in [{z_lo + 0.3:.2f}, {z_hi - 0.3:.2f}]")
@@ -1607,7 +1903,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                        gravity_up=None, imus=None,
                        resolution=0.03, epsilon=0.012, snap_angle=45,
                        voxel_size=0.03, ceil_band=0.12,
-                       close_kernel=11, angle_flex=3.0, verbose=True):
+                       close_kernel=11, angle_flex=3.0,
+                       wall_labels=None, verbose=True):
     """Extract a 2D floor plan from an in-memory point cloud.
 
     Writes to `output_dir` (PNG only — DXF export is intentionally omitted):
@@ -1617,14 +1914,27 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
       {name}_overlay.png         — plan on top of raw point cloud
       {name}_comparison.png      — A/B/C variants side by side
       {name}_corners.png         — corner-detection detail
+      {name}_refined.png         — D_refined walls (type-colored if vision
+                                    wall_labels was supplied)
 
     Floor/ceiling detection is robust: uses `detect_room()` (RANSAC + IMU
     gravity prior) rather than histogram peaks, so furniture no longer
     beats the real ceiling.
 
+    Optional `wall_labels` is a dict
+        {'xyz': (M, 3) float32, 'labels': (M,) uint8}
+    of world-frame lidar points tagged with vision bucket ids (bucket
+    layout: 0 other / 1 wall / 2 window / 3 door / 4 glass). When
+    provided and non-empty, three vision augmentations activate:
+      Tier 1 — per-wall `type` label in the metadata.
+      Tier 2 — wall-band filter (drops 'other' clutter) before RANSAC.
+      Tier 3 — diagnostic wall-point / wall-blob counts in the metadata.
+    When None or empty, behavior is byte-identical to the vision-less path.
+
     Returns:
         (variants, meta) where variants is a dict of
-        {"A_natural"|"B_corners"|"C_snapped": (walls, poly, label)}.
+        {"A_natural"|"B_corners"|"C_snapped"|"D_refined":
+            (walls, poly, label)}.
     """
     os.makedirs(output_dir, exist_ok=True)
     t0 = time.time()
@@ -1650,6 +1960,25 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     if verbose:
         print(f"Loaded: {n_raw} -> {len(pts)} pts")
         print(f"Floor: {floor_z:.2f}m, Ceiling: {ceiling_z:.2f}m, Height: {h:.2f}m")
+
+    # --- Vision label lookup (optional; no-op when wall_labels is None) ---
+    # `pts_labels` ends up as None when vision is absent or contributed no
+    # wall-like (bucket >= 1) signal — so every downstream vision hook
+    # short-circuits and the pipeline behaves byte-identically to the
+    # vision-less path.
+    pts_labels = None
+    if wall_labels is not None and len(wall_labels.get('labels', [])) > 0:
+        _tentative = _lookup_vision_labels_for_pts(pts, wall_labels)
+        if np.any(_tentative >= 1):
+            pts_labels = _tentative
+            if verbose:
+                n_labeled = int((_tentative >= 1).sum())
+                print(f"[vision] matched {n_labeled}/{len(pts)} downsampled "
+                      f"points against {len(wall_labels['labels'])} "
+                      f"labeled frame points")
+        elif verbose:
+            print("[vision] wall_labels contained no wall-like buckets — "
+                  "skipping vision augmentations")
 
     # Mask is a tight band around the ceiling only (no more 70%-of-room
     # cutoff — that included furniture tops). Uses point-to-plane distance
@@ -1717,7 +2046,9 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     if verbose:
         print("\n--- Variant D: RANSAC refinement + tolerance snap ---")
     walls_d, walls_d_meta = refine_walls(
-        walls_a, pts, floor_z, ceiling_z, verbose=verbose)
+        walls_a, pts, floor_z, ceiling_z,
+        point_labels=pts_labels,
+        verbose=verbose)
     if len(walls_d) >= 3:
         # Build polygon from refined wall endpoints (corners from wall order)
         corners_d = np.array([w[0] for w in walls_d])
@@ -1728,6 +2059,12 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         # Keep the per-wall meta aligned by index-truncation (best effort;
         # extract_walls may drop short edges).
         walls_d_meta_clean = walls_d_meta[:len(walls_d_clean)]
+        # Pad with empty dicts if extract_walls produced more segments than
+        # the refiner's meta (rare, but possible after gap-merge).
+        while len(walls_d_meta_clean) < len(walls_d_clean):
+            walls_d_meta_clean.append({'snapped_to': 'free',
+                                       'residual_m': 0.0,
+                                       'confidence': 0.0})
     else:
         # Too few refined walls — fall back to A_natural
         poly_d = poly_a
@@ -1737,6 +2074,37 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                                for _ in walls_a]
     if verbose:
         print(f"  {poly_d.area:.1f} m2, {len(walls_d_clean)} walls")
+
+    # --- Tier 1: per-wall vision type label on D_refined walls ---
+    # Runs only when pts_labels was computed above (i.e. vision gave useful
+    # signal). Attaches 'type' (the wall's dominant vision bucket) and
+    # 'features' (secondary classes seen at ≥10% along the band) to each
+    # walls_d_meta_clean entry. No effect on wall geometry.
+    if pts_labels is not None:
+        for i, (p1, p2, _a, _l) in enumerate(walls_d_clean):
+            if i >= len(walls_d_meta_clean):
+                break
+            primary, features = _classify_wall_from_endpoints(
+                p1, p2, pts, pts_labels, return_features=True)
+            walls_d_meta_clean[i]['type'] = primary
+            if features:
+                walls_d_meta_clean[i]['features'] = features
+        if verbose:
+            type_tally = {}
+            for m in walls_d_meta_clean:
+                t = m.get('type', 'unknown')
+                type_tally[t] = type_tally.get(t, 0) + 1
+            print(f"  [vision] wall types: {type_tally}")
+
+    # --- Tier 3: vision diagnostics (log-only; does NOT modify D_refined) ---
+    vision_stats = None
+    if pts_labels is not None:
+        vision_stats = _compute_vision_wall_stats(pts, pts_labels)
+        if verbose:
+            print(f"  [vision] wall_point_count="
+                  f"{vision_stats['wall_point_count']}, "
+                  f"wall_blob_count={vision_stats['wall_blob_count']}, "
+                  f"D_refined n_walls={len(walls_d_clean)}")
 
     variants = {
         'A_natural': (walls_a, poly_a, 'Natural angles (no snap)'),
@@ -1772,6 +2140,13 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         'variants': {},
         'processing_time_s': round(elapsed, 1),
     }
+    # Top-level vision diagnostics — present only when wall_labels was used.
+    if vision_stats is not None:
+        meta['vision_model'] = 'mask2former-swin-large-ade-semantic'
+        meta['vision_wall_point_count'] = int(
+            vision_stats['wall_point_count'])
+        meta['vision_wall_blob_count'] = int(
+            vision_stats['wall_blob_count'])
     for key, (walls, poly, label) in variants.items():
         wall_entries = []
         for idx, (_, _, a, l) in enumerate(walls):
@@ -1789,6 +2164,12 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                 # the wall to match the point cloud).
                 entry['length_m_data_extent'] = m.get(
                     'length_m_data_extent', 0.0)
+                # Vision Tier 1: per-wall type — only present when wall_labels
+                # was supplied and classification produced a result.
+                if 'type' in m:
+                    entry['type'] = m['type']
+                if 'features' in m:
+                    entry['features'] = m['features']
             elif key == 'D_refined':
                 # Fell back to A_natural — meta is None
                 entry['snapped_to'] = 'fallback_a'
