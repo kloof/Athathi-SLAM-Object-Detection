@@ -1222,6 +1222,13 @@ def _stage5_vertex_translation(edges, verbose=False):
             'p1': p1, 'p2': p2,
             'direction': dir_new,
             'point_on_line': (p1 + p2) / 2,
+            # Stash the pre-Stage-5 RANSAC-fitted direction and anchor so
+            # Stage 7 can project inliers in the frame they were fitted in.
+            # Stage 5's `direction`/`point_on_line` above are derived from
+            # the line intersection, NOT from the data — using them for
+            # inlier projection introduces a subtle coordinate-frame bias.
+            'ransac_direction': np.asarray(src['direction']).copy(),
+            'ransac_point_on_line': np.asarray(src['point_on_line']).copy(),
             'inliers_xy': src['inliers_xy'],
             'residual': src['residual'],
             'length': length,
@@ -1234,6 +1241,171 @@ def _stage5_vertex_translation(edges, verbose=False):
     if verbose:
         print(f"  [Stage 5] vertex translation complete ({len(out)} edges)")
     return out
+
+
+# ----- Stage 7: length-constrained corner adjustment -----
+
+def _stage7_length_constrain(edges, slack=0.30, verbose=False):
+    """Pull/push each shared corner so neither adjacent wall over- or
+    under-extends beyond its data support.
+
+    Stage 5 computes corners as line-line intersections of the snapped wall
+    directions, which can place corners far outside the physical wall
+    extent (over-extension). Stage 7 uses each wall's Stage-1 RANSAC
+    inliers to compute a data extent [t_min, t_max] and clamps the corner's
+    projection onto each wall to that extent (± slack).
+
+    Projections use `ransac_direction` and `ransac_point_on_line` (stashed
+    by Stage 5) because Stage 5 overwrites `direction`/`point_on_line` with
+    intersection-derived values that are geometrically valid but in a
+    different frame from the RANSAC fit.
+
+    Safeguards (from 4-agent review):
+      - Adaptive slack: `min(slack, max(0.05, 0.1 * wall_length))` — tight
+        for short walls to avoid over-trimming into near-zero length.
+      - Zero-length guard: skip the corner move if it would collapse a
+        wall below 0.10 m.
+      - Per-corner sign check: skip the move if it would flip a wall's
+        p1→p2 orientation relative to its direction (bad geometry).
+      - Final polygon validity check (Shapely): if the post-Stage-7 polygon
+        self-intersects or invalidates, revert ALL moves for that polygon
+        and leave Stage 5's output unchanged (honest: better no refinement
+        than silently-corrupted geometry).
+    """
+    n = len(edges)
+    if n < 3:
+        return edges, {'n_moved': 0, 'reverted': False}
+
+    # Snapshot for potential revert
+    snapshot = [{
+        'p1': np.asarray(e['p1']).copy(),
+        'p2': np.asarray(e['p2']).copy(),
+        'length': float(e['length']),
+        'angle_deg': float(e['angle_deg']),
+    } for e in edges]
+
+    n_moved = 0
+    shifts = []
+
+    for i in range(n):
+        e_curr = edges[i]
+        e_next = edges[(i + 1) % n]
+        if e_curr.get('fallback', False) or e_next.get('fallback', False):
+            continue
+
+        # Use pre-Stage-5 RANSAC frame (stashed by Stage 5)
+        dir_i = np.asarray(e_curr.get('ransac_direction',
+                                       e_curr['direction']))
+        pol_i = np.asarray(e_curr.get('ransac_point_on_line',
+                                       e_curr['point_on_line']))
+        dir_j = np.asarray(e_next.get('ransac_direction',
+                                       e_next['direction']))
+        pol_j = np.asarray(e_next.get('ransac_point_on_line',
+                                       e_next['point_on_line']))
+
+        in_i = e_curr.get('inliers_xy', np.zeros((0, 2)))
+        in_j = e_next.get('inliers_xy', np.zeros((0, 2)))
+        if len(in_i) < 10 or len(in_j) < 10:
+            continue
+
+        # C0 is the shared corner between wall i and wall i+1
+        C0 = np.asarray(e_curr['p2'])
+
+        # Current along-wall parameters of C0
+        t_i = float((C0 - pol_i) @ dir_i)
+        t_j = float((C0 - pol_j) @ dir_j)
+
+        # Data extent from inliers (in the RANSAC frame)
+        t_i_data = (in_i - pol_i) @ dir_i
+        t_j_data = (in_j - pol_j) @ dir_j
+        t_i_min, t_i_max = float(t_i_data.min()), float(t_i_data.max())
+        t_j_min, t_j_max = float(t_j_data.min()), float(t_j_data.max())
+
+        # Adaptive slack: tight for short walls, capped at `slack` for long
+        len_i = float(np.linalg.norm(e_curr['p2'] - e_curr['p1']))
+        len_j = float(np.linalg.norm(e_next['p2'] - e_next['p1']))
+        slack_eff = min(slack, max(0.05, 0.10 * max(len_i, len_j)))
+
+        t_i_cl = float(np.clip(t_i, t_i_min - slack_eff, t_i_max + slack_eff))
+        t_j_cl = float(np.clip(t_j, t_j_min - slack_eff, t_j_max + slack_eff))
+
+        # No change needed if both clamps are no-ops
+        if abs(t_i_cl - t_i) < 1e-6 and abs(t_j_cl - t_j) < 1e-6:
+            continue
+
+        # Two clamped candidate corner positions (one per wall's line)
+        cand_i = pol_i + dir_i * t_i_cl
+        cand_j = pol_j + dir_j * t_j_cl
+        C_new = 0.5 * (cand_i + cand_j)
+
+        # Safeguard: zero-length guard
+        new_len_curr = float(np.linalg.norm(C_new - e_curr['p1']))
+        new_len_next = float(np.linalg.norm(e_next['p2'] - C_new))
+        if new_len_curr < 0.10 or new_len_next < 0.10:
+            continue
+
+        # Safeguard: per-corner sign check — ensure wall orientation
+        # (p1 → p2 along direction) is preserved after the move.
+        old_t_p1_curr = float((np.asarray(e_curr['p1']) - pol_i) @ dir_i)
+        new_t_p2_curr = float((C_new - pol_i) @ dir_i)
+        if new_t_p2_curr <= old_t_p1_curr:
+            continue  # flipping the wall — abort this corner
+        old_t_p2_next = float((np.asarray(e_next['p2']) - pol_j) @ dir_j)
+        new_t_p1_next = float((C_new - pol_j) @ dir_j)
+        if new_t_p1_next >= old_t_p2_next:
+            continue
+
+        # Commit the corner move
+        shift = float(np.linalg.norm(C_new - C0))
+        e_curr['p2'] = C_new
+        e_next['p1'] = C_new
+        e_curr['length'] = new_len_curr
+        e_next['length'] = new_len_next
+        n_moved += 1
+        shifts.append(shift)
+
+    # Final polygon validity check. If Shapely can't build a valid polygon,
+    # revert ALL moves and keep Stage 5's output — better unchanged than
+    # silently-corrupted.
+    reverted = False
+    if n_moved > 0:
+        try:
+            corners = [np.asarray(e['p1']) for e in edges]
+            poly_check = ShapelyPolygon(corners)
+            if (not poly_check.is_valid) or poly_check.area < 1e-3:
+                # Revert
+                for e, snap in zip(edges, snapshot):
+                    e['p1'] = snap['p1']
+                    e['p2'] = snap['p2']
+                    e['length'] = snap['length']
+                    e['angle_deg'] = snap['angle_deg']
+                reverted = True
+                if verbose:
+                    print(f"  [Stage 7] polygon invalid after {n_moved} "
+                          "corner moves — reverted all moves")
+        except Exception as exc:
+            # Any Shapely exception → revert defensively
+            for e, snap in zip(edges, snapshot):
+                e['p1'] = snap['p1']
+                e['p2'] = snap['p2']
+                e['length'] = snap['length']
+                e['angle_deg'] = snap['angle_deg']
+            reverted = True
+            if verbose:
+                print(f"  [Stage 7] Shapely exception ({exc}) — reverted")
+
+    stats = {'n_moved': n_moved if not reverted else 0,
+             'reverted': reverted}
+    if verbose and not reverted:
+        if n_moved > 0:
+            max_shift = max(shifts)
+            mean_shift = sum(shifts) / len(shifts)
+            print(f"  [Stage 7] length-constrained {n_moved}/{n} corners "
+                  f"(max shift={max_shift:.3f}m, "
+                  f"mean shift={mean_shift:.3f}m)")
+        else:
+            print(f"  [Stage 7] no corners needed length-constraining")
+    return edges, stats
 
 
 # ----- Stage 6: gap-split segments -----
@@ -1351,27 +1523,50 @@ def refine_walls(walls_in, pts_3d, floor_z, ceiling_z, *,
     # Stage 5
     translated = _stage5_vertex_translation(merged, verbose=verbose)
 
+    # Stage 7: length-constrain corners to data-supported extent
+    # (per-wall: pull corners inward if they over-extend beyond the RANSAC
+    # inlier extent; push outward if the wall has data reaching beyond).
+    # Uses the `ransac_direction` / `ransac_point_on_line` stashed by
+    # Stage 5. Safe by construction: reverts on Shapely invalidation.
+    constrained, stage7_stats = _stage7_length_constrain(
+        translated, slack=0.30, verbose=verbose)
+
     # Stage 6 (gap-split) is intentionally NOT applied to the polygon
     # topology — it would produce disconnected segments that break Shapely
     # polygon construction. Gap-split is useful as diagnostic info (where
     # are the doors?) but not for the returned outline. Keeping the code
     # for potential future use on a separate per-wall list.
     if verbose:
-        _ = _stage6_gap_split(translated, gap_thresh=gap_thresh,
+        _ = _stage6_gap_split(constrained, gap_thresh=gap_thresh,
                               verbose=verbose)
 
     # Convert to (p1, p2, angle, length) tuples + meta
     out_walls = []
     out_meta = []
-    for e in translated:
+    for e in constrained:
         if e['length'] < 0.10:
             continue
+        # Compute data-extent length for audit (Stage-1 inlier span
+        # projected onto the pre-Stage-5 RANSAC direction).
+        length_data = 0.0
+        try:
+            inliers = e.get('inliers_xy', np.zeros((0, 2)))
+            if len(inliers) >= 10:
+                rdir = np.asarray(e.get('ransac_direction', e['direction']))
+                rpol = np.asarray(e.get('ransac_point_on_line',
+                                         e['point_on_line']))
+                t = (inliers - rpol) @ rdir
+                length_data = float(t.max() - t.min())
+        except Exception:
+            length_data = 0.0
+
         out_walls.append((np.asarray(e['p1']), np.asarray(e['p2']),
                           float(e['angle_deg']), float(e['length'])))
         out_meta.append({
             'snapped_to': e.get('snapped_to', 'free'),
             'residual_m': round(float(e.get('residual', 0.0)), 4),
             'confidence': round(float(e.get('confidence', 0.0)), 3),
+            'length_m_data_extent': round(length_data, 3),
         })
     return out_walls, out_meta
 
@@ -1560,6 +1755,11 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                 entry['snapped_to'] = m.get('snapped_to', 'free')
                 entry['residual_m'] = m.get('residual_m', 0.0)
                 entry['confidence'] = m.get('confidence', 0.0)
+                # Stage 7 audit: data-extent length from RANSAC inliers
+                # (compare to `length_m` to see how much Stage 7 trimmed
+                # the wall to match the point cloud).
+                entry['length_m_data_extent'] = m.get(
+                    'length_m_data_extent', 0.0)
             wall_entries.append(entry)
         meta['variants'][key] = {
             'label': label,
