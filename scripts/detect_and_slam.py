@@ -236,16 +236,22 @@ def main():
         print(f"[INFO] Saved map with boxes: {boxes_map_path}")
 
     # Optional 2D floor-plan extraction (opt-in via --floorplan).
-    # `merged` is already leveled to Z-up by the blocks above, so the
-    # floor-plan module can assume gravity_up = [0, 0, 1] exactly.
+    # Dead-simple wiring: write xyz-only PLY -> level_ply -> floorplan.run().
+    # (xyz-only because level.py's PLY reader chokes on color properties.)
     if args.floorplan:
-        from cloud_slam.floorplan import generate_floorplan
         print(f"[INFO] Generating floor plan ...")
-        generate_floorplan(
-            merged,
-            args.output,
-            name="floorplan",
-            gravity_up=np.array([0.0, 0.0, 1.0]),
+        xyz_only = o3d.geometry.PointCloud()
+        xyz_only.points = merged.points
+        tmp_ply = os.path.join(args.output, "_merged_xyz.ply")
+        o3d.io.write_point_cloud(tmp_ply, xyz_only,
+                                 write_ascii=False, compressed=False)
+        from cloud_slam.floorplan_level import level_ply
+        from cloud_slam.floorplan import run as floorplan_run
+        leveled_ply = os.path.join(args.output, "_merged_leveled.ply")
+        level_ply(tmp_ply, output_path=leveled_ply)
+        os.remove(tmp_ply)
+        floorplan_run(
+            leveled_ply, args.output,
             resolution=args.floorplan_resolution,
             snap_angle=args.floorplan_snap,
         )

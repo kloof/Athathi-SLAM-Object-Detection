@@ -2,19 +2,8 @@
 """
 floorplan — Extract 2D floor plans from LiDAR point cloud scans.
 
-Near-verbatim port of the user's reference script at
-`reference/floorplan/floorplan.py`. Traces the ceiling boundary, simplifies
-to straight walls, snaps to 45-degree angles, and exports PNGs.
-
-Only two deviations from the reference:
-  1. DXF export is dropped (PNG-only) — removes the ezdxf dependency.
-  2. A leveling pre-step (ported from `level.py` in the same folder)
-     rotates the cloud so its floor normal maps to +Z and shifts the
-     floor to Z=0, BEFORE the original pipeline runs. This fixes the
-     single known failure mode — `detect_floor_ceiling`'s histogram
-     top-2 peaks mis-identifying furniture as the ceiling on SLAM
-     outputs. Once the cloud is leveled, the floor peak is at Z=0
-     and the ceiling peak is at ~room_height, unambiguously.
+Traces the ceiling boundary, simplifies to straight walls, snaps to 45-degree
+angles, and exports PNG + DXF.
 
 Usage:
     python floorplan.py input.ply
@@ -35,7 +24,6 @@ import numpy as np
 import open3d as o3d
 from scipy.ndimage import binary_fill_holes, gaussian_filter1d
 from scipy.signal import find_peaks
-from scipy.spatial.transform import Rotation
 from shapely.geometry import Polygon as ShapelyPolygon
 
 
@@ -43,139 +31,9 @@ from shapely.geometry import Polygon as ShapelyPolygon
 # CORE FUNCTIONS
 # ============================================================
 
-def _detect_floor_plane_ransac(points, distance_thresh=0.03, max_attempts=3,
-                                verbose=False):
-    """Find the floor plane via iterative RANSAC. (Ported from level.py.)
-
-    Picks the cloud's narrowest extent as the candidate vertical axis, runs
-    RANSAC up to `max_attempts` times, returns the first horizontal plane
-    (normal within 45 deg of the vertical axis). The returned normal is
-    oriented so its component along the vertical axis is positive.
-
-    Returns (normal, n_inliers) or None if no horizontal plane was found.
-    """
-    xyz = np.asarray(points)[:, :3]
-    extents = xyz.max(axis=0) - xyz.min(axis=0)
-    vert_axis = int(np.argmin(extents))
-    axis_names = ['X', 'Y', 'Z']
-    if verbose:
-        print(f'  Candidate vertical axis: {axis_names[vert_axis]} '
-              f'(extents: X={extents[0]:.2f}, Y={extents[1]:.2f}, '
-              f'Z={extents[2]:.2f})')
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
-    remaining = pcd
-
-    for attempt in range(max_attempts):
-        pts_rem = np.asarray(remaining.points)
-        if len(pts_rem) < 100:
-            break
-        try:
-            plane_model, inliers = remaining.segment_plane(
-                distance_threshold=distance_thresh,
-                ransac_n=3, num_iterations=1000)
-        except Exception:
-            break
-        if len(inliers) < 100:
-            break
-
-        a, b, c, d = plane_model
-        normal = np.array([a, b, c])
-        norm = np.linalg.norm(normal)
-        if norm < 1e-9:
-            break
-        normal /= norm
-
-        vert_component = abs(normal[vert_axis])
-        angle_from_vert = np.degrees(np.arccos(np.clip(vert_component, 0, 1)))
-
-        if angle_from_vert < 45:
-            if normal[vert_axis] < 0:
-                normal = -normal
-            if verbose:
-                print(f'  Plane found on attempt {attempt + 1}: '
-                      f'normal=[{normal[0]:.3f}, {normal[1]:.3f}, '
-                      f'{normal[2]:.3f}], '
-                      f'{angle_from_vert:.1f} deg from '
-                      f'{axis_names[vert_axis]}-axis, '
-                      f'{len(inliers):,} inliers')
-            return normal, len(inliers)
-
-        if verbose:
-            print(f'  Attempt {attempt + 1}: plane is a wall '
-                  f'({angle_from_vert:.1f} deg from '
-                  f'{axis_names[vert_axis]}-axis), skipping')
-        remaining = remaining.select_by_index(inliers, invert=True)
-
-    return None
-
-
-def _level_points(points, normal, verbose=False):
-    """Rotate points so `normal` maps to +Z, shift floor peak to Z=0.
-
-    Ported from level.py. Returns (leveled_points, rotation_deg, z_shift).
-    """
-    target = np.array([[0.0, 0.0, 1.0]])
-    source = normal.reshape(1, 3)
-    R, _ = Rotation.align_vectors(target, source)
-    R_mat = R.as_matrix()
-
-    result = points.copy()
-    result[:, :3] = (R_mat @ points[:, :3].T).T
-
-    angle_deg = R.magnitude() * 180 / np.pi
-    if verbose:
-        print(f'  Rotation applied: {angle_deg:.2f} deg')
-
-    z_vals = result[:, 2]
-    z_min = np.percentile(z_vals, 1)
-    z_max = np.percentile(z_vals, 99)
-    z_range = z_max - z_min
-    bottom_mask = z_vals < (z_min + 0.3 * z_range)
-    if np.sum(bottom_mask) > 10:
-        hist, edges = np.histogram(z_vals[bottom_mask], bins=100)
-        peak_idx = np.argmax(hist)
-        floor_z = (edges[peak_idx] + edges[peak_idx + 1]) / 2
-    else:
-        floor_z = z_min
-
-    result[:, 2] -= floor_z
-    if verbose:
-        print(f'  Z shift: {-floor_z:+.4f} m (floor -> Z=0)')
-
-    return result, float(angle_deg), float(floor_z)
-
-
-def level_cloud(points_xyz, distance_thresh=0.03, verbose=True):
-    """Level a Nx3 point array so the floor is at Z=0 and +Z is up.
-
-    High-level wrapper around `_detect_floor_plane_ransac` + `_level_points`.
-    Returns the leveled (N, 3) array. Raises RuntimeError if no floor plane
-    is found.
-    """
-    if verbose:
-        print('[Level] Detecting floor plane (RANSAC)...')
-    detected = _detect_floor_plane_ransac(
-        points_xyz, distance_thresh=distance_thresh, verbose=verbose)
-    if detected is None:
-        raise RuntimeError('No horizontal plane found — cannot level cloud')
-    normal, _n_inliers = detected
-
-    if verbose:
-        print('[Level] Leveling...')
-    leveled, _rot, _shift = _level_points(points_xyz, normal, verbose=verbose)
-    return leveled[:, :3]
-
-
-def load_and_preprocess(path_or_pcd, voxel_size=0.03, sor_neighbors=20,
-                         sor_std=2.0):
-    """Load PLY/PCD (or take an in-memory PointCloud), apply SOR + voxel
-    downsample. Accepts either a file path (str) or an Open3D PointCloud."""
-    if isinstance(path_or_pcd, str):
-        pcd = o3d.io.read_point_cloud(path_or_pcd)
-    else:
-        pcd = path_or_pcd
+def load_and_preprocess(path, voxel_size=0.03, sor_neighbors=20, sor_std=2.0):
+    """Load PLY/PCD, apply statistical outlier removal + voxel downsample."""
+    pcd = o3d.io.read_point_cloud(path)
     n_raw = len(pcd.points)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=sor_neighbors, std_ratio=sor_std)
     pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
@@ -606,7 +464,7 @@ def re_intersect_corners(walls):
 
 
 # ============================================================
-# EXPORT FUNCTIONS  (PNG-only; DXF export dropped from reference)
+# EXPORT FUNCTIONS
 # ============================================================
 
 def export_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
@@ -723,66 +581,26 @@ def export_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
 
 def run(input_path, output_dir, resolution=0.03, epsilon=0.012,
         snap_angle=45, voxel_size=0.03, ceil_band=0.12,
-        close_kernel=11, angle_flex=3.0, verbose=True,
-        level=True, level_distance_thresh=0.03,
-        pcd=None, name=None):
+        close_kernel=11, angle_flex=3.0, verbose=True):
     """Run the full ceiling-trace floor plan extraction pipeline.
 
     Produces 3 variants:
       A) Ceiling trace with strict angle snap (baseline)
       B) Ceiling trace with flexible angles (snap +/- angle_flex degrees)
       C) RANSAC-refined positions with strict angle snap
-
-    Parameters:
-        input_path  : file path OR ignored when `pcd` is provided.
-        pcd         : optional in-memory Open3D PointCloud; bypasses disk
-                      I/O. When provided, `input_path` is only used to
-                      derive `name` unless `name` is also given.
-        name        : output filename base; defaults to
-                      os.path.splitext(os.path.basename(input_path))[0].
-        level       : if True (default), apply the level.py-style floor
-                      leveling (rotate floor normal to +Z, shift floor to
-                      Z=0) BEFORE running the rest of the pipeline. This
-                      is the single fix for SLAM outputs where the
-                      histogram floor/ceiling detector mis-identifies
-                      furniture as the ceiling. Disable only when you are
-                      certain the cloud is already leveled.
-        level_distance_thresh : RANSAC threshold for floor plane detection.
     """
     os.makedirs(output_dir, exist_ok=True)
-    if name is None:
-        name = os.path.splitext(os.path.basename(input_path))[0]
+    name = os.path.splitext(os.path.basename(input_path))[0]
     t0 = time.time()
 
     if verbose:
         print(f"floorplan: {name}")
         print("=" * 50)
 
-    # Load (from path or in-memory pcd)
-    source = pcd if pcd is not None else input_path
-    pts, n_raw = load_and_preprocess(source, voxel_size)
+    # Load
+    pts, n_raw = load_and_preprocess(input_path, voxel_size)
     if verbose:
         print(f"Loaded: {n_raw} -> {len(pts)} pts")
-
-    # Leveling pre-step (the only deviation from the reference script's
-    # pipeline). Rotates the cloud so the floor normal maps to +Z and
-    # shifts the floor to Z=0. This makes the histogram-based
-    # detect_floor_ceiling below reliably pick the correct floor and
-    # ceiling peaks, even on SLAM outputs where the floor may be at an
-    # arbitrary Z with furniture creating competing peaks.
-    if level:
-        if verbose:
-            print("\n[Level] Applying floor-leveling pre-step...")
-        try:
-            pts = level_cloud(pts, distance_thresh=level_distance_thresh,
-                              verbose=verbose)
-            if verbose:
-                print(f"[Level] Done. Z range now: [{pts[:, 2].min():.2f}, "
-                      f"{pts[:, 2].max():.2f}]")
-        except RuntimeError as exc:
-            if verbose:
-                print(f"[Level] FAILED ({exc}); continuing with un-leveled "
-                      "cloud. detect_floor_ceiling may pick the wrong peaks.")
 
     # Floor/ceiling
     floor_z, ceiling_z = detect_floor_ceiling(pts)
@@ -943,8 +761,6 @@ def run(input_path, output_dir, resolution=0.03, epsilon=0.012,
     plt.savefig(f'{output_dir}/{name}_corners.png', bbox_inches='tight')
     plt.close()
 
-    # (DXF export dropped — PNG-only per user preference)
-
     # Metadata
     elapsed = time.time() - t0
     meta = {
@@ -976,36 +792,6 @@ def run(input_path, output_dir, resolution=0.03, epsilon=0.012,
             print(f"  {key}: {poly.area:.1f} m2, {len(walls)} walls - {label}")
 
     return variants, meta
-
-
-# ============================================================
-# Integration adapter
-# ============================================================
-# `generate_floorplan` is the name the rest of this repo (e.g.
-# scripts/detect_and_slam.py, scripts/generate_floorplan.py) imports.
-# It's a thin adapter around `run()` that matches the integration
-# call sites' expected keyword arguments (pcd, output_dir, name,
-# gravity_up, imus) used by earlier versions of this module. Any kwargs
-# that don't apply here (gravity_up, imus) are silently ignored — the
-# leveling step inside run() does not need them.
-
-def generate_floorplan(pcd, output_dir, name="floorplan", *,
-                        gravity_up=None, imus=None,
-                        resolution=0.03, epsilon=0.012, snap_angle=45,
-                        voxel_size=0.03, ceil_band=0.12,
-                        close_kernel=11, angle_flex=3.0, verbose=True,
-                        level=True, level_distance_thresh=0.03):
-    """Thin adapter — see `run()` docstring."""
-    # gravity_up / imus are accepted for call-site compatibility but not
-    # used: the new pipeline auto-detects the floor plane from the cloud.
-    return run(
-        input_path=None, output_dir=output_dir, name=name,
-        pcd=pcd, resolution=resolution, epsilon=epsilon,
-        snap_angle=snap_angle, voxel_size=voxel_size,
-        ceil_band=ceil_band, close_kernel=close_kernel,
-        angle_flex=angle_flex, verbose=verbose,
-        level=level, level_distance_thresh=level_distance_thresh,
-    )
 
 
 # ============================================================
