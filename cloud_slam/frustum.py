@@ -123,12 +123,15 @@ def estimate_gravity(imus, n_samples=50):
 
     gravity_up = gravity / norm
 
-    # IMU convention check: accelerometer at rest should report the support
-    # force (pointing UP). Some IMUs report gravity direction (pointing DOWN).
-    # For a roughly-upright sensor, gravity_up.z should be positive.
-    if gravity_up[2] < 0:
-        gravity_up = -gravity_up
-
+    # The Unitree L2 accelerometer reports proper acceleration (the support
+    # force, pointing UP in the sensor frame). `gravity_up` computed above
+    # is already the up-direction in the sensor/lidar frame — no sign flip
+    # is applied.
+    #
+    # (The earlier Z-sign heuristic assumed an upright sensor and became
+    # noise-flaky for the L2's ~70°-tilted mount. If integrating a new IMU
+    # that reports the gravity field direction instead of proper accel,
+    # negate `gravity_up` here.)
     return gravity_up
 
 
