@@ -18,7 +18,7 @@ from cloud_slam.size_priors import (
 )
 
 
-def refine_objects(merged_pcd, objects_raw, imus, tracker):
+def refine_objects(merged_pcd, objects_raw, imus, tracker, gravity_up=None):
     """
     Full RoomPlan-style object refinement pipeline.
 
@@ -27,11 +27,20 @@ def refine_objects(merged_pcd, objects_raw, imus, tracker):
         objects_raw: list of raw object dicts from tracker.get_final_objects()
         imus: list of (timestamp, gyro, acc) tuples
         tracker: ObjectTracker3D with per-object point buffers
+        gravity_up: Optional (3,) unit vector for "up" in the frame of
+            merged_pcd and tracker.point_buffer. If None (default), gravity
+            is estimated from IMU data — the legacy behavior. Pass
+            np.array([0,0,1]) when merged_pcd/tracker have already been
+            pre-leveled by cloud_slam.leveling.level_by_floor, otherwise the
+            IMU estimate will undo the pre-leveling work.
 
     Returns:
         objects_refined: list of refined object dicts
     """
-    gravity_up = estimate_gravity(imus)
+    if gravity_up is None:
+        gravity_up = estimate_gravity(imus)
+    else:
+        gravity_up = np.asarray(gravity_up, dtype=float)
 
     # Step 1: Room structure detection
     print("[REFINE] Detecting room structure...")

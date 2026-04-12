@@ -14,7 +14,8 @@ from cloud_slam.spatial_memory import SpatialObjectMemory
 from cloud_slam.pipelines import icp_imu_pipeline
 
 
-def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
+def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
+        leveling_mode="legacy"):
     """
     Run SLAM + object detection pipeline.
 
@@ -25,6 +26,12 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
         calib: dict from load_calibration()
         voxel_size: final point cloud resolution
         detector_config: dict of kwargs for YOLODetector (optional)
+        leveling_mode: "legacy" (default) = leveling deferred to the caller
+            (scripts/detect_and_slam.py does it after this function returns).
+            "floor" = pre-level the merged cloud + tracker buffers via
+            cloud_slam.leveling.level_by_floor BEFORE box refinement, so OBBs
+            are fit in the already-leveled frame. The "legacy" default keeps
+            the working IMU-gravity path completely untouched.
 
     Returns:
         merged: Open3D PointCloud (colored)
@@ -81,11 +88,36 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None):
     # Post-processing
     tracks_before_merge = len(tracker.objects)
     tracker.merge_fragmented_tracks()
+
+    # Optional pre-leveling: rotate the merged cloud + tracker buffers so the
+    # detected floor maps to +Z and (optionally) sits at Z=0. This keeps all
+    # downstream OBB fitting in an already-leveled frame.
+    #
+    # Legacy mode is a no-op here; scripts/detect_and_slam.py does IMU-based
+    # leveling AFTER refinement, matching the pre-existing behavior exactly.
+    gravity_for_refine = None  # → refine_objects re-estimates from IMU (legacy)
+    if leveling_mode == "floor":
+        from cloud_slam.leveling import level_by_floor, apply_leveling_to_tracker
+        R_level, z_shift, level_method = level_by_floor(merged, imus)
+        print(f"[LEVEL] method={level_method}, z_shift={z_shift:+.3f}m")
+        if not np.allclose(R_level, np.eye(3), atol=1e-6):
+            merged.rotate(R_level, center=(0.0, 0.0, 0.0))
+        if abs(z_shift) > 1e-6:
+            merged.translate((0.0, 0.0, -z_shift))
+        apply_leveling_to_tracker(tracker, R_level, z_shift)
+        stats['leveling_mode'] = 'floor'
+        stats['leveling_method'] = level_method
+        stats['leveling_z_shift'] = float(z_shift)
+        gravity_for_refine = np.array([0.0, 0.0, 1.0])
+    else:
+        stats['leveling_mode'] = 'legacy'
+
     objects_raw = tracker.get_final_objects(gravity_up=gravity_up)
 
     # RoomPlan-style refinement
     from cloud_slam.box_refiner import refine_objects
-    objects = refine_objects(merged, objects_raw, imus, tracker)
+    objects = refine_objects(merged, objects_raw, imus, tracker,
+                             gravity_up=gravity_for_refine)
 
     stats['detection_enabled'] = True
     stats['total_detections'] = detection_count

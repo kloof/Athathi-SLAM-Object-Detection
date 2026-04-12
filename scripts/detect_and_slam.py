@@ -64,6 +64,13 @@ def main():
                         help="Final voxel size in meters (default: 0.005)")
     parser.add_argument("--conf", type=float, default=0.3,
                         help="YOLOE confidence threshold (default: 0.3)")
+    parser.add_argument("--leveling", choices=["legacy", "floor"], default="legacy",
+                        help="Leveling strategy. 'legacy' (default) = IMU "
+                             "gravity estimate applied AFTER refinement (the "
+                             "stable, 2-months-in-the-making path). 'floor' = "
+                             "RANSAC floor detection (with IMU prior) applied "
+                             "BEFORE refinement and shifts floor to Z=0 — "
+                             "experimental, sharper leveling.")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -98,33 +105,39 @@ def main():
         clouds, imus, images, calib,
         voxel_size=args.voxel_size,
         detector_config=detector_config,
+        leveling_mode=args.leveling,
     )
 
     t_total = time.time() - t0
 
-    # Level the scan: rotate so gravity aligns with Z-up
     import open3d as o3d
     from scipy.spatial.transform import Rotation as SciRot
-    from cloud_slam.frustum import estimate_gravity
-
-    gravity_up = estimate_gravity(imus)
     z_up = np.array([0.0, 0.0, 1.0])
-    if not np.allclose(gravity_up, z_up, atol=0.01):
-        R_level = SciRot.align_vectors([z_up], [gravity_up])[0].as_matrix()
-        print(f"[INFO] Leveling scan (gravity was {gravity_up})")
 
-        # Rotate the point cloud
-        merged.rotate(R_level, center=(0, 0, 0))
+    if args.leveling == "legacy":
+        # Level the scan: rotate so IMU-estimated gravity aligns with Z-up.
+        # This is the original, working path — untouched by the floor-leveling
+        # feature. In "floor" mode the pipeline has already leveled merged +
+        # tracker and left us in a Z-up frame with the floor at Z=0.
+        from cloud_slam.frustum import estimate_gravity
 
-        # Rotate all object centers and orientations
-        for obj in objects:
-            c = np.array(obj['center'])
-            obj['center'] = (R_level @ c).tolist()
-            if 'orientation' in obj:
-                q = np.array(obj['orientation']['quaternion'])
-                R_obj = SciRot.from_quat(q).as_matrix()
-                R_new = R_level @ R_obj
-                obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+        gravity_up = estimate_gravity(imus)
+        if not np.allclose(gravity_up, z_up, atol=0.01):
+            R_level = SciRot.align_vectors([z_up], [gravity_up])[0].as_matrix()
+            print(f"[INFO] Leveling scan (gravity was {gravity_up})")
+
+            # Rotate the point cloud
+            merged.rotate(R_level, center=(0, 0, 0))
+
+            # Rotate all object centers and orientations
+            for obj in objects:
+                c = np.array(obj['center'])
+                obj['center'] = (R_level @ c).tolist()
+                if 'orientation' in obj:
+                    q = np.array(obj['orientation']['quaternion'])
+                    R_obj = SciRot.from_quat(q).as_matrix()
+                    R_new = R_level @ R_obj
+                    obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
 
     # Align room to axes: detect wall direction on the LEVELED cloud
     from cloud_slam.room_structure import detect_room
