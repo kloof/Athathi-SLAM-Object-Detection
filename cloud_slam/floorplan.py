@@ -1,21 +1,27 @@
+#!/usr/bin/env python3
 """
-Floor-plan extraction from a leveled indoor point cloud.
+floorplan — Extract 2D floor plans from LiDAR point cloud scans.
 
-Ported from `reference/floorplan/floorplan.py` with one substantive change:
-the reference's fragile `detect_floor_ceiling()` (top-2 Z-histogram peaks) is
-replaced with `detect_floor_ceiling_robust()`, which uses the same RANSAC +
-IMU-prior plane detection that the rest of the SLAM pipeline already relies
-on (`cloud_slam.room_structure.detect_room`). Furniture peaks no longer win
-against the real ceiling.
+Near-verbatim port of the user's reference script at
+`reference/floorplan/floorplan.py`. Traces the ceiling boundary, simplifies
+to straight walls, snaps to 45-degree angles, and exports PNGs.
 
-DXF export from the reference tool is intentionally not ported — this module
-emits PNG + JSON only.
+Only two deviations from the reference:
+  1. DXF export is dropped (PNG-only) — removes the ezdxf dependency.
+  2. A leveling pre-step (ported from `level.py` in the same folder)
+     rotates the cloud so its floor normal maps to +Z and shifts the
+     floor to Z=0, BEFORE the original pipeline runs. This fixes the
+     single known failure mode — `detect_floor_ceiling`'s histogram
+     top-2 peaks mis-identifying furniture as the ceiling on SLAM
+     outputs. Once the cloud is leveled, the floor peak is at Z=0
+     and the ceiling peak is at ~room_height, unambiguously.
 
-Public entry points:
-    detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None)
-    generate_floorplan(pcd, output_dir, name="floorplan", *, ...)
+Usage:
+    python floorplan.py input.ply
+    python floorplan.py input.ply -o output_dir/
+    python floorplan.py input.ply --epsilon 0.015 --snap 45 --resolution 0.03
 """
-
+import argparse
 import json
 import os
 import time
@@ -29,287 +35,189 @@ import numpy as np
 import open3d as o3d
 from scipy.ndimage import binary_fill_holes, gaussian_filter1d
 from scipy.signal import find_peaks
+from scipy.spatial.transform import Rotation
 from shapely.geometry import Polygon as ShapelyPolygon
 
-from cloud_slam.room_structure import detect_room
-from cloud_slam.frustum import estimate_gravity
-
 
 # ============================================================
-# FLOOR / CEILING DETECTION (the robust replacement)
+# CORE FUNCTIONS
 # ============================================================
 
-def _plane_inliers_xy(pts, plane, distance_thresh=0.15):
-    """Return the XY coords of cloud points within `distance_thresh` of plane."""
-    signed = (pts - plane.centroid) @ plane.normal
-    mask = np.abs(signed) < distance_thresh
-    return pts[mask][:, :2]
+def _detect_floor_plane_ransac(points, distance_thresh=0.03, max_attempts=3,
+                                verbose=False):
+    """Find the floor plane via iterative RANSAC. (Ported from level.py.)
 
+    Picks the cloud's narrowest extent as the candidate vertical axis, runs
+    RANSAC up to `max_attempts` times, returns the first horizontal plane
+    (normal within 45 deg of the vertical axis). The returned normal is
+    oriented so its component along the vertical axis is positive.
 
-def _convex_hull_area(xy_points):
-    """Area of the 2D convex hull of a point set. Returns 0.0 for degenerate input."""
-    if xy_points is None or len(xy_points) < 3:
-        return 0.0
-    try:
-        from scipy.spatial import ConvexHull
-        hull = ConvexHull(xy_points)
-        return float(hull.volume)  # in 2D, ConvexHull.volume is the area
-    except Exception:
-        return 0.0
-
-
-def _select_ceiling_plane(pts, room, distance_thresh=0.15, verbose=False):
-    """Of the two horizontal planes detected by detect_room, return the one
-    that is the actual ceiling.
-
-    Rationale: ceilings span the entire room (uninterrupted horizontal
-    surface). Floors are partially occluded by furniture (beds, tables,
-    sofas sit on the floor, hiding it). The plane with the larger XY
-    convex-hull coverage is the ceiling.
-
-    This heuristic is robust to leveling-sign inversion: even if the cloud
-    is upside-down and detect_room swaps the floor/ceiling labels, picking
-    by coverage picks the physically-correct surface.
-
-    Args:
-        pts: (N, 3) array of cloud points (full resolution).
-        room: RoomStructure with .floor and .ceiling Plane objects.
-        distance_thresh: band used to collect inliers for each plane (m).
-
-    Returns:
-        (ceiling_plane, floor_plane, swapped_bool, info_dict)
-        where info_dict has hull areas for both candidates.
+    Returns (normal, n_inliers) or None if no horizontal plane was found.
     """
-    cand_ceil = room.ceiling   # detect_room's label
-    cand_floor = room.floor
+    xyz = np.asarray(points)[:, :3]
+    extents = xyz.max(axis=0) - xyz.min(axis=0)
+    vert_axis = int(np.argmin(extents))
+    axis_names = ['X', 'Y', 'Z']
+    if verbose:
+        print(f'  Candidate vertical axis: {axis_names[vert_axis]} '
+              f'(extents: X={extents[0]:.2f}, Y={extents[1]:.2f}, '
+              f'Z={extents[2]:.2f})')
 
-    if cand_ceil is None:
-        # Nothing to swap with
-        return None, cand_floor, False, {'ceil_area': 0.0, 'floor_area': 0.0}
-    if cand_floor is None:
-        # Only a ceiling candidate — trust detect_room
-        return cand_ceil, None, False, {'ceil_area': 0.0, 'floor_area': 0.0}
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+    remaining = pcd
 
-    xy_ceil = _plane_inliers_xy(pts, cand_ceil, distance_thresh)
-    xy_floor = _plane_inliers_xy(pts, cand_floor, distance_thresh)
-    area_ceil = _convex_hull_area(xy_ceil)
-    area_floor = _convex_hull_area(xy_floor)
+    for attempt in range(max_attempts):
+        pts_rem = np.asarray(remaining.points)
+        if len(pts_rem) < 100:
+            break
+        try:
+            plane_model, inliers = remaining.segment_plane(
+                distance_threshold=distance_thresh,
+                ransac_n=3, num_iterations=1000)
+        except Exception:
+            break
+        if len(inliers) < 100:
+            break
 
-    info = {'ceil_area': area_ceil, 'floor_area': area_floor}
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c])
+        norm = np.linalg.norm(normal)
+        if norm < 1e-9:
+            break
+        normal /= norm
 
-    # Swap (i.e. treat detect_room's "floor" as the real ceiling) only when
-    # the floor-labelled plane's XY hull is SIGNIFICANTLY larger — not just
-    # marginally. In well-scanned rooms with open floor space, the floor's
-    # hull can be a few percent larger than the ceiling's just by chance,
-    # which is NOT evidence of leveling inversion. The Unitree L2 inverted
-    # case shows a ratio of ~1.4x; a threshold of 1.25x excludes the 1.05-
-    # 1.07x noise while catching real inversions.
-    #
-    # Root-caused via 4-agent investigation (2026-04-12): previously any
-    # `area_floor > area_ceil` triggered a swap and a 3 m Z sign-flip that
-    # emptied the wall-band on two well-leveled test scans.
-    SWAP_HULL_RATIO = 1.25
-    ratio = (area_floor / area_ceil) if area_ceil > 1e-6 else 1.0
-    if area_floor > area_ceil * SWAP_HULL_RATIO:
+        vert_component = abs(normal[vert_axis])
+        angle_from_vert = np.degrees(np.arccos(np.clip(vert_component, 0, 1)))
+
+        if angle_from_vert < 45:
+            if normal[vert_axis] < 0:
+                normal = -normal
+            if verbose:
+                print(f'  Plane found on attempt {attempt + 1}: '
+                      f'normal=[{normal[0]:.3f}, {normal[1]:.3f}, '
+                      f'{normal[2]:.3f}], '
+                      f'{angle_from_vert:.1f} deg from '
+                      f'{axis_names[vert_axis]}-axis, '
+                      f'{len(inliers):,} inliers')
+            return normal, len(inliers)
+
         if verbose:
-            print(f"[FLOORPLAN] auto-swapped floor/ceiling — leveling "
-                  f"inverted (ceil hull={area_ceil:.2f} m², "
-                  f"floor hull={area_floor:.2f} m², ratio={ratio:.2f} "
-                  f"> {SWAP_HULL_RATIO:.2f}).")
-        return cand_floor, cand_ceil, True, info
+            print(f'  Attempt {attempt + 1}: plane is a wall '
+                  f'({angle_from_vert:.1f} deg from '
+                  f'{axis_names[vert_axis]}-axis), skipping')
+        remaining = remaining.select_by_index(inliers, invert=True)
+
+    return None
+
+
+def _level_points(points, normal, verbose=False):
+    """Rotate points so `normal` maps to +Z, shift floor peak to Z=0.
+
+    Ported from level.py. Returns (leveled_points, rotation_deg, z_shift).
+    """
+    target = np.array([[0.0, 0.0, 1.0]])
+    source = normal.reshape(1, 3)
+    R, _ = Rotation.align_vectors(target, source)
+    R_mat = R.as_matrix()
+
+    result = points.copy()
+    result[:, :3] = (R_mat @ points[:, :3].T).T
+
+    angle_deg = R.magnitude() * 180 / np.pi
+    if verbose:
+        print(f'  Rotation applied: {angle_deg:.2f} deg')
+
+    z_vals = result[:, 2]
+    z_min = np.percentile(z_vals, 1)
+    z_max = np.percentile(z_vals, 99)
+    z_range = z_max - z_min
+    bottom_mask = z_vals < (z_min + 0.3 * z_range)
+    if np.sum(bottom_mask) > 10:
+        hist, edges = np.histogram(z_vals[bottom_mask], bins=100)
+        peak_idx = np.argmax(hist)
+        floor_z = (edges[peak_idx] + edges[peak_idx + 1]) / 2
+    else:
+        floor_z = z_min
+
+    result[:, 2] -= floor_z
+    if verbose:
+        print(f'  Z shift: {-floor_z:+.4f} m (floor -> Z=0)')
+
+    return result, float(angle_deg), float(floor_z)
+
+
+def level_cloud(points_xyz, distance_thresh=0.03, verbose=True):
+    """Level a Nx3 point array so the floor is at Z=0 and +Z is up.
+
+    High-level wrapper around `_detect_floor_plane_ransac` + `_level_points`.
+    Returns the leveled (N, 3) array. Raises RuntimeError if no floor plane
+    is found.
+    """
+    if verbose:
+        print('[Level] Detecting floor plane (RANSAC)...')
+    detected = _detect_floor_plane_ransac(
+        points_xyz, distance_thresh=distance_thresh, verbose=verbose)
+    if detected is None:
+        raise RuntimeError('No horizontal plane found — cannot level cloud')
+    normal, _n_inliers = detected
 
     if verbose:
-        print(f"[FLOORPLAN] ceiling plane: hull={area_ceil:.2f} m² "
-              f"(floor candidate hull={area_floor:.2f} m², ratio={ratio:.2f} "
-              f"≤ {SWAP_HULL_RATIO:.2f} — no swap).")
-    return cand_ceil, cand_floor, False, info
+        print('[Level] Leveling...')
+    leveled, _rot, _shift = _level_points(points_xyz, normal, verbose=verbose)
+    return leveled[:, :3]
 
 
-def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
-                                 bin_width=0.02, verbose=False):
-    """Robust floor/ceiling Z using RANSAC + IMU gravity.
-
-    Gravity resolution order:
-        explicit `gravity_up` → `estimate_gravity(imus)` → `[0, 0, 1]`.
-
-    Tier 1: detect_room(pcd, gravity_up) returns the lowest horizontal
-            plane (floor) and the highest horizontal plane above
-            floor + 1.0 m (ceiling). When both are populated, use them.
-    Tier 2: floor hit but no ceiling (open-ceiling scans, tall rooms).
-            Ceiling_z = 98th percentile of (points · gravity_up) above
-            floor_z + 1.0 m.
-    Tier 3: detect_room fails entirely (fewer than ~100 horizontal
-            points). Fall back to the original Z-histogram top-2 peaks
-            for parity with the reference tool. Only reached on
-            pathological inputs.
-
-    Args:
-        pcd:         Open3D PointCloud.
-        gravity_up:  (3,) unit vector for "up". If None, try imus, else [0,0,1].
-        imus:        list of (t, gyro, acc) — IMU prior when gravity_up is None.
-        bin_width:   Z-histogram bin size for Tier 3 fallback.
-        verbose:     Print which tier produced the answer.
-
-    Returns:
-        (floor_z, ceiling_z, ceiling_plane_or_none). The third element is
-        the RANSAC ceiling Plane when Tier 1 succeeds (so callers can do
-        point-to-plane masking); None for Tier 2/3 fallbacks.
-
-    The Tier 1 path also auto-selects between detect_room's floor- and
-    ceiling-labelled planes by XY coverage, so the returned ceiling is
-    the physically-correct surface even if the leveling is sign-inverted
-    (see _select_ceiling_plane).
-    """
-    # Resolve gravity
-    if gravity_up is None:
-        if imus:
-            try:
-                gravity_up = np.asarray(estimate_gravity(imus), dtype=float)
-            except Exception:
-                gravity_up = np.array([0.0, 0.0, 1.0])
-        else:
-            gravity_up = np.array([0.0, 0.0, 1.0])
-    gravity_up = np.asarray(gravity_up, dtype=float)
-    n = np.linalg.norm(gravity_up)
-    if n < 1e-6:
-        gravity_up = np.array([0.0, 0.0, 1.0])
+def load_and_preprocess(path_or_pcd, voxel_size=0.03, sor_neighbors=20,
+                         sor_std=2.0):
+    """Load PLY/PCD (or take an in-memory PointCloud), apply SOR + voxel
+    downsample. Accepts either a file path (str) or an Open3D PointCloud."""
+    if isinstance(path_or_pcd, str):
+        pcd = o3d.io.read_point_cloud(path_or_pcd)
     else:
-        gravity_up = gravity_up / n
-
+        pcd = path_or_pcd
+    n_raw = len(pcd.points)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=sor_neighbors, std_ratio=sor_std)
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
     pts = np.asarray(pcd.points)
-    z_along = pts @ gravity_up  # scalar height along gravity
+    return pts, n_raw
 
-    # ---- Tier 1: detect_room ----
-    try:
-        room = detect_room(pcd, gravity_up=gravity_up)
-    except Exception as e:
-        if verbose:
-            print(f"[FLOORPLAN] detect_room raised: {e}")
-        room = None
 
-    if room is not None and room.floor is not None and room.ceiling is not None:
-        # Auto-pick the real ceiling by XY coverage. Robust to leveling
-        # inversion: picks the physical ceiling even if detect_room's
-        # "floor"/"ceiling" labels are swapped.
-        ceiling_plane, floor_plane, swapped, _info = _select_ceiling_plane(
-            pts, room, verbose=verbose)
-        z_ceiling = float(ceiling_plane.centroid @ gravity_up)
-        z_floor = float(floor_plane.centroid @ gravity_up)
-        # For display consistency, always report floor_z < ceiling_z.
-        # When leveling is inverted, the physical ceiling is at the lower
-        # Z in the leveled frame; we flip signs so the reported heights are
-        # physically sensible (floor below, ceiling above). The returned
-        # `ceiling_plane` still references the physical ceiling surface so
-        # that point-to-plane masking works on the real cloud.
-        if swapped:
-            floor_z = float(-z_floor)      # physical floor — make positive up
-            ceiling_z = float(-z_ceiling)  # physical ceiling — make positive up
-        else:
-            floor_z = z_floor
-            ceiling_z = z_ceiling
-        if verbose:
-            print(f"[FLOORPLAN] floor/ceiling via RANSAC (Tier 1): "
-                  f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}"
-                  f"{' (Z-flipped for display — leveling is inverted)' if swapped else ''}")
-        return floor_z, ceiling_z, ceiling_plane
-
-    # ---- Tier 2: floor only — percentile above floor + 1 m ----
-    # If RANSAC found a good floor, preserve it. Only the ceiling falls back.
-    if room is not None and room.floor is not None:
-        floor_z = float(room.floor_height)
-        above = z_along[z_along > floor_z + 1.0]
-        if above.size >= 50:
-            ceiling_z = float(np.percentile(above, 98))
-            if verbose:
-                print(f"[FLOORPLAN] ceiling via percentile (Tier 2): "
-                      f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}")
-            return floor_z, ceiling_z, None
-        # Too few points above floor+1m (pathological scan). Keep the RANSAC
-        # floor but use the 99th percentile of the full Z range as ceiling.
-        if z_along.size >= 50:
-            ceiling_z = float(np.percentile(z_along, 99))
-            if ceiling_z - floor_z > 0.5:  # at least half-meter to be usable
-                if verbose:
-                    print(f"[FLOORPLAN] ceiling via 99th-pct fallback (Tier 2b): "
-                          f"floor={floor_z:.3f} (RANSAC), ceiling={ceiling_z:.3f}")
-                return floor_z, ceiling_z, None
-
-    # ---- Tier 3: histogram fallback (reference-tool parity) ----
-    if z_along.size == 0:
-        raise ValueError("empty point cloud")
-    bins = np.arange(z_along.min(), z_along.max() + bin_width, bin_width)
-    hist, edges = np.histogram(z_along, bins=bins)
+def detect_floor_ceiling(pts, bin_width=0.02):
+    """Detect floor and ceiling Z from histogram peaks."""
+    z = pts[:, 2]
+    bins = np.arange(z.min(), z.max() + bin_width, bin_width)
+    hist, edges = np.histogram(z, bins=bins)
     centers = (edges[:-1] + edges[1:]) / 2
     zhist = gaussian_filter1d(hist.astype(float), sigma=3)
     pks, props = find_peaks(zhist, height=np.max(zhist) * 0.1, distance=10)
+
     if len(pks) >= 2:
         top2 = pks[np.argsort(props['peak_heights'])[-2:]]
         top2 = np.sort(top2)
-        floor_z = float(centers[top2[0]])
-        ceiling_z = float(centers[top2[1]])
+        floor_z, ceiling_z = centers[top2[0]], centers[top2[1]]
     else:
-        floor_z = float(np.percentile(z_along, 5))
-        ceiling_z = float(np.percentile(z_along, 95))
+        floor_z = np.percentile(z, 5)
+        ceiling_z = np.percentile(z, 95)
 
-    if verbose:
-        print(f"[FLOORPLAN] floor/ceiling via histogram fallback (Tier 3): "
-              f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}")
-    return floor_z, ceiling_z, None
+    return floor_z, ceiling_z
 
 
-# ============================================================
-# CORE GEOMETRIC FUNCTIONS (1:1 port from reference)
-# ============================================================
-
-def _voxel_downsample(pcd, voxel_size=0.03, sor_neighbors=20, sor_std=2.0):
-    """Statistical outlier removal + voxel downsample. In-memory equivalent
-    of the reference tool's `load_and_preprocess`."""
-    n_raw = len(pcd.points)
-    pcd2, _ = pcd.remove_statistical_outlier(nb_neighbors=sor_neighbors, std_ratio=sor_std)
-    pcd2 = pcd2.voxel_down_sample(voxel_size=voxel_size)
-    return np.asarray(pcd2.points), n_raw
-
-
-def extract_ceiling_points(pts, ceiling_z, band=0.15, floor_z=None,
-                            ceiling_plane=None):
-    """Extract ceiling-level points projected to XY.
-
-    If `ceiling_plane` is provided (the RANSAC ceiling plane from
-    detect_room), use point-to-plane distance — robust to residual leveling
-    tilt and correct when the plane's normal is not exactly [0, 0, 1].
-    Otherwise fall back to a tight Z-band centred on `ceiling_z`.
-
-    The previous implementation used a 70 %-of-room-height cutoff, which
-    produced a ~1 m thick band that included tops of tall furniture
-    (67.9 % contamination measured on the reference scan). That heuristic
-    is intentionally removed.
-
-    Args:
-        pts:            (N, 3) cloud points.
-        ceiling_z:      ceiling height along gravity (for the Z-band fallback).
-        band:           half-thickness of the mask in meters. Default 0.15.
-        floor_z:        unused in the current implementation; kept for
-                        backwards compatibility.
-        ceiling_plane:  Plane object from room_structure.detect_room with
-                        `normal` and `centroid` attributes. Optional.
-
-    Returns:
-        (M, 2) XY coordinates of the masked points.
-    """
-    del floor_z  # unused; retained for backwards compatibility
-
-    if ceiling_plane is not None:
-        # Point-to-plane distance (preferred path).
-        signed = (pts - ceiling_plane.centroid) @ ceiling_plane.normal
-        mask = np.abs(signed) < band
+def extract_ceiling_points(pts, ceiling_z, band=0.12, floor_z=None):
+    """Extract ceiling points. Handles multi-level ceilings by taking
+    all points in the upper portion of the room, not just a narrow band."""
+    if floor_z is not None:
+        h = ceiling_z - floor_z
+        # Take everything above 70% of room height — catches double ceilings
+        z_cutoff = floor_z + h * 0.70
+        mask = (pts[:, 2] > z_cutoff) & (pts[:, 2] < ceiling_z + band)
     else:
-        # Tight Z-band fallback (Tier 2/3 of detect_floor_ceiling_robust).
-        mask = np.abs(pts[:, 2] - ceiling_z) < band
+        mask = (pts[:, 2] > ceiling_z - band) & (pts[:, 2] < ceiling_z + band)
     return pts[mask][:, :2]
 
 
 def ceiling_to_binary(ceil_xy, resolution=0.03, close_kernel=11, open_kernel=5):
-    """Project ceiling XY points to a binary mask and clean with morphology."""
+    """Project ceiling points to 2D binary mask with morphological cleanup."""
     x_min, y_min = ceil_xy.min(axis=0) - 0.5
     x_max, y_max = ceil_xy.max(axis=0) + 0.5
     nx = int((x_max - x_min) / resolution)
@@ -319,6 +227,7 @@ def ceiling_to_binary(ceil_xy, resolution=0.03, close_kernel=11, open_kernel=5):
         ceil_xy[:, 0], ceil_xy[:, 1],
         bins=[nx, ny], range=[[x_min, x_max], [y_min, y_max]])
 
+    # Normalize + Otsu threshold
     if np.any(grid > 0):
         cap = np.percentile(grid[grid > 0], 90)
         g8 = (np.clip(grid, 0, cap) / cap * 255).astype(np.uint8)
@@ -327,19 +236,18 @@ def ceiling_to_binary(ceil_xy, resolution=0.03, close_kernel=11, open_kernel=5):
 
     _, binary = cv2.threshold(g8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel)))
+    # Morphology: close scan-line gaps, fill holes, remove noise
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel)))
     binary = (binary_fill_holes(binary > 0).astype(np.uint8)) * 255
-    binary = cv2.morphologyEx(
-        binary, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel)))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kernel, open_kernel)))
 
     return binary, g8, xe, ye, resolution, x_min, y_min
 
 
 def remove_outlier_clusters(binary):
-    """Keep only the largest connected component; soften jagged edges."""
+    """Keep only the largest connected component."""
     n_labels, labeled, stats, _ = cv2.connectedComponentsWithStats(binary)
     if n_labels <= 1:
         return binary, 0
@@ -348,6 +256,8 @@ def remove_outlier_clusters(binary):
     biggest = np.argmax(areas) + 1
     clean = np.zeros_like(binary)
     clean[labeled == biggest] = 255
+
+    # Smooth jagged edges
     clean = cv2.erode(clean, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     clean = cv2.dilate(clean, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
@@ -355,53 +265,69 @@ def remove_outlier_clusters(binary):
 
 
 def trace_and_simplify(binary, epsilon_ratio=0.012):
-    """Contour trace + Douglas-Peucker simplification."""
+    """Trace contour and simplify with Douglas-Peucker."""
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour = max(contours, key=cv2.contourArea)
+
     perimeter = cv2.arcLength(contour, True)
     epsilon = epsilon_ratio * perimeter
     simplified = cv2.approxPolyDP(contour, epsilon, True)
+
     return contour, simplified
 
 
 def pixel_to_real(px_coords, x_min, y_min, resolution):
+    """Convert pixel contour coords to real-world (swap col/row -> x/y)."""
     real = np.zeros_like(px_coords, dtype=float)
-    real[:, 0] = x_min + px_coords[:, 1] * resolution
-    real[:, 1] = y_min + px_coords[:, 0] * resolution
+    real[:, 0] = x_min + px_coords[:, 1] * resolution  # row -> x
+    real[:, 1] = y_min + px_coords[:, 0] * resolution  # col -> y
     return real
 
 
 def detect_corners(binary, g8, x_min, y_min, resolution, max_corners=20,
                     quality=0.02, min_distance_m=0.5):
-    """Shi-Tomasi corner detection on the ceiling mask edges."""
+    """Detect corners directly from the ceiling binary mask using Shi-Tomasi.
+
+    Returns real-world corner coordinates ordered as a polygon.
+    """
     min_distance_px = int(min_distance_m / resolution)
+
+    # Shi-Tomasi corner detection on the binary mask edges
     edges = cv2.Canny(binary, 50, 150)
+    # Dilate edges slightly so corners are detected at wall intersections
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
 
     corners_px = cv2.goodFeaturesToTrack(
         edges, maxCorners=max_corners, qualityLevel=quality,
         minDistance=min_distance_px, blockSize=7)
+
     if corners_px is None or len(corners_px) < 3:
         return None
 
     corners_px = corners_px.reshape(-1, 2)
 
+    # Filter: keep only corners that are ON the contour boundary
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour = max(contours, key=cv2.contourArea)
 
     on_boundary = []
     for cx, cy in corners_px:
+        # Check distance to contour — should be very close
         dist = abs(cv2.pointPolygonTest(contour, (float(cx), float(cy)), True))
-        if dist < 8:
+        if dist < 8:  # within 8 pixels of boundary
             on_boundary.append([cx, cy])
+
     if len(on_boundary) < 3:
         return None
 
     on_boundary = np.array(on_boundary)
-    real = np.zeros_like(on_boundary, dtype=float)
-    real[:, 0] = x_min + on_boundary[:, 1] * resolution
-    real[:, 1] = y_min + on_boundary[:, 0] * resolution
 
+    # Convert to real-world (swap col/row -> x/y)
+    real = np.zeros_like(on_boundary, dtype=float)
+    real[:, 0] = x_min + on_boundary[:, 1] * resolution  # row -> x
+    real[:, 1] = y_min + on_boundary[:, 0] * resolution  # col -> y
+
+    # Order corners as a polygon (by angle from centroid)
     centroid = real.mean(axis=0)
     angles = np.arctan2(real[:, 1] - centroid[1], real[:, 0] - centroid[0])
     order = np.argsort(angles)
@@ -411,35 +337,41 @@ def detect_corners(binary, g8, x_min, y_min, resolution, max_corners=20,
 
 
 def snap_polygon_to_angles(coords, snap_angles_deg=None):
-    """Snap each polygon edge to nearest listed angle, then re-intersect."""
+    """Snap each polygon edge to nearest angle, re-intersect for clean corners."""
     if snap_angles_deg is None:
         snap_angles_deg = np.array([0, 45, 90, 135])
 
     n = len(coords)
     edges = []
+
     for i in range(n):
         p1, p2 = coords[i], coords[(i + 1) % n]
         d = p2 - p1
         length = np.linalg.norm(d)
         if length < 0.1:
             continue
+
         angle = np.arctan2(d[1], d[0]) * 180 / np.pi % 180
         diffs = [min(abs(angle - sa), 180 - abs(angle - sa)) for sa in snap_angles_deg]
         best = np.argmin(diffs)
         snap = snap_angles_deg[best]
+
         rad = snap * np.pi / 180
         direction = np.array([np.cos(rad), np.sin(rad)])
         mid = (p1 + p2) / 2
         edges.append((mid, direction, length, snap))
 
+    # Re-intersect consecutive edges
     corners = []
     for i in range(len(edges)):
         mid1, dir1, _, _ = edges[i]
         mid2, dir2, _, _ = edges[(i + 1) % len(edges)]
+
         denom = dir1[0] * dir2[1] - dir1[1] * dir2[0]
         if abs(denom) < 1e-10:
             corners.append((mid1 + mid2) / 2)
             continue
+
         dp = mid2 - mid1
         t = (dp[0] * dir2[1] - dp[1] * dir2[0]) / denom
         corners.append(mid1 + t * dir1)
@@ -448,6 +380,7 @@ def snap_polygon_to_angles(coords, snap_angles_deg=None):
 
 
 def build_room_polygon(corners):
+    """Build a valid Shapely polygon from corners."""
     poly = ShapelyPolygon(corners)
     if not poly.is_valid:
         poly = poly.buffer(0)
@@ -457,6 +390,7 @@ def build_room_polygon(corners):
 
 
 def extract_walls(poly, min_length=0.15):
+    """Extract wall segments from polygon exterior."""
     coords = np.array(poly.exterior.coords)
     walls = []
     for i in range(len(coords) - 1):
@@ -469,13 +403,216 @@ def extract_walls(poly, min_length=0.15):
 
 
 # ============================================================
-# VISUALIZATION (PNG export only — no DXF by design)
+# RANSAC REFINEMENT
 # ============================================================
 
-def _export_pipeline_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
-                          real_coords, snapped_coords, output_dir, name,
-                          floor_z, ceiling_z):
-    """Generate the pipeline / floorplan / overlay PNGs."""
+def detect_ransac_walls(pts, floor_z, ceiling_z, room_poly,
+                        max_iter=80, min_len=0.25):
+    """Run RANSAC on points inside the room polygon to find precise wall planes."""
+    from matplotlib.path import Path as MplPath
+
+    # Clip points to room boundary
+    boundary_path = MplPath(np.array(room_poly.buffer(0.3).exterior.coords))
+    inside = boundary_path.contains_points(pts[:, :2])
+    pts_inside = pts[inside]
+
+    # Build point cloud for RANSAC
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts_inside)
+
+    remaining = pcd
+    ransac_walls = []
+
+    for _ in range(max_iter):
+        if len(remaining.points) < 50:
+            break
+        best_inliers, best_model = [], None
+        for thresh in [0.02, 0.04, 0.06, 0.08]:
+            model, inliers = remaining.segment_plane(thresh, 3, 1000)
+            if len(inliers) > len(best_inliers):
+                best_inliers, best_model = inliers, model
+        if not best_inliers or len(best_inliers) < 10:
+            break
+
+        a, b, c, d = best_model
+        normal = np.array([a, b, c])
+        normal /= np.linalg.norm(normal)
+
+        if abs(normal[2]) < 0.3:  # vertical wall
+            wc = remaining.select_by_index(best_inliers)
+            wp = np.asarray(wc.points)[:, :2]
+            if len(wp) >= 10:
+                wpcd = o3d.geometry.PointCloud()
+                wpcd.points = o3d.utility.Vector3dVector(
+                    np.hstack([wp, np.zeros((len(wp), 1))]))
+                labels = np.array(wpcd.cluster_dbscan(eps=0.5, min_points=10))
+                for lbl in range(max(labels.max(), 0) + 1):
+                    cl = wp[labels == lbl]
+                    if len(cl) < 10:
+                        continue
+                    # PCA fit
+                    mean = cl.mean(axis=0)
+                    centered = cl - mean
+                    cov = np.cov(centered.T)
+                    eigvals, eigvecs = np.linalg.eigh(cov)
+                    direction = eigvecs[:, np.argmax(eigvals)]
+                    proj = centered @ direction
+                    p1 = mean + direction * proj.min()
+                    p2 = mean + direction * proj.max()
+                    length = np.linalg.norm(p2 - p1)
+                    angle = np.arctan2(direction[1], direction[0]) * 180 / np.pi % 180
+                    # Perpendicular tightness
+                    perp_dir = eigvecs[:, np.argmin(eigvals)]
+                    perp_spread = (centered @ perp_dir).ptp()
+                    if length >= min_len:
+                        ransac_walls.append({
+                            'p1': p1, 'p2': p2, 'angle': angle, 'length': length,
+                            'n_pts': len(cl), 'perp_spread': perp_spread,
+                            'midpoint': mean.copy(),
+                        })
+
+        remaining = remaining.select_by_index(best_inliers, invert=True)
+
+    return ransac_walls
+
+
+def refine_walls_with_ransac(walls, ransac_walls, angle_flex=3.0, max_shift=0.3):
+    """For each ceiling-trace wall, find the matching RANSAC wall and refine.
+
+    - Replaces the wall position with the RANSAC wall's precise position
+    - Uses the RANSAC wall's actual angle (within angle_flex degrees of original)
+    - Shifts the wall perpendicular to align with RANSAC data
+
+    Args:
+        walls: list of (p1, p2, angle, length) from ceiling trace
+        ransac_walls: list of dicts from detect_ransac_walls
+        angle_flex: max degrees a refined angle can deviate from snapped angle
+        max_shift: max perpendicular shift in meters to accept a RANSAC match
+    """
+    if not ransac_walls:
+        return walls
+
+    refined = []
+    for p1, p2, angle, length in walls:
+        mid = (p1 + p2) / 2
+        direction = p2 - p1
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            refined.append((p1, p2, angle, length))
+            continue
+        direction = direction / norm
+        wall_normal = np.array([-direction[1], direction[0]])
+
+        # Find best matching RANSAC wall
+        best_match = None
+        best_score = float('inf')
+
+        for rw in ransac_walls:
+            # Angle compatibility
+            angle_diff = min(abs(angle - rw['angle']), 180 - abs(angle - rw['angle']))
+            if angle_diff > 20:  # too different, not the same wall
+                continue
+
+            # Perpendicular distance from RANSAC midpoint to ceiling-trace wall line
+            perp_dist = abs(np.dot(rw['midpoint'] - p1, wall_normal))
+            if perp_dist > max_shift:
+                continue
+
+            # Along-wall overlap check
+            proj_start = np.dot(rw['p1'] - mid, direction)
+            proj_end = np.dot(rw['p2'] - mid, direction)
+            rw_center_proj = (proj_start + proj_end) / 2
+            overlap_dist = abs(rw_center_proj)
+
+            # Score: lower = better match (prefer close + aligned + overlapping)
+            score = perp_dist + angle_diff * 0.01 + overlap_dist * 0.1
+
+            if score < best_score:
+                best_score = score
+                best_match = rw
+
+        if best_match is not None:
+            # Refine angle: use RANSAC angle but clamp deviation
+            raw_angle = best_match['angle']
+            angle_deviation = raw_angle - angle
+            # Handle wraparound
+            if angle_deviation > 90:
+                angle_deviation -= 180
+            elif angle_deviation < -90:
+                angle_deviation += 180
+            clamped_deviation = np.clip(angle_deviation, -angle_flex, angle_flex)
+            refined_angle = angle + clamped_deviation
+
+            # Refine position: shift wall perpendicular to match RANSAC
+            perp_shift = np.dot(best_match['midpoint'] - mid, wall_normal)
+            clamped_shift = np.clip(perp_shift, -max_shift, max_shift)
+            new_mid = mid + wall_normal * clamped_shift
+
+            # Rebuild wall with refined angle and position
+            rad = refined_angle * np.pi / 180
+            new_dir = np.array([np.cos(rad), np.sin(rad)])
+            half = length / 2
+            new_p1 = new_mid - new_dir * half
+            new_p2 = new_mid + new_dir * half
+
+            refined.append((new_p1, new_p2, refined_angle, length))
+        else:
+            # No RANSAC match — keep original
+            refined.append((p1, p2, angle, length))
+
+    return refined
+
+
+def re_intersect_corners(walls):
+    """After refining wall positions/angles, re-intersect consecutive walls
+    to get clean corners again."""
+    if len(walls) < 3:
+        return walls
+
+    # Build directions
+    edges = []
+    for p1, p2, angle, length in walls:
+        mid = (p1 + p2) / 2
+        rad = angle * np.pi / 180
+        direction = np.array([np.cos(rad), np.sin(rad)])
+        edges.append((mid, direction, length, angle))
+
+    # Re-intersect consecutive edges
+    corners = []
+    for i in range(len(edges)):
+        mid1, dir1, _, _ = edges[i]
+        mid2, dir2, _, _ = edges[(i + 1) % len(edges)]
+
+        denom = dir1[0] * dir2[1] - dir1[1] * dir2[0]
+        if abs(denom) < 1e-10:
+            corners.append((mid1 + mid2) / 2)
+            continue
+
+        dp = mid2 - mid1
+        t = (dp[0] * dir2[1] - dp[1] * dir2[0]) / denom
+        corners.append(mid1 + t * dir1)
+
+    # Rebuild walls from new corners
+    new_walls = []
+    for i in range(len(corners)):
+        p1 = corners[i]
+        p2 = corners[(i + 1) % len(corners)]
+        length = np.linalg.norm(p2 - p1)
+        angle = np.arctan2(p2[1] - p1[1], p2[0] - p1[0]) * 180 / np.pi % 180
+        if length > 0.1:
+            new_walls.append((np.array(p1), np.array(p2), angle, length))
+
+    return new_walls
+
+
+# ============================================================
+# EXPORT FUNCTIONS  (PNG-only; DXF export dropped from reference)
+# ============================================================
+
+def export_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
+                real_coords, snapped_coords, output_dir, name,
+                floor_z, ceiling_z):
+    """Generate all PNG visualizations."""
     h = ceiling_z - floor_z
     ext = [xe[0], xe[-1], ye[0], ye[-1]]
 
@@ -524,8 +661,7 @@ def _export_pipeline_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
         rx, ry = room_poly.exterior.xy
         ax.fill(rx, ry, color='#E8F5E9', alpha=0.5)
     for p1, p2, a, l in walls:
-        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], 'k-', linewidth=3.5,
-                solid_capstyle='round')
+        ax.plot([p1[0], p2[0]], [p1[1], p2[1]], 'k-', linewidth=3.5, solid_capstyle='round')
         if l > 0.3:
             mid = (p1 + p2) / 2
             d = p2 - p1
@@ -535,8 +671,7 @@ def _export_pipeline_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
                     ha='center', fontsize=7, color='#444',
                     rotation=a if a <= 90 else a - 180)
     ax.text(room_poly.centroid.x, room_poly.centroid.y,
-            f"Area: {room_poly.area:.1f} m2\nCeiling: {ceiling_z:.2f}m\n"
-            f"Height: {h:.2f}m",
+            f"Area: {room_poly.area:.1f} m2\nCeiling: {ceiling_z:.2f}m\nHeight: {h:.2f}m",
             ha='center', va='center', fontsize=12, fontweight='bold',
             bbox=dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.4'))
     ax.grid(True, alpha=0.06, color='#4488CC')
@@ -555,7 +690,7 @@ def _export_pipeline_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
     plt.savefig(f'{output_dir}/{name}_floorplan.png', bbox_inches='tight')
     plt.close()
 
-    # 03: Overlay on raw point cloud
+    # 03: Overlay on raw
     res_v = 0.02
     xmn, ymn = pts[:, :2].min(0) - 0.5
     xmx, ymx = pts[:, :2].max(0) + 0.5
@@ -582,9 +717,163 @@ def _export_pipeline_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
     plt.close()
 
 
-def _export_comparison_png(variants, pts, output_dir, name,
-                           corner_coords_real):
-    """3-variant side-by-side over the raw point cloud."""
+# ============================================================
+# PIPELINE
+# ============================================================
+
+def run(input_path, output_dir, resolution=0.03, epsilon=0.012,
+        snap_angle=45, voxel_size=0.03, ceil_band=0.12,
+        close_kernel=11, angle_flex=3.0, verbose=True,
+        level=True, level_distance_thresh=0.03,
+        pcd=None, name=None):
+    """Run the full ceiling-trace floor plan extraction pipeline.
+
+    Produces 3 variants:
+      A) Ceiling trace with strict angle snap (baseline)
+      B) Ceiling trace with flexible angles (snap +/- angle_flex degrees)
+      C) RANSAC-refined positions with strict angle snap
+
+    Parameters:
+        input_path  : file path OR ignored when `pcd` is provided.
+        pcd         : optional in-memory Open3D PointCloud; bypasses disk
+                      I/O. When provided, `input_path` is only used to
+                      derive `name` unless `name` is also given.
+        name        : output filename base; defaults to
+                      os.path.splitext(os.path.basename(input_path))[0].
+        level       : if True (default), apply the level.py-style floor
+                      leveling (rotate floor normal to +Z, shift floor to
+                      Z=0) BEFORE running the rest of the pipeline. This
+                      is the single fix for SLAM outputs where the
+                      histogram floor/ceiling detector mis-identifies
+                      furniture as the ceiling. Disable only when you are
+                      certain the cloud is already leveled.
+        level_distance_thresh : RANSAC threshold for floor plane detection.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if name is None:
+        name = os.path.splitext(os.path.basename(input_path))[0]
+    t0 = time.time()
+
+    if verbose:
+        print(f"floorplan: {name}")
+        print("=" * 50)
+
+    # Load (from path or in-memory pcd)
+    source = pcd if pcd is not None else input_path
+    pts, n_raw = load_and_preprocess(source, voxel_size)
+    if verbose:
+        print(f"Loaded: {n_raw} -> {len(pts)} pts")
+
+    # Leveling pre-step (the only deviation from the reference script's
+    # pipeline). Rotates the cloud so the floor normal maps to +Z and
+    # shifts the floor to Z=0. This makes the histogram-based
+    # detect_floor_ceiling below reliably pick the correct floor and
+    # ceiling peaks, even on SLAM outputs where the floor may be at an
+    # arbitrary Z with furniture creating competing peaks.
+    if level:
+        if verbose:
+            print("\n[Level] Applying floor-leveling pre-step...")
+        try:
+            pts = level_cloud(pts, distance_thresh=level_distance_thresh,
+                              verbose=verbose)
+            if verbose:
+                print(f"[Level] Done. Z range now: [{pts[:, 2].min():.2f}, "
+                      f"{pts[:, 2].max():.2f}]")
+        except RuntimeError as exc:
+            if verbose:
+                print(f"[Level] FAILED ({exc}); continuing with un-leveled "
+                      "cloud. detect_floor_ceiling may pick the wrong peaks.")
+
+    # Floor/ceiling
+    floor_z, ceiling_z = detect_floor_ceiling(pts)
+    h = ceiling_z - floor_z
+    if verbose:
+        print(f"Floor: {floor_z:.2f}m, Ceiling: {ceiling_z:.2f}m, Height: {h:.2f}m")
+
+    # Ceiling points
+    ceil_xy = extract_ceiling_points(pts, ceiling_z, ceil_band, floor_z=floor_z)
+    if verbose:
+        print(f"Ceiling points: {len(ceil_xy)}")
+
+    # Binary mask
+    binary, g8, xe, ye, res, x_min, y_min = ceiling_to_binary(
+        ceil_xy, resolution, close_kernel)
+
+    # Remove outliers
+    clean, n_removed = remove_outlier_clusters(binary)
+    if verbose:
+        print(f"Outlier clusters removed: {n_removed}")
+
+    # Trace + simplify
+    raw_contour, simplified = trace_and_simplify(clean, epsilon)
+    px_coords = simplified.reshape(-1, 2).astype(float)
+    real_coords = pixel_to_real(px_coords, x_min, y_min, res)
+    if verbose:
+        print(f"Contour: {len(raw_contour)} -> {len(real_coords)} vertices")
+
+    # Corner detection from ceiling mask
+    corner_result = detect_corners(clean, g8, x_min, y_min, res)
+    if corner_result is not None:
+        corner_coords_real, corner_coords_px = corner_result
+        if verbose:
+            print(f"Corners detected: {len(corner_coords_real)}")
+    else:
+        corner_coords_real = None
+        corner_coords_px = None
+        if verbose:
+            print("Corner detection: not enough corners found")
+
+    # ============================================================
+    # VARIANT A: No snap — raw simplified contour (natural angles)
+    # ============================================================
+    if verbose:
+        print(f"\n--- Variant A: No snap (natural angles) ---")
+    poly_a = build_room_polygon(real_coords)
+    walls_a = extract_walls(poly_a)
+    if verbose:
+        print(f"  {poly_a.area:.1f} m2, {len(walls_a)} walls")
+
+    # ============================================================
+    # VARIANT B: Corner detection (Shi-Tomasi)
+    # ============================================================
+    if verbose:
+        print(f"\n--- Variant B: Corner detection ---")
+    if corner_coords_real is not None and len(corner_coords_real) >= 3:
+        poly_b = build_room_polygon(corner_coords_real)
+        walls_b = extract_walls(poly_b)
+    else:
+        # Fallback to contour
+        poly_b = poly_a
+        walls_b = walls_a
+    if verbose:
+        print(f"  {poly_b.area:.1f} m2, {len(walls_b)} walls")
+
+    # ============================================================
+    # VARIANT C: Angle snap (for comparison)
+    # ============================================================
+    if verbose:
+        print(f"\n--- Variant C: {snap_angle}-deg snap (for comparison) ---")
+    snap_angles = np.arange(0, 180, snap_angle) if snap_angle > 0 else None
+    snapped_c, _ = snap_polygon_to_angles(real_coords, snap_angles)
+    poly_c = build_room_polygon(snapped_c)
+    walls_c = extract_walls(poly_c)
+    if verbose:
+        print(f"  {poly_c.area:.1f} m2, {len(walls_c)} walls")
+
+    # ============================================================
+    # EXPORT
+    # ============================================================
+    variants = {
+        'A_natural': (walls_a, poly_a, 'Natural angles (no snap)'),
+        'B_corners': (walls_b, poly_b, 'Corner detection'),
+        'C_snapped': (walls_c, poly_c, f'{snap_angle}-deg snap'),
+    }
+
+    # Pipeline PNG
+    export_pngs(walls_a, poly_a, pts, binary, clean, g8, xe, ye,
+                real_coords, real_coords, output_dir, name, floor_z, ceiling_z)
+
+    # Comparison PNG with point cloud background
     res_v = 0.02
     xmn, ymn = pts[:, :2].min(0) - 0.5
     xmx, ymx = pts[:, :2].max(0) + 0.5
@@ -604,47 +893,40 @@ def _export_comparison_png(variants, pts, output_dir, name,
             rx, ry = poly.exterior.xy
             ax.fill(rx, ry, color=colors[idx], alpha=0.15)
         for p1, p2, a, l in walls:
-            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], 'r-', linewidth=2.5,
-                    solid_capstyle='round')
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], 'r-', linewidth=2.5, solid_capstyle='round')
             if l > 0.3:
                 mid = (p1 + p2) / 2
                 d = p2 - p1
                 nm = np.linalg.norm(d)
                 perp = np.array([-d[1], d[0]]) / nm * 0.15
-                ax.text(mid[0] + perp[0], mid[1] + perp[1], f'{l:.2f}m',
-                        ha='center', fontsize=6, color='yellow',
-                        fontweight='bold',
-                        rotation=a if a <= 90 else a - 180)
+                ax.text(mid[0]+perp[0], mid[1]+perp[1], f'{l:.2f}m',
+                        ha='center', fontsize=6, color='yellow', fontweight='bold',
+                        rotation=a if a <= 90 else a-180)
+        # Show detected corners for variant B
         if key == 'B_corners' and corner_coords_real is not None:
             ax.scatter(corner_coords_real[:, 0], corner_coords_real[:, 1],
-                       s=80, c='red', marker='o', zorder=5,
-                       edgecolors='white', linewidth=1.5)
-        ax.set_title(f'{label}\n{poly.area:.1f} m2, {len(walls)} walls',
-                     fontsize=11, fontweight='bold')
+                       s=80, c='red', marker='o', zorder=5, edgecolors='white', linewidth=1.5)
+        ax.set_title(f'{label}\n{poly.area:.1f} m2, {len(walls)} walls', fontsize=11, fontweight='bold')
         ax.set_aspect('equal')
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
+        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
     fig.suptitle('3 Variants on Point Cloud', fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(f'{output_dir}/{name}_comparison.png', bbox_inches='tight')
     plt.close()
 
-
-def _export_corners_png(clean, g8, xe, ye, poly_b, corner_coords_real,
-                        output_dir, name):
-    """Corner-detection detail PNG."""
+    # Corner detection detail PNG
     ext_ceil = [xe[0], xe[-1], ye[0], ye[-1]]
     fig, axes = plt.subplots(1, 3, figsize=(21, 7), dpi=150)
     axes[0].imshow(g8.T, origin='lower', cmap='hot', extent=ext_ceil)
     axes[0].set_title('Ceiling Density')
+    # Show edges + detected corners
     edges_img = cv2.Canny(clean, 50, 150)
     axes[1].imshow(edges_img.T, origin='lower', cmap='gray', extent=ext_ceil)
     if corner_coords_real is not None:
         axes[1].scatter(corner_coords_real[:, 0], corner_coords_real[:, 1],
-                        s=100, c='red', marker='o', zorder=5,
-                        edgecolors='white', linewidth=2)
-    n_corners = len(corner_coords_real) if corner_coords_real is not None else 0
-    axes[1].set_title(f'Edges + Corners ({n_corners})')
+                        s=100, c='red', marker='o', zorder=5, edgecolors='white', linewidth=2)
+    axes[1].set_title(f'Edges + Corners ({len(corner_coords_real) if corner_coords_real is not None else 0})')
+    # Final polygon from corners
     axes[2].set_facecolor('white')
     if hasattr(poly_b, 'exterior'):
         rx, ry = poly_b.exterior.xy
@@ -655,171 +937,35 @@ def _export_corners_png(clean, g8, xe, ye, poly_b, corner_coords_real,
                         s=80, c='red', marker='o', zorder=5)
     axes[2].set_title(f'Corner-Based Polygon\n{poly_b.area:.1f} m2')
     for ax in axes:
-        ax.set_aspect('equal')
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
+        ax.set_aspect('equal'); ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
     fig.suptitle('Corner Detection Pipeline', fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(f'{output_dir}/{name}_corners.png', bbox_inches='tight')
     plt.close()
 
+    # (DXF export dropped — PNG-only per user preference)
 
-# ============================================================
-# PUBLIC ENTRY POINT
-# ============================================================
-
-def generate_floorplan(pcd, output_dir, name="floorplan", *,
-                       gravity_up=None, imus=None,
-                       resolution=0.03, epsilon=0.012, snap_angle=45,
-                       voxel_size=0.03, ceil_band=0.12,
-                       close_kernel=11, angle_flex=3.0, verbose=True):
-    """Extract a 2D floor plan from an in-memory point cloud.
-
-    Writes to `output_dir` (PNG only — DXF export is intentionally omitted):
-      {name}_metadata.json       — floor/ceiling Z, walls, areas, variants
-      {name}_pipeline.png        — density / mask / contour stages
-      {name}_floorplan.png       — final room with dimensions
-      {name}_overlay.png         — plan on top of raw point cloud
-      {name}_comparison.png      — A/B/C variants side by side
-      {name}_corners.png         — corner-detection detail
-
-    Floor/ceiling detection is robust: uses `detect_room()` (RANSAC + IMU
-    gravity prior) rather than histogram peaks, so furniture no longer
-    beats the real ceiling.
-
-    Returns:
-        (variants, meta) where variants is a dict of
-        {"A_natural"|"B_corners"|"C_snapped": (walls, poly, label)}.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    t0 = time.time()
-
-    if verbose:
-        print(f"floorplan: {name}")
-        print("=" * 50)
-
-    # --- Robust floor/ceiling detection (the substantive change) ---
-    # Tier 1 also returns the ceiling RANSAC Plane so the mask can use
-    # point-to-plane distance instead of a Z-band. Tiers 2/3 return None.
-    floor_z, ceiling_z, ceiling_plane = detect_floor_ceiling_robust(
-        pcd, gravity_up=gravity_up, imus=imus, verbose=verbose)
-    h = ceiling_z - floor_z
-
-    if h <= 0.0:
-        raise ValueError(
-            f"detect_floor_ceiling_robust returned non-positive height: "
-            f"floor_z={floor_z:.3f}, ceiling_z={ceiling_z:.3f}")
-
-    # --- Preprocess: SOR + voxel downsample, in XYZ ---
-    pts, n_raw = _voxel_downsample(pcd, voxel_size=voxel_size)
-    if verbose:
-        print(f"Loaded: {n_raw} -> {len(pts)} pts")
-        print(f"Floor: {floor_z:.2f}m, Ceiling: {ceiling_z:.2f}m, Height: {h:.2f}m")
-
-    # Mask is a tight band around the ceiling only (no more 70%-of-room
-    # cutoff — that included furniture tops). Uses point-to-plane distance
-    # when a RANSAC ceiling plane is available; falls back to a Z-band.
-    ceil_xy = extract_ceiling_points(pts, ceiling_z, band=ceil_band,
-                                     ceiling_plane=ceiling_plane)
-    if verbose:
-        print(f"Ceiling points: {len(ceil_xy)}")
-
-    binary, g8, xe, ye, res, x_min, y_min = ceiling_to_binary(
-        ceil_xy, resolution, close_kernel)
-
-    clean, n_removed = remove_outlier_clusters(binary)
-    if verbose:
-        print(f"Outlier clusters removed: {n_removed}")
-
-    raw_contour, simplified = trace_and_simplify(clean, epsilon)
-    px_coords = simplified.reshape(-1, 2).astype(float)
-    real_coords = pixel_to_real(px_coords, x_min, y_min, res)
-    if verbose:
-        print(f"Contour: {len(raw_contour)} -> {len(real_coords)} vertices")
-
-    corner_result = detect_corners(clean, g8, x_min, y_min, res)
-    if corner_result is not None:
-        corner_coords_real, corner_coords_px = corner_result
-        if verbose:
-            print(f"Corners detected: {len(corner_coords_real)}")
-    else:
-        corner_coords_real = None
-        corner_coords_px = None
-        if verbose:
-            print("Corner detection: not enough corners found")
-
-    # ---- Variant A: natural (raw simplified contour) ----
-    if verbose:
-        print("\n--- Variant A: No snap (natural angles) ---")
-    poly_a = build_room_polygon(real_coords)
-    walls_a = extract_walls(poly_a)
-    if verbose:
-        print(f"  {poly_a.area:.1f} m2, {len(walls_a)} walls")
-
-    # ---- Variant B: corner detection (Shi-Tomasi) ----
-    if verbose:
-        print("\n--- Variant B: Corner detection ---")
-    if corner_coords_real is not None and len(corner_coords_real) >= 3:
-        poly_b = build_room_polygon(corner_coords_real)
-        walls_b = extract_walls(poly_b)
-    else:
-        poly_b = poly_a
-        walls_b = walls_a
-    if verbose:
-        print(f"  {poly_b.area:.1f} m2, {len(walls_b)} walls")
-
-    # ---- Variant C: angle snap (for comparison) ----
-    if verbose:
-        print(f"\n--- Variant C: {snap_angle}-deg snap ---")
-    snap_angles = np.arange(0, 180, snap_angle) if snap_angle > 0 else None
-    snapped_c, _ = snap_polygon_to_angles(real_coords, snap_angles)
-    poly_c = build_room_polygon(snapped_c)
-    walls_c = extract_walls(poly_c)
-    if verbose:
-        print(f"  {poly_c.area:.1f} m2, {len(walls_c)} walls")
-
-    variants = {
-        'A_natural': (walls_a, poly_a, 'Natural angles (no snap)'),
-        'B_corners': (walls_b, poly_b, 'Corner detection'),
-        'C_snapped': (walls_c, poly_c, f'{snap_angle}-deg snap'),
-    }
-
-    # ---- PNG exports ----
-    # Pass snapped_c (not real_coords twice) so the "Angle Snapped" pipeline
-    # panel actually shows the snapped polygon. The reference tool passed
-    # real_coords twice here — likely a bug in the reference; we correct it.
-    _export_pipeline_pngs(walls_a, poly_a, pts, binary, clean, g8, xe, ye,
-                          real_coords, snapped_c, output_dir, name,
-                          floor_z, ceiling_z)
-    _export_comparison_png(variants, pts, output_dir, name, corner_coords_real)
-    _export_corners_png(clean, g8, xe, ye, poly_b, corner_coords_real,
-                        output_dir, name)
-
-    # ---- Metadata JSON ----
+    # Metadata
     elapsed = time.time() - t0
     meta = {
-        'n_points_raw': int(n_raw),
-        'n_points_processed': int(len(pts)),
+        'input': input_path,
+        'n_points_raw': n_raw,
+        'n_points_processed': len(pts),
         'floor_z': round(float(floor_z), 3),
         'ceiling_z': round(float(ceiling_z), 3),
         'room_height': round(float(h), 3),
-        'n_outlier_clusters_removed': int(n_removed),
-        'n_corners_detected':
-            int(len(corner_coords_real)) if corner_coords_real is not None else 0,
+        'n_outlier_clusters_removed': n_removed,
+        'n_corners_detected': len(corner_coords_real) if corner_coords_real is not None else 0,
         'variants': {},
         'processing_time_s': round(elapsed, 1),
     }
     for key, (walls, poly, label) in variants.items():
-        wall_entries = [
-            {'length_m': round(float(l), 3),
-             'angle_deg': round(float(a), 1)}
-            for _, _, a, l in walls
-        ]
         meta['variants'][key] = {
             'label': label,
             'area_m2': round(float(poly.area), 2),
-            'n_walls': int(len(walls)),
-            'walls': wall_entries,
+            'n_walls': len(walls),
+            'walls': [{'length_m': round(float(l), 3), 'angle_deg': round(float(a), 1)}
+                      for _, _, a, l in walls],
         }
     with open(f'{output_dir}/{name}_metadata.json', 'w') as f:
         json.dump(meta, f, indent=2)
@@ -830,3 +976,71 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
             print(f"  {key}: {poly.area:.1f} m2, {len(walls)} walls - {label}")
 
     return variants, meta
+
+
+# ============================================================
+# Integration adapter
+# ============================================================
+# `generate_floorplan` is the name the rest of this repo (e.g.
+# scripts/detect_and_slam.py, scripts/generate_floorplan.py) imports.
+# It's a thin adapter around `run()` that matches the integration
+# call sites' expected keyword arguments (pcd, output_dir, name,
+# gravity_up, imus) used by earlier versions of this module. Any kwargs
+# that don't apply here (gravity_up, imus) are silently ignored — the
+# leveling step inside run() does not need them.
+
+def generate_floorplan(pcd, output_dir, name="floorplan", *,
+                        gravity_up=None, imus=None,
+                        resolution=0.03, epsilon=0.012, snap_angle=45,
+                        voxel_size=0.03, ceil_band=0.12,
+                        close_kernel=11, angle_flex=3.0, verbose=True,
+                        level=True, level_distance_thresh=0.03):
+    """Thin adapter — see `run()` docstring."""
+    # gravity_up / imus are accepted for call-site compatibility but not
+    # used: the new pipeline auto-detects the floor plane from the cloud.
+    return run(
+        input_path=None, output_dir=output_dir, name=name,
+        pcd=pcd, resolution=resolution, epsilon=epsilon,
+        snap_angle=snap_angle, voxel_size=voxel_size,
+        ceil_band=ceil_band, close_kernel=close_kernel,
+        angle_flex=angle_flex, verbose=verbose,
+        level=level, level_distance_thresh=level_distance_thresh,
+    )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='floorplan',
+        description='Extract 2D floor plans from LiDAR point cloud scans.')
+    parser.add_argument('input', help='Input PLY or PCD file')
+    parser.add_argument('-o', '--output', default='output/', help='Output directory')
+    parser.add_argument('--resolution', type=float, default=0.03,
+                        help='Grid resolution in meters (default: 0.03)')
+    parser.add_argument('--epsilon', type=float, default=0.012,
+                        help='Contour simplification ratio (default: 0.012)')
+    parser.add_argument('--snap', type=float, default=45,
+                        help='Angle snap increment in degrees (default: 45, 0=disable)')
+    parser.add_argument('--voxel', type=float, default=0.03,
+                        help='Voxel downsample size (default: 0.03)')
+    parser.add_argument('--ceil-band', type=float, default=0.12,
+                        help='Ceiling Z band +/- meters (default: 0.12)')
+    parser.add_argument('--close-kernel', type=int, default=11,
+                        help='Morphology close kernel size (default: 11)')
+    parser.add_argument('--angle-flex', type=float, default=3.0,
+                        help='Max angle deviation from snap grid in degrees (default: 3.0)')
+    parser.add_argument('-q', '--quiet', action='store_true')
+    args = parser.parse_args()
+
+    run(args.input, args.output,
+        resolution=args.resolution, epsilon=args.epsilon,
+        snap_angle=args.snap, voxel_size=args.voxel,
+        ceil_band=args.ceil_band, close_kernel=args.close_kernel,
+        angle_flex=args.angle_flex, verbose=not args.quiet)
+
+
+if __name__ == '__main__':
+    main()
