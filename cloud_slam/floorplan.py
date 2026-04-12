@@ -617,7 +617,7 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
     legend_kinds = set()
     for idx, (p1, p2, a, l) in enumerate(walls_d):
         kind = 'free'
-        if idx < len(walls_d_meta):
+        if idx < len(walls_d_meta) and walls_d_meta[idx] is not None:
             kind = walls_d_meta[idx].get('snapped_to', 'free')
         color = kind_color.get(kind, '#000000')
         ax.plot([p1[0], p2[0]], [p1[1], p2[1]], '-',
@@ -1458,15 +1458,43 @@ def _stage6_gap_split(edges, gap_thresh=0.3, min_segment=0.2, verbose=False):
 def _collect_wall_band(pts_3d, floor_z, ceiling_z, margin=0.3):
     """Return (M, 2) XY coords of points in the wall-band Z slice.
 
-    Band: Z in [floor_z + margin, ceiling_z - margin]. Avoids floor/ceiling
-    clutter and captures the middle of each wall.
+    Band: Z in [floor_z + margin, ceiling_z - margin] — the middle of the
+    wall, avoiding floor/ceiling clutter.
+
+    The `floor_z`/`ceiling_z` args may be sign-flipped by the caller for
+    display purposes (when leveling-inversion was detected). We detect
+    this by checking whether they lie within the actual pts Z range; if
+    not, we fall back to percentile-derived bounds. This makes the
+    wall-band extraction robust regardless of how the caller reports
+    floor/ceiling heights.
     """
     z = pts_3d[:, 2]
-    lo, hi = floor_z + margin, ceiling_z - margin
-    if hi - lo < 0.2:
-        # Ceiling too close to floor; widen or fall back
-        margin = 0.15
-        lo, hi = floor_z + margin, ceiling_z - margin
+    if z.size < 100:
+        return pts_3d[:, :2] if z.size else np.zeros((0, 2))
+
+    z_pts_lo = float(np.percentile(z, 2))
+    z_pts_hi = float(np.percentile(z, 98))
+
+    lo_provided = min(float(floor_z), float(ceiling_z))
+    hi_provided = max(float(floor_z), float(ceiling_z))
+
+    # Check if the provided Z range overlaps with the actual cloud Z range.
+    # If there's no overlap, the caller likely sign-flipped the values for
+    # display — use percentile bounds instead.
+    overlap_lo = max(lo_provided, z_pts_lo)
+    overlap_hi = min(hi_provided, z_pts_hi)
+    if overlap_hi - overlap_lo < 0.5:
+        # No meaningful overlap — fall back to pts percentiles.
+        lo_raw, hi_raw = z_pts_lo, z_pts_hi
+    else:
+        lo_raw, hi_raw = lo_provided, hi_provided
+
+    m = margin
+    if hi_raw - lo_raw < 2 * margin + 0.2:
+        # Short room — shrink the margin
+        m = max(0.10, (hi_raw - lo_raw) / 4)
+
+    lo, hi = lo_raw + m, hi_raw - m
     mask = (z > lo) & (z < hi)
     return pts_3d[mask][:, :2]
 
@@ -1750,7 +1778,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
             entry = {'length_m': round(float(l), 3),
                      'angle_deg': round(float(a), 1)}
             # D_refined: add per-wall snap kind + residual + confidence
-            if key == 'D_refined' and idx < len(walls_d_meta_clean):
+            if (key == 'D_refined' and idx < len(walls_d_meta_clean)
+                    and walls_d_meta_clean[idx] is not None):
                 m = walls_d_meta_clean[idx]
                 entry['snapped_to'] = m.get('snapped_to', 'free')
                 entry['residual_m'] = m.get('residual_m', 0.0)
@@ -1760,6 +1789,9 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                 # the wall to match the point cloud).
                 entry['length_m_data_extent'] = m.get(
                     'length_m_data_extent', 0.0)
+            elif key == 'D_refined':
+                # Fell back to A_natural — meta is None
+                entry['snapped_to'] = 'fallback_a'
             wall_entries.append(entry)
         meta['variants'][key] = {
             'label': label,
