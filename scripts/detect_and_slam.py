@@ -189,6 +189,11 @@ def main():
     # Post-process: run standalone RANSAC floor leveler on the merged cloud
     # in-memory (level.py's own PLY reader doesn't handle uchar RGB, so we
     # keep its algorithm verbatim but use Open3D for I/O).
+    #
+    # After producing the refined leveled PLY we also apply the same
+    # rotation + z-shift to `merged` in place and to every object center /
+    # quaternion, so that the downstream `objects.json` and
+    # `map_with_boxes.ply` end up in the same "floor at Z=0" frame.
     try:
         from cloud_slam.level import detect_floor_plane, level_points
         print("[Level] Running RANSAC floor leveler on map...")
@@ -197,7 +202,14 @@ def main():
         if result is None:
             raise RuntimeError("No horizontal plane found")
         normal, _ = result
-        leveled_xyz, _, _ = level_points(xyz, normal)
+        leveled_xyz, _, z_shift = level_points(xyz, normal)
+
+        # Re-derive the rotation matrix level_points computed internally
+        # (it only returns the magnitude in degrees).
+        R_level = SciRot.align_vectors(
+            [np.array([0.0, 0.0, 1.0])], [normal])[0].as_matrix()
+
+        # Write the refined leveled PLY as a separate file.
         leveled_pcd = o3d.geometry.PointCloud()
         leveled_pcd.points = o3d.utility.Vector3dVector(leveled_xyz.astype(np.float64))
         if merged.has_colors():
@@ -205,6 +217,21 @@ def main():
         leveled_path = os.path.join(args.output, "colored_map_leveled.ply")
         o3d.io.write_point_cloud(leveled_path, leveled_pcd)
         print(f"[Level] Saved leveled map: {leveled_path}")
+
+        # Propagate the same transform to `merged` and to objects so that
+        # the subsequently-saved objects.json and map_with_boxes.ply align
+        # with the leveled cloud.
+        merged.points = leveled_pcd.points
+        shift_vec = np.array([0.0, 0.0, -z_shift])
+        for obj in objects:
+            c = np.array(obj['center'])
+            obj['center'] = (R_level @ c + shift_vec).tolist()
+            if 'orientation' in obj:
+                q = np.array(obj['orientation']['quaternion'])
+                R_obj = SciRot.from_quat(q).as_matrix()
+                R_new = R_level @ R_obj
+                obj['orientation']['quaternion'] = (
+                    SciRot.from_matrix(R_new).as_quat().tolist())
     except Exception as e:
         print(f"[WARNING] level.py post-process failed: {e}")
 
