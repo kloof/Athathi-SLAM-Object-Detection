@@ -71,14 +71,6 @@ def main():
                              "RANSAC floor detection (with IMU prior) applied "
                              "BEFORE refinement and shifts floor to Z=0 — "
                              "experimental, sharper leveling.")
-    parser.add_argument("--floorplan", action="store_true",
-                        help="Also emit 2D floor-plan PNGs + metadata from "
-                             "the leveled cloud. Uses RANSAC + IMU gravity "
-                             "for robust floor/ceiling detection. Default: off.")
-    parser.add_argument("--floorplan-resolution", type=float, default=0.03,
-                        help="Floor-plan grid resolution (m). Default: 0.03")
-    parser.add_argument("--floorplan-snap", type=float, default=45,
-                        help="Floor-plan angle snap (deg). 0 disables. Default: 45")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -234,27 +226,6 @@ def main():
         boxes_map_path = os.path.join(args.output, "map_with_boxes.ply")
         o3d.io.write_point_cloud(boxes_map_path, combined)
         print(f"[INFO] Saved map with boxes: {boxes_map_path}")
-
-    # Optional 2D floor-plan extraction (opt-in via --floorplan).
-    # Dead-simple wiring: write xyz-only PLY -> level_ply -> floorplan.run().
-    # (xyz-only because level.py's PLY reader chokes on color properties.)
-    if args.floorplan:
-        print(f"[INFO] Generating floor plan ...")
-        xyz_only = o3d.geometry.PointCloud()
-        xyz_only.points = merged.points
-        tmp_ply = os.path.join(args.output, "_merged_xyz.ply")
-        o3d.io.write_point_cloud(tmp_ply, xyz_only,
-                                 write_ascii=False, compressed=False)
-        from cloud_slam.floorplan_level import level_ply
-        from cloud_slam.floorplan import run as floorplan_run
-        leveled_ply = os.path.join(args.output, "_merged_leveled.ply")
-        level_ply(tmp_ply, output_path=leveled_ply)
-        os.remove(tmp_ply)
-        floorplan_run(
-            leveled_ply, args.output,
-            resolution=args.floorplan_resolution,
-            snap_angle=args.floorplan_snap,
-        )
 
     # Summary
     print(f"\n{'='*60}")
