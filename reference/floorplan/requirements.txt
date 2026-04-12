@@ -1,0 +1,7 @@
+open3d>=0.13.0
+numpy
+opencv-python
+scipy
+matplotlib
+shapely
+ezdxf>=0.16.0

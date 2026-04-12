@@ -71,6 +71,14 @@ def main():
                              "RANSAC floor detection (with IMU prior) applied "
                              "BEFORE refinement and shifts floor to Z=0 — "
                              "experimental, sharper leveling.")
+    parser.add_argument("--floorplan", action="store_true",
+                        help="Also emit 2D floor-plan PNGs + metadata from "
+                             "the leveled cloud. Uses RANSAC + IMU gravity "
+                             "for robust floor/ceiling detection. Default: off.")
+    parser.add_argument("--floorplan-resolution", type=float, default=0.03,
+                        help="Floor-plan grid resolution (m). Default: 0.03")
+    parser.add_argument("--floorplan-snap", type=float, default=45,
+                        help="Floor-plan angle snap (deg). 0 disables. Default: 45")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -226,6 +234,21 @@ def main():
         boxes_map_path = os.path.join(args.output, "map_with_boxes.ply")
         o3d.io.write_point_cloud(boxes_map_path, combined)
         print(f"[INFO] Saved map with boxes: {boxes_map_path}")
+
+    # Optional 2D floor-plan extraction (opt-in via --floorplan).
+    # `merged` is already leveled to Z-up by the blocks above, so the
+    # floor-plan module can assume gravity_up = [0, 0, 1] exactly.
+    if args.floorplan:
+        from cloud_slam.floorplan import generate_floorplan
+        print(f"[INFO] Generating floor plan ...")
+        generate_floorplan(
+            merged,
+            args.output,
+            name="floorplan",
+            gravity_up=np.array([0.0, 0.0, 1.0]),
+            resolution=args.floorplan_resolution,
+            snap_angle=args.floorplan_snap,
+        )
 
     # Summary
     print(f"\n{'='*60}")
