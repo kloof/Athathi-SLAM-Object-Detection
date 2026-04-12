@@ -9,10 +9,18 @@ import numpy as np
 from dataclasses import dataclass
 
 DEFAULT_CLASSES = [
-    "person", "chair", "table", "desk", "sofa", "bed",
-    "shelf", "door", "monitor", "lamp", "plant",
+    "chair", "table", "desk", "sofa", "bed",
+    "shelf", "monitor", "lamp", "plant",
     "cabinet", "wardrobe",
 ]
+# Intentionally NOT in the default class list:
+#   "person" — transient (people move during scans), 3D boxes are junk
+#   "door"   — doors now come from vision wall features (Mask2Former
+#              via `--label-walls`), attached to their host wall in
+#              `floorplan_metadata.json` instead of as standalone 3D
+#              objects in `objects.json`. No more redundancy.
+# Override with `--classes "person,door,..."` on the CLI if you
+# specifically need them re-enabled for a given scan.
 
 
 @dataclass
