@@ -235,6 +235,36 @@ def main():
     except Exception as e:
         print(f"[WARNING] level.py post-process failed: {e}")
 
+    # Post-process: 2D floor plan extraction.
+    # Uses the ENHANCED algorithm (Stages 1-7 RANSAC wall refinement +
+    # learned-dominant-angle tolerance snap, producing variant D_refined
+    # with per-wall `snapped_to`/`residual_m`/`confidence` fields). Robust
+    # floor/ceiling detection via detect_room() + IMU gravity prior — not
+    # the fragile top-2 Z-histogram peaks that broke on furniture-heavy
+    # rooms. Operates on the in-memory `merged` cloud (already Z-up).
+    # Output: <scan_root>/results/<scan_name>/ (user-chosen convention).
+    try:
+        from cloud_slam.floorplan import generate_floorplan
+        rosbag_parent = os.path.dirname(os.path.abspath(args.rosbag))
+        scan_name = os.path.basename(rosbag_parent)
+        scan_root = os.path.dirname(rosbag_parent)
+        fp_out_dir = os.path.join(scan_root, "results", scan_name)
+        os.makedirs(fp_out_dir, exist_ok=True)
+        print(f"[Floorplan] Generating floor plan -> {fp_out_dir}")
+        _variants, fp_meta = generate_floorplan(
+            merged,
+            fp_out_dir,
+            name="floorplan",
+            gravity_up=np.array([0.0, 0.0, 1.0]),
+            verbose=False,
+        )
+        v = fp_meta['variants']
+        print(f"[Floorplan] Saved ("
+              f"A={v['A_natural']['area_m2']}m²/{v['A_natural']['n_walls']}w, "
+              f"D={v['D_refined']['area_m2']}m²/{v['D_refined']['n_walls']}w)")
+    except Exception as e:
+        print(f"[WARNING] floorplan.py post-process failed: {e}")
+
     # Save objects.json
     objects_path = os.path.join(args.output, "objects.json")
     output_json = {
