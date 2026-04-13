@@ -741,6 +741,7 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
     # usable (the exterior-normal orientation needs at least the spread of
     # a trajectory to pick the outward direction reliably).
     traj_center_xy = None
+    pose_arr = None
     if poses is not None:
         try:
             pose_arr = np.asarray(
@@ -749,8 +750,11 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                 dtype=float)
             if pose_arr.ndim == 2 and pose_arr.shape[0] >= 2:
                 traj_center_xy = np.mean(pose_arr[:, :2], axis=0)
+            else:
+                pose_arr = None
         except Exception:
             traj_center_xy = None
+            pose_arr = None
 
     all_openings: list = []
     oid_counter = 0
@@ -993,20 +997,53 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                     and wall_dir_xy_full is not None
                     and wall_normal_xy is not None
                     and traj_center_xy is not None):
-                rel = np.asarray(merged_pts[:, :2],
-                                 dtype=float) - np.asarray(p1)[:2]
-                perp_all = rel @ wall_normal_xy
-                along_all = rel @ wall_dir_xy_full
-                in_blob_along = ((along_all >= float(along_s) - 0.1)
-                                 & (along_all <= float(along_e) + 0.1))
-                behind_wall = (perp_all > 0.3) & (perp_all < 1.5)
-                n_behind = int(np.sum(in_blob_along & behind_wall))
-                if n_behind >= 50:
-                    opening_type = 'mirror'
-                    cand_source = 'lidar-bimodal-mirror'
+                # Trajectory-both-sides gate — prevents Option A from
+                # mis-flagging real passages where the scanner walked
+                # into the adjacent space. Real passage: scanner has
+                # poses on both sides of the wall plane at this
+                # along-wall position. Mirror: scanner stays on one
+                # side.
+                trajectory_on_both_sides = False
+                if pose_arr is not None and len(pose_arr) >= 3:
+                    pose_rel = pose_arr[:, :2] - np.asarray(p1)[:2]
+                    pose_perp = pose_rel @ wall_normal_xy
+                    pose_along = pose_rel @ wall_dir_xy_full
+                    in_blob_span = (
+                        (pose_along >= float(along_s) - 0.5)
+                        & (pose_along <= float(along_e) + 0.5))
+                    poses_near_blob_perp = pose_perp[in_blob_span]
+                    if len(poses_near_blob_perp) >= 2:
+                        exterior_count = int(
+                            np.sum(poses_near_blob_perp > 0.1))
+                        interior_count = int(
+                            np.sum(poses_near_blob_perp < -0.1))
+                        trajectory_on_both_sides = (
+                            exterior_count >= 3 and interior_count >= 3)
+
+                if trajectory_on_both_sides:
+                    # Real passage — scanner walked through. Do NOT
+                    # apply Option A. Keep passage classification.
                     if verbose:
-                        print(f"[Openings] wall {wall_idx} mirror via "
-                              f"lidar-bimodal (n_behind={n_behind})")
+                        print(f"[Openings] wall {wall_idx} Option A "
+                              f"suppressed: trajectory on both sides "
+                              f"of wall plane")
+                else:
+                    rel = np.asarray(merged_pts[:, :2],
+                                     dtype=float) - np.asarray(p1)[:2]
+                    perp_all = rel @ wall_normal_xy
+                    along_all = rel @ wall_dir_xy_full
+                    in_blob_along = (
+                        (along_all >= float(along_s) - 0.1)
+                        & (along_all <= float(along_e) + 0.1))
+                    behind_wall = (perp_all > 0.3) & (perp_all < 1.5)
+                    n_behind = int(np.sum(in_blob_along & behind_wall))
+                    if n_behind >= 50:
+                        opening_type = 'mirror'
+                        cand_source = 'lidar-bimodal-mirror'
+                        if verbose:
+                            print(f"[Openings] wall {wall_idx} mirror "
+                                  f"via lidar-bimodal "
+                                  f"(n_behind={n_behind})")
 
             per_wall.append({
                 't_lo': t_lo, 't_hi': t_hi, 'z_lo': z_lo, 'z_hi': z_hi,
