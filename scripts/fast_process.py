@@ -141,7 +141,10 @@ def process_with_imu_integration(cloud_msgs, imu_msgs, camera_imgs=None, calib=N
         # Colorize from camera if available
         if do_color and len(scan.points) > 0:
             import cv2 as _cv2
-            img_idx = match_nearest_image(stamp, image_timestamps)
+            # M4a: match_nearest_image returns (idx, dt); the dt is
+            # unused here (fast_process is a standalone script that
+            # doesn't emit the scan_quality block).
+            img_idx, _img_dt = match_nearest_image(stamp, image_timestamps)
             if img_idx is not None:
                 _, compressed_bytes, _ = camera_imgs[img_idx]
                 img_arr = np.frombuffer(compressed_bytes, dtype=np.uint8)

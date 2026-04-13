@@ -1069,11 +1069,23 @@ def refine_walls(walls_in, pts_3d, floor_z, ceiling_z, *,
 
         out_walls.append((np.asarray(e['p1']), np.asarray(e['p2']),
                           float(e['angle_deg']), float(e['length'])))
+        # M4a: curved-wall flag — a wall whose RANSAC residual (mean
+        # |perpendicular distance| of inliers from the fitted line)
+        # exceeds 5% of its length is too bent to be modeled as a
+        # single line. Downstream consumers can filter on this to
+        # surface bay-window bulges, round walls, or mis-aligned
+        # multi-segment runs. Strict > 0.05 so exactly 5% is "straight".
+        residual_m = float(e.get('residual', 0.0))
+        length_m = float(e.get('length', 0.0))
+        curved_flag = bool(
+            residual_m / max(length_m, 0.1) > 0.05)
         out_meta.append({
             'snapped_to': e.get('snapped_to', 'free'),
-            'residual_m': round(float(e.get('residual', 0.0)), 4),
+            'residual_m': round(residual_m, 4),
             'confidence': round(float(e.get('confidence', 0.0)), 3),
             'length_m_data_extent': round(length_data, 3),
+            'length_m': round(length_m, 3),
+            'curved': curved_flag,
         })
     return out_walls, out_meta
 

@@ -2,6 +2,9 @@
 
 M0a introduced the 2.0 baseline; M3 bumped to 2.1 when D_refined.openings
 (doors / windows / glass / passages) joined the per-variant walls list.
+M4a bumped to 2.2 when the top-level `scan_quality` block,
+`secondary_ceiling_features`, per-wall `frames_seen_count`, and
+`curved` fields were added.
 """
 from cloud_slam.floorplan import SCHEMA_VERSION
 
@@ -18,7 +21,8 @@ def test_schema_version_is_2_0_or_higher():
     )
 
 
-def test_schema_version_is_2_1():
-    """M3 bumped the schema version to 2.1 — the JSON now emits
-    D_refined.openings alongside D_refined.walls."""
-    assert SCHEMA_VERSION == "2.1"
+def test_schema_version_is_2_2():
+    """M4a bumped the schema version to 2.2 — the JSON now emits a
+    top-level `scan_quality` block, `secondary_ceiling_features`, and
+    per-wall `frames_seen_count` + `curved` fields."""
+    assert SCHEMA_VERSION == "2.2"

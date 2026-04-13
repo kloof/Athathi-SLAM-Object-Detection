@@ -147,6 +147,105 @@ def _select_ceiling_plane(pts, room, distance_thresh=0.15, verbose=False):
     return cand_ceil, cand_floor, False, info
 
 
+def _compute_per_wall_frame_coverage(walls, wall_labels,
+                                      perp_thresh_m=0.5,
+                                      min_pts_per_frame=5):
+    """Count, per wall, how many frames contributed at least
+    `min_pts_per_frame` points within `perp_thresh_m` of the wall line.
+
+    Pure post-processing — reads `wall_labels['per_frame_xyz']`
+    (list of (N_i, 3) float32 arrays, one per contributing frame) and
+    compares each frame's XY footprint against each wall's infinite
+    line. Walls with < `min_pts_per_frame` points in a given frame
+    don't count that frame — this avoids counting frames that merely
+    grazed the wall with one or two points.
+
+    Returns a dict `{wall_id: int}` keyed by the wall's integer index.
+    Walls with no coverage at all get 0. Returns an empty dict when
+    `wall_labels` is None / missing per-frame data.
+
+    `wall_id` is 0..len(walls)-1 — downstream code maps it to the
+    serialized wall `id` field (same integer, by construction).
+    """
+    out = {}
+    for i in range(len(walls)):
+        out[int(i)] = 0
+    if not walls:
+        return out
+    if wall_labels is None:
+        return out
+    per_frame = wall_labels.get('per_frame_xyz')
+    if not per_frame:
+        return out
+
+    # Precompute each wall's unit perpendicular + mid XY — O(W) up front.
+    wall_perp = []
+    wall_along = []
+    wall_mid = []
+    wall_half_len = []
+    for (p1, p2, _a, _l) in walls:
+        p1 = np.asarray(p1, dtype=float)
+        p2 = np.asarray(p2, dtype=float)
+        v = p2 - p1
+        L = float(np.linalg.norm(v))
+        if L < 1e-6:
+            wall_perp.append(np.array([0.0, 1.0]))
+            wall_along.append(np.array([1.0, 0.0]))
+            wall_mid.append((p1 + p2) / 2)
+            wall_half_len.append(0.0)
+            continue
+        d = v / L
+        wall_along.append(d)
+        wall_perp.append(np.array([-d[1], d[0]]))
+        wall_mid.append((p1 + p2) / 2)
+        wall_half_len.append(L / 2 + 0.5)  # 0.5 m slack at each end
+
+    for xyz in per_frame:
+        if xyz is None or len(xyz) == 0:
+            continue
+        xy = np.asarray(xyz[:, :2], dtype=float)
+        for i, (perp, along, mid, half) in enumerate(zip(
+                wall_perp, wall_along, wall_mid, wall_half_len)):
+            rel = xy - mid
+            perp_d = np.abs(rel @ perp)
+            along_d = np.abs(rel @ along)
+            mask = (perp_d < perp_thresh_m) & (along_d < half)
+            if int(mask.sum()) >= min_pts_per_frame:
+                out[int(i)] += 1
+    return out
+
+
+def _build_secondary_features(room, gravity_up, swapped=False):
+    """Serialize `room.intermediate_horiz` into JSON-friendly dicts.
+
+    Each Plane becomes `{height_m, n_inliers, type_hint}`. `height_m`
+    is the plane centroid projected onto gravity (Z along gravity_up);
+    when `swapped` is True (physical ceiling ended up at lower Z after
+    leveling inversion), heights are negated so the emitted value is
+    physically sensible ("above floor" positive). `type_hint` is the
+    generic "soffit" tag — downstream code can refine the type based
+    on hull / spatial extent.
+
+    Returns an empty list when `room` is None or has no intermediate
+    horizontal planes.
+    """
+    if room is None:
+        return []
+    intermediates = getattr(room, 'intermediate_horiz', None) or []
+    gravity_up = np.asarray(gravity_up, dtype=float)
+    out = []
+    for p in intermediates:
+        z = float(p.centroid @ gravity_up)
+        if swapped:
+            z = -z
+        out.append({
+            'height_m': round(z, 3),
+            'n_inliers': int(p.num_inliers),
+            'type_hint': 'soffit',
+        })
+    return out
+
+
 def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
                                  bin_width=0.02, verbose=False):
     """Robust floor/ceiling Z using RANSAC + IMU gravity.
@@ -173,9 +272,15 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
         verbose:     Print which tier produced the answer.
 
     Returns:
-        (floor_z, ceiling_z, ceiling_plane_or_none). The third element is
-        the RANSAC ceiling Plane when Tier 1 succeeds (so callers can do
-        point-to-plane masking); None for Tier 2/3 fallbacks.
+        (floor_z, ceiling_z, ceiling_plane_or_none, secondary_features).
+        The third element is the RANSAC ceiling Plane when Tier 1
+        succeeds (so callers can do point-to-plane masking); None for
+        Tier 2/3 fallbacks. The fourth element (M4a) is a list of dicts
+        describing dropped soffits / coffers / trays / HVAC bulkheads —
+        any horizontal plane between floor+1m and the selected ceiling.
+        Each dict has keys `height_m`, `n_inliers`, `type_hint`.
+        Empty list when detect_room doesn't populate `intermediate_horiz`
+        (Tier 2/3 fallbacks or no intermediate surfaces present).
 
     The Tier 1 path also auto-selects between detect_room's floor- and
     ceiling-labelled planes by XY coverage, so the returned ceiling is
@@ -233,19 +338,27 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
             print(f"[FLOORPLAN] floor/ceiling via RANSAC (Tier 1): "
                   f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}"
                   f"{' (Z-flipped for display — leveling is inverted)' if swapped else ''}")
-        return floor_z, ceiling_z, ceiling_plane
+        secondary = _build_secondary_features(
+            room, gravity_up, swapped)
+        return floor_z, ceiling_z, ceiling_plane, secondary
 
     # ---- Tier 2: floor only — percentile above floor + 1 m ----
     # If RANSAC found a good floor, preserve it. Only the ceiling falls back.
     if room is not None and room.floor is not None:
         floor_z = float(room.floor_height)
+        # Tier 2 can still surface intermediate horizontal planes (dropped
+        # soffits etc.) from detect_room's candidate list — even though the
+        # primary ceiling came from a percentile fallback. The list is
+        # already filtered to >floor+1m by detect_room.
+        secondary = _build_secondary_features(
+            room, gravity_up, swapped=False)
         above = z_along[z_along > floor_z + 1.0]
         if above.size >= 50:
             ceiling_z = float(np.percentile(above, 98))
             if verbose:
                 print(f"[FLOORPLAN] ceiling via percentile (Tier 2): "
                       f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}")
-            return floor_z, ceiling_z, None
+            return floor_z, ceiling_z, None, secondary
         # Too few points above floor+1m (pathological scan). Keep the RANSAC
         # floor but use the 99th percentile of the full Z range as ceiling.
         if z_along.size >= 50:
@@ -254,7 +367,7 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
                 if verbose:
                     print(f"[FLOORPLAN] ceiling via 99th-pct fallback (Tier 2b): "
                           f"floor={floor_z:.3f} (RANSAC), ceiling={ceiling_z:.3f}")
-                return floor_z, ceiling_z, None
+                return floor_z, ceiling_z, None, secondary
 
     # ---- Tier 3: histogram fallback (reference-tool parity) ----
     if z_along.size == 0:
@@ -276,7 +389,8 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
     if verbose:
         print(f"[FLOORPLAN] floor/ceiling via histogram fallback (Tier 3): "
               f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}")
-    return floor_z, ceiling_z, None
+    # No detect_room result → no intermediate horizontals to surface.
+    return floor_z, ceiling_z, None, []
 
 
 # ============================================================
@@ -503,6 +617,9 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                        calibration_info=None,
                        run_stage8=True,
                        emit_stage8_diagnostics=False,
+                       vision_health=None,
+                       time_sync_dts=None,
+                       time_sync_dropped=0,
                        verbose=True):
     """Extract a 2D floor plan from an in-memory point cloud.
 
@@ -555,8 +672,13 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     # --- Robust floor/ceiling detection (the substantive change) ---
     # Tier 1 also returns the ceiling RANSAC Plane so the mask can use
     # point-to-plane distance instead of a Z-band. Tiers 2/3 return None.
-    floor_z, ceiling_z, ceiling_plane = detect_floor_ceiling_robust(
-        pcd, gravity_up=gravity_up, imus=imus, verbose=verbose)
+    # M4a: the 4th element is a list of intermediate horizontal planes
+    # (dropped soffits / coffers / trays / HVAC bulkheads) — surfaced in
+    # the metadata as `secondary_ceiling_features`. Empty when none
+    # were detected (the common, well-scanned case).
+    floor_z, ceiling_z, ceiling_plane, secondary_ceiling_features = (
+        detect_floor_ceiling_robust(
+            pcd, gravity_up=gravity_up, imus=imus, verbose=verbose))
     h = ceiling_z - floor_z
 
     if h <= 0.0:
@@ -831,6 +953,13 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     ade_class_counts = None
     if wall_labels is not None:
         ade_class_counts = wall_labels.get('ade_class_counts')
+
+    # M4a: compute per-wall camera frame coverage from the per-frame
+    # XYZ chunks accumulated during SLAM. Only D_refined walls are
+    # considered — other variants emit `frames_seen_count: 0`.
+    wall_frames_seen = _compute_per_wall_frame_coverage(
+        walls_d_clean, wall_labels)
+
     meta = build_floorplan_metadata(
         n_raw=n_raw, pts=pts, floor_z=floor_z, ceiling_z=ceiling_z, h=h,
         n_removed=n_removed, corner_coords_real=corner_coords_real,
@@ -839,7 +968,12 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         calibration_info=calibration_info,
         ade_class_counts=ade_class_counts,
         stage8_diagnostics=stage8_diagnostics,
-        openings=openings)
+        openings=openings,
+        vision_health=vision_health,
+        time_sync_dts=time_sync_dts,
+        time_sync_dropped=time_sync_dropped,
+        wall_frames_seen=wall_frames_seen,
+        secondary_ceiling_features=secondary_ceiling_features)
     write_floorplan_metadata(meta, output_dir, name)
 
     if verbose:

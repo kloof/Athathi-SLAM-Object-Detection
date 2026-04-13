@@ -53,7 +53,12 @@ def load_calibration(intrinsics_path, extrinsics_path):
 def match_nearest_image(cloud_stamp, image_timestamps, max_dt=0.15):
     """
     Find the nearest image timestamp to a cloud timestamp.
-    Returns index into image_timestamps, or None if beyond max_dt.
+
+    M4a: returns `(idx, dt)` where `dt = abs(stamp_diff)` on a hit,
+    or `(None, None)` when no image is within `max_dt`. The dt value
+    feeds the scan_quality.time_sync telemetry (p50/p95/p99 across
+    matched frames) so downstream users can see whether the capture
+    pipeline is hovering near the 150 ms hard cap.
     """
     idx = np.searchsorted(image_timestamps, cloud_stamp)
     candidates = []
@@ -63,12 +68,13 @@ def match_nearest_image(cloud_stamp, image_timestamps, max_dt=0.15):
         candidates.append(idx)
 
     if not candidates:
-        return None
+        return None, None
 
     best = min(candidates, key=lambda i: abs(image_timestamps[i] - cloud_stamp))
-    if abs(image_timestamps[best] - cloud_stamp) > max_dt:
-        return None
-    return best
+    dt = float(abs(image_timestamps[best] - cloud_stamp))
+    if dt > max_dt:
+        return None, None
+    return best, dt
 
 
 def colorize_cloud(xyz, image, calib, default_color=(128, 128, 128)):

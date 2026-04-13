@@ -68,6 +68,13 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
     if do_color:
         from cloud_slam.colorizer import colorize_cloud, match_nearest_image
         color_match_count = 0
+    # M4a: collect per-frame time-sync deltas (lidar↔image stamp gap) so
+    # the floorplan pipeline can emit p50/p95/p99 telemetry. A matched
+    # frame contributes its dt; a frame that failed the max_dt threshold
+    # is counted as dropped (None). Populated only when both the image
+    # lookup and per_frame_callback path are active.
+    time_sync_dts: list = []
+    time_sync_dropped: int = 0
 
     merged = o3d.geometry.PointCloud()
     T_current = np.eye(4)
@@ -85,11 +92,16 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
         decoded_image = None
         if (do_color or per_frame_callback) and len(image_timestamps) > 0:
             from cloud_slam.colorizer import match_nearest_image
-            img_idx = match_nearest_image(stamp, image_timestamps)
+            img_idx, img_dt = match_nearest_image(stamp, image_timestamps)
             if img_idx is not None:
                 _, compressed_bytes, _ = images[img_idx]
                 img_arr = np.frombuffer(compressed_bytes, dtype=np.uint8)
                 decoded_image = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+                # M4a: record the stamp-gap so the floorplan pipeline can
+                # emit scan_quality.time_sync percentiles.
+                time_sync_dts.append(float(img_dt))
+            else:
+                time_sync_dropped += 1
 
         # Colorize from camera if available
         if do_color and decoded_image is not None:
@@ -162,5 +174,11 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
     bbox = merged.get_axis_aligned_bounding_box()
     extent = bbox.get_extent()
     stats["bounding_box_m"] = f"{extent[0]:.2f} x {extent[1]:.2f} x {extent[2]:.2f}"
+
+    # M4a: time-sync telemetry — raw list of per-frame dt values + dropped
+    # count. Downstream code percentile-aggregates into the scan_quality
+    # block. Empty list / 0 when no image matching was performed.
+    stats["time_sync_dts"] = list(time_sync_dts)
+    stats["time_sync_dropped"] = int(time_sync_dropped)
 
     return merged, poses, stats

@@ -139,6 +139,13 @@ def _accumulate_wall_labels(segmenter, xyz, pose, image, calib, buffer,
 
     buffer['xyz'].append(xyz_world.astype(np.float32))
     buffer['labels'].append(bucket_ids[non_other].astype(np.uint8))
+    # M4a: mirror just the per-frame XYZ chunk so the downstream
+    # floorplan pipeline can count how many frames saw each wall.
+    # List-of-arrays keeps the per-frame boundary (one entry per
+    # contributing frame); the 'xyz'/'labels' lists above get
+    # concatenated into flat buffers for the rest of the pipeline.
+    if 'per_frame_xyz' in buffer:
+        buffer['per_frame_xyz'].append(xyz_world.astype(np.float32))
 
 
 def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
@@ -192,7 +199,10 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
     # on_frame closure appends into `wall_label_chunks`; after SLAM finishes
     # we concatenate into a single array. Keeping it as a list-of-arrays
     # avoids repeated concat/growing across frames.
-    wall_label_chunks = {'xyz': [], 'labels': []}
+    # M4a: `per_frame_xyz` mirrors the xyz chunks frame-by-frame so the
+    # floorplan pipeline can count, for each wall, how many frames
+    # contributed points within a small perpendicular band.
+    wall_label_chunks = {'xyz': [], 'labels': [], 'per_frame_xyz': []}
 
     # M0c: every Nth frame's wall-class mask + pose, used by
     # cloud_slam.calibration.verify_calibration downstream. Stays empty when
@@ -298,11 +308,16 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
         wall_labels = {
             'xyz': np.concatenate(wall_label_chunks['xyz'], axis=0),
             'labels': np.concatenate(wall_label_chunks['labels'], axis=0),
+            # M4a: list of per-frame XYZ arrays. Kept separate from the
+            # flattened 'xyz' above so the floorplan pipeline can count
+            # per-wall frame coverage.
+            'per_frame_xyz': list(wall_label_chunks['per_frame_xyz']),
         }
     else:
         wall_labels = {
             'xyz': np.zeros((0, 3), dtype=np.float32),
             'labels': np.zeros((0,), dtype=np.uint8),
+            'per_frame_xyz': [],
         }
     # M0a: carry the segmenter's cumulative ADE20K class histogram
     # alongside the bucket labels so the floorplan pipeline can vote on

@@ -74,6 +74,14 @@ class WallSegmenter:
         # are the raw ADE-150 ids (NOT the 5-bucket remap), values are
         # cumulative pixel counts across every successful segment() call.
         self._ade_class_counts: dict[int, int] = {}
+        # M4a: vision health counters. Track how much of the pixel
+        # stream actually lights up as non-"other" (ADE id 0 = the
+        # unlabeled / noise bucket). A scan where < 30% of pixels ever
+        # become recognizable indicates a broken lens, fogged camera,
+        # wrong lighting, etc. Surfaced via `get_vision_health()`.
+        self._total_pixels_seen: int = 0
+        self._non_other_pixels: int = 0
+        self._frames_seen: int = 0
 
     # ------------------------------------------------------------------
     # Lazy model load
@@ -174,6 +182,21 @@ class WallSegmenter:
             # Histogram update is best-effort; never fail segment() on it.
             pass
 
+        # M4a: vision health — track how often pixels land in ADE class 0
+        # (the "other"/unlabeled bucket). A healthy indoor scan sees the
+        # majority of pixels as recognizable classes (wall/floor/ceiling/
+        # furniture); a scan where most pixels come back as 0 is a signal
+        # that the camera is covered, out-of-focus, or the lighting is
+        # wrong, and that downstream vision features (wall typing, room
+        # vote) will be starved of signal.
+        try:
+            self._frames_seen += 1
+            self._total_pixels_seen += int(ade_mask.size)
+            self._non_other_pixels += int((ade_mask != 0).sum())
+        except Exception:
+            # Same best-effort contract as the ADE histogram update above.
+            pass
+
         return self._remap_ade(ade_mask)
 
     def get_ade_class_counts(self) -> dict:
@@ -184,6 +207,31 @@ class WallSegmenter:
         never run or was always disabled.
         """
         return dict(self._ade_class_counts)
+
+    def get_vision_health(self) -> dict:
+        """Return scan-level vision quality metrics (M4a).
+
+        `frame_quality_pct` is the percentage of pixels that were NOT
+        labeled as ADE class 0 ("other"). A healthy indoor scan scores
+        70-95%. Below ~30% indicates a broken capture (lens covered,
+        severely underexposed, wrong sensor orientation).
+
+        Returns zero-valued defaults when segment() has never run so the
+        caller can unconditionally serialize the block to JSON.
+        """
+        total = self._total_pixels_seen
+        if total == 0:
+            return {
+                "frame_quality_pct": 0.0,
+                "frames_seen": int(self._frames_seen),
+                "total_pixels_seen": 0,
+            }
+        return {
+            "frame_quality_pct": round(
+                100.0 * self._non_other_pixels / total, 2),
+            "frames_seen": int(self._frames_seen),
+            "total_pixels_seen": int(total),
+        }
 
     def reset_ade_class_counts(self) -> None:
         """Clear the accumulated ADE20K per-class counts.

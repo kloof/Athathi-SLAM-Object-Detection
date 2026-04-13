@@ -16,6 +16,8 @@ import hashlib
 import json
 from collections import Counter
 
+import numpy as np
+
 
 # Bumped by M0a when the JSON schema grew (per-wall UUIDs, cyclic
 # id links, calibration block, room category). Kept as a module constant
@@ -23,7 +25,11 @@ from collections import Counter
 # Bumped again by M3 when `D_refined.openings` (doors / windows / glass /
 # passages) joined each variant's per-wall list — mirrors Apple RoomPlan's
 # `CapturedOpening` contract.
-SCHEMA_VERSION = "2.1"
+# Bumped again by M4a with the new top-level `scan_quality` block (vision
+# frame-quality %, time-sync p50/p95/p99, per-wall camera coverage),
+# `secondary_ceiling_features` (dropped soffits / coffers / trays) and
+# per-wall `frames_seen_count` + `curved` fields.
+SCHEMA_VERSION = "2.2"
 
 
 # M3 opening schema keys (documented here so M3 populates them consistently).
@@ -160,8 +166,100 @@ def _build_calibration_block(calibration_info) -> dict:
     }
 
 
+def _build_scan_quality_block(vision_health, time_sync_dts,
+                                time_sync_dropped, wall_frames_seen,
+                                n_walls_d_refined):
+    """Assemble the M4a `scan_quality` metadata block.
+
+    Arguments are all optional — the block is emitted with sensible
+    zero-ish defaults when vision / timing data isn't available, so
+    consumers can unconditionally read it.
+
+    vision_health: dict from `WallSegmenter.get_vision_health()` or
+        None when Mask2Former wasn't run. Expected keys:
+        `frame_quality_pct`, `frames_seen`, `total_pixels_seen`.
+    time_sync_dts: list of per-frame lidar↔image stamp gaps (seconds),
+        from `icp_imu_pipeline.run`'s stats. Empty or None when no
+        color matching ran.
+    time_sync_dropped: int count of frames where match_nearest_image
+        returned None (beyond max_dt). Defaults to 0 when missing.
+    wall_frames_seen: dict {wall_id: int frames_seen}, from
+        `_compute_per_wall_frame_coverage`. Empty when no per-frame
+        XYZ was accumulated.
+    n_walls_d_refined: number of walls in the D_refined variant.
+        Used to count "low coverage" walls as a fraction of the
+        total, and to median-aggregate over. Zero-safe.
+    """
+    # ---- Vision sub-block ----
+    if vision_health is not None:
+        fq_pct = float(vision_health.get("frame_quality_pct", 0.0) or 0.0)
+        frames_seen_vision = int(vision_health.get("frames_seen", 0))
+        # "frames_low_quality_count" — we don't track per-frame
+        # fractions (the counters are cumulative), so expose 0 for
+        # now. Downstream consumers treat this as a placeholder;
+        # a future milestone can add per-frame gating.
+        vision_block = {
+            "frame_quality_pct": round(fq_pct, 2),
+            "frames_seen": frames_seen_vision,
+            "frames_low_quality_count": 0,
+        }
+    else:
+        vision_block = {
+            "frame_quality_pct": None,
+            "frames_seen": 0,
+            "frames_low_quality_count": 0,
+        }
+
+    # ---- Time-sync sub-block ----
+    dts_ms = None
+    if time_sync_dts:
+        dts_ms = np.asarray(time_sync_dts, dtype=float) * 1000.0
+    if dts_ms is not None and dts_ms.size > 0:
+        time_sync_block = {
+            "p50_ms": round(float(np.percentile(dts_ms, 50)), 2),
+            "p95_ms": round(float(np.percentile(dts_ms, 95)), 2),
+            "p99_ms": round(float(np.percentile(dts_ms, 99)), 2),
+            "frames_dropped": int(time_sync_dropped or 0),
+        }
+    else:
+        time_sync_block = {
+            "p50_ms": None,
+            "p95_ms": None,
+            "p99_ms": None,
+            "frames_dropped": int(time_sync_dropped or 0),
+        }
+
+    # ---- Per-wall coverage sub-block ----
+    if wall_frames_seen:
+        counts = np.asarray(
+            [int(v) for v in wall_frames_seen.values()], dtype=int)
+        min_fs = int(counts.min())
+        med_fs = int(np.median(counts))
+        # A wall is "low coverage" if < 10 frames saw it at close range.
+        # The threshold matches the M4a plan spec.
+        n_low = int((counts < 10).sum())
+    else:
+        min_fs = 0
+        med_fs = 0
+        # Without any per-frame coverage data, treat every wall as "low
+        # coverage" so the schema reflects the missing telemetry signal.
+        n_low = int(n_walls_d_refined or 0)
+
+    walls_block = {
+        "n_walls_with_low_coverage": n_low,
+        "min_frames_seen": min_fs,
+        "median_frames_seen": med_fs,
+    }
+
+    return {
+        "vision": vision_block,
+        "time_sync": time_sync_block,
+        "walls_camera_coverage": walls_block,
+    }
+
+
 def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean,
-                               n_walls):
+                               n_walls, wall_frames_seen=None):
     """Build a single wall entry dict for the variants.<key>.walls list.
 
     M0a expansion: every wall entry (regardless of variant) now carries
@@ -201,6 +299,10 @@ def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean,
             entry['type'] = m['type']
         if 'features' in m:
             entry['features'] = m['features']
+        # M4a: curved-wall flag (residual_m / length_m > 5%).
+        # Always emitted — defaults to False when the refiner couldn't
+        # compute one (fallback paths).
+        entry['curved'] = bool(m.get('curved', False))
     elif key == 'D_refined':
         # Fell back to A_natural — meta is None. Populate the same set of
         # numeric keys with neutral values so downstream consumers can
@@ -210,6 +312,16 @@ def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean,
         entry['residual_m'] = 0.0
         entry['confidence'] = 0.0
         entry['length_m_data_extent'] = entry['length_m']
+        entry['curved'] = False
+
+    # M4a: per-wall frames_seen_count — how many camera frames actually
+    # observed this wall at close range. Surfaced on EVERY variant's
+    # walls so downstream consumers don't need to special-case D_refined.
+    # Defaults to 0 when no per-frame data was available.
+    if wall_frames_seen is not None:
+        entry['frames_seen_count'] = int(wall_frames_seen.get(idx, 0))
+    else:
+        entry['frames_seen_count'] = 0
     return entry
 
 
@@ -219,7 +331,12 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               calibration_info=None,
                               ade_class_counts=None,
                               stage8_diagnostics=None,
-                              openings=None) -> dict:
+                              openings=None,
+                              vision_health=None,
+                              time_sync_dts=None,
+                              time_sync_dropped=0,
+                              wall_frames_seen=None,
+                              secondary_ceiling_features=None) -> dict:
     """Assemble the floorplan metadata dict (pre-serialization).
 
     M0a additions (all strict superset — pre-existing keys unchanged):
@@ -249,6 +366,25 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
         `variants.D_refined.openings` (array). When None, the key is
         still emitted as `[]` (total contract: consumers can
         unconditionally iterate `D_refined.openings`).
+
+    M4a kwargs (all optional; surface as the `scan_quality` block +
+    `secondary_ceiling_features` at metadata root):
+
+    vision_health: dict from `WallSegmenter.get_vision_health()` —
+        `frame_quality_pct` / `frames_seen` / `total_pixels_seen`.
+        None when Mask2Former didn't run → emits nulls.
+    time_sync_dts: list of per-frame lidar↔image stamp gaps in
+        seconds (from `icp_imu_pipeline.run` stats). Empty/None →
+        emits nulls.
+    time_sync_dropped: int count of frames where match_nearest_image
+        returned None (beyond max_dt).
+    wall_frames_seen: dict {wall_id: int frames_seen} from
+        `_compute_per_wall_frame_coverage`. None → emits 0 for every
+        wall's `frames_seen_count`.
+    secondary_ceiling_features: list of dicts describing dropped
+        soffits / coffers / trays / HVAC bulkheads (any horizontal
+        plane between floor+1m and the picked ceiling). Emitted as
+        `meta['secondary_ceiling_features']`. None → emits `[]`.
     """
     room_category, room_confidence, room_source = _vote_room_category(
         ade_class_counts)
@@ -296,12 +432,33 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
     # path — used when --no-stage8 disables the solver).
     if stage8_diagnostics is not None:
         meta['stage8'] = dict(stage8_diagnostics)
+
+    # M4a: dropped-ceiling features (soffits/coffers/trays/HVAC bulkheads).
+    # Always emitted as a list so consumers can unconditionally iterate.
+    meta['secondary_ceiling_features'] = (
+        list(secondary_ceiling_features) if secondary_ceiling_features
+        else [])
+
+    # M4a: scan_quality block. Always emitted — the helper fills in
+    # nulls/zeros for missing signals so consumers see a total contract.
+    n_d_walls = 0
+    if 'D_refined' in variants:
+        _walls_d, _poly_d, _label_d = variants['D_refined']
+        n_d_walls = len(_walls_d)
+    meta['scan_quality'] = _build_scan_quality_block(
+        vision_health=vision_health,
+        time_sync_dts=time_sync_dts,
+        time_sync_dropped=time_sync_dropped,
+        wall_frames_seen=wall_frames_seen,
+        n_walls_d_refined=n_d_walls)
+
     for key, (walls, poly, label) in variants.items():
         n_walls = len(walls)
         wall_entries = []
         for idx, wall_tuple in enumerate(walls):
             entry = _build_variant_wall_entry(
-                idx, wall_tuple, key, walls_d_meta_clean, n_walls)
+                idx, wall_tuple, key, walls_d_meta_clean, n_walls,
+                wall_frames_seen=wall_frames_seen)
             wall_entries.append(entry)
         meta['variants'][key] = {
             'label': label,

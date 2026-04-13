@@ -451,6 +451,16 @@ def main():
             k: v for k, v in calibration_info.items()
             if not k.startswith('_')
         }
+        # M4a: gather scan-quality inputs — vision health from the
+        # segmenter (None when --label-walls wasn't passed), time-sync
+        # dts from the SLAM stats, and the dropped-frame count. Any
+        # missing signal falls through as None / 0, and the floorplan
+        # schema builder emits nulls — the JSON always carries the
+        # block so consumers can unconditionally read it.
+        vision_health = (wall_segmenter.get_vision_health()
+                         if wall_segmenter is not None else None)
+        time_sync_dts = stats.get('time_sync_dts')
+        time_sync_dropped = int(stats.get('time_sync_dropped', 0) or 0)
         _variants, fp_meta = generate_floorplan(
             merged,
             fp_out_dir,
@@ -459,6 +469,9 @@ def main():
             wall_labels=fp_wall_labels,
             calibration_info=calibration_info_fp,
             run_stage8=not args.no_stage8,
+            vision_health=vision_health,
+            time_sync_dts=time_sync_dts,
+            time_sync_dropped=time_sync_dropped,
             verbose=False,
         )
         v = fp_meta['variants']
@@ -540,6 +553,48 @@ def main():
         except Exception:
             # Never let the warning path break the pipeline.
             pass
+
+    # M4a: loud warning when the scan_quality block shows low-quality
+    # vision, bad time-sync, or too many poorly-seen walls. Format
+    # matches the M0c calibration banner for visual consistency.
+    sq = {}
+    try:
+        sq = fp_meta.get('scan_quality', {}) if 'fp_meta' in locals() else {}
+    except Exception:
+        sq = {}
+    try:
+        if sq:
+            _issues = []
+            _v = sq.get('vision', {})
+            _fq = _v.get('frame_quality_pct')
+            if _fq is not None and float(_fq) < 30.0:
+                _issues.append(
+                    f"vision frame_quality_pct={_fq:.1f}% (<30%) — "
+                    "most pixels labeled 'other'; check camera/lighting")
+            _t = sq.get('time_sync', {})
+            _p95 = _t.get('p95_ms')
+            if _p95 is not None and float(_p95) > 120.0:
+                _issues.append(
+                    f"time_sync p95_ms={_p95:.1f} ms (>120 ms) — "
+                    "approaching the 150 ms hard wall")
+            _w = sq.get('walls_camera_coverage', {})
+            _nlow = _w.get('n_walls_with_low_coverage', 0)
+            if int(_nlow or 0) > 2:
+                _issues.append(
+                    f"walls_camera_coverage.n_walls_with_low_coverage="
+                    f"{_nlow} (>2) — too many walls seen in <10 frames")
+            if _issues:
+                print()
+                print("!" * 60)
+                print("!!  SCAN QUALITY WARNING (M4a)")
+                for _i in _issues:
+                    print(f"!!  - {_i}")
+                print("!!  Inspect floorplan_metadata.json → scan_quality "
+                      "for details.")
+                print("!" * 60)
+    except Exception:
+        # Never let the warning path break the pipeline.
+        pass
 
 
 if __name__ == "__main__":
