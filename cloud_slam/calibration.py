@@ -305,6 +305,11 @@ def warning_message(calibration_block: dict) -> str:
         "      reflect the new calibration.",
         "    - Re-run this pipeline; the new mean IoU should reach >= 0.85",
         "      (\"tight\" tier) before relying on sub-2 cm wall alignment.",
+        "",
+        "  Also review the `scan_quality` JSON block for vision / time-sync /",
+        "  per-wall-coverage diagnostics — those catch failure modes beyond",
+        "  the calibration scope (dropped ceilings, picture-frame false",
+        "  positives, phantom walls from open doorways).",
         "=" * 66,
     ]
     return "\n".join(lines)

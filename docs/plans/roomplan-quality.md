@@ -538,3 +538,72 @@ Datasets / bleeding-edge:
 - MASt3R-SLAM ([arxiv 2412.12392](https://arxiv.org/abs/2412.12392))
 - Depth Pro ([arxiv 2410.02073](https://arxiv.org/abs/2410.02073))
 - [GRASS — glass reflection suppression](https://www.mdpi.com/2072-4192/18/2/332)
+
+---
+
+## M4 — Robustness (landed on `feature/roomplan-quality`)
+
+Target: handle real-world scan gotchas without breaking the existing pipeline. Three sub-steps shipped:
+
+### M4a — Dropped-ceiling fix + scan telemetry
+
+Commits: `1d81205` + `7709fe8` + `4abbde7`.
+
+- `room_structure.detect_room()`: iteration cap 5→10, ceiling min_inliers 100→50, so the actual
+  structural ceiling is detected even when a dropped soffit/coffer/tray has more inliers.
+  `RoomStructure.intermediate_horiz` exposes secondary horizontal planes (soffits, trays)
+  with height + inlier count.
+- `SCHEMA_VERSION` 2.1→2.2. New `scan_quality` root block: vision quality percent, time-sync
+  slop p50/p95/p99, per-wall camera coverage. New per-wall `frames_seen_count`, `curved` flag.
+  New metadata root `secondary_ceiling_features`.
+- Loud warning banner at pipeline end when vision_quality < 30%, time_sync p95 > 120ms,
+  or more than 2 walls have low camera coverage.
+- Tests: `tests/unit/test_ceiling_pick.py` (4), `tests/unit/test_robustness_telemetry.py` (8).
+- Canonical scan (bedroom) confirms fix works: detects 2 soffits at ~3.03m alongside the
+  actual ceiling.
+
+### M4b — Opening robustness + trajectory-containment filter
+
+Commits: `22c70d4` + `56036b2` + `610daff` + `1e43058`.
+
+- **Picture-frame rejection**: small (<0.5m x 0.5m) window-bucket blobs not touching wall edges
+  rejected as likely wall art.
+- **Per-wall lidar-coverage gate**: if a wall has <5% lidar coverage, skip vision-blob
+  detection. Gap detection (passages) still runs.
+- **Density-ratio guard**: reject vision blobs with density_ratio None or <0.15 (phantom
+  unscanned regions mascarading as openings).
+- **Glass/window temporal voting**: vote on vision bucket via accumulated wall_labels points
+  instead of single-frame majority; `temporal_vote_count` exposed per opening.
+- **Trajectory-containment polygon filter**: walls outside the scanner's 1m-buffered
+  trajectory hull moved to `excluded_walls[]`. Prevents next-room phantom walls from
+  polluting the primary room polygon.
+- **Mirror detection via vision-override**: gap-detected passages with >=30% glass-bucket
+  vision cells reclassified as `type: mirror` with `source: vision-override-mirror`.
+  A lidar-bimodal fallback was attempted (commits `56036b2`/`610daff`) but removed in
+  `1e43058` because legitimate line-of-sight through real passages produces the same
+  behind-wall point signature — the heuristic was fundamentally unreliable.
+- Tests: 4 new in `test_openings.py`, 3 in `test_trajectory_filter.py`, 3 in `test_openings.py`
+  for mirror detection.
+- Canonical scans:
+  - Bedroom: 5 openings → 3 (picture frames rejected).
+  - L-shape: 13 walls → 8 (5 phantoms excluded), 6 openings → 4 (2 passages + 2 glass).
+  - Large room (180132): unchanged.
+
+### M4c — End-to-end test + docs
+
+Commits: (this section).
+
+- `tests/integration/test_robustness_e2e.py`: schema 2.2 contract test + back-compat test.
+- `cloud_slam/calibration.py`: warning updated to reference the new `scan_quality` block
+  alongside the existing IoU advice.
+- This documentation.
+
+### Known limitations (deferred to M5)
+
+- Multi-level rooms (mezzanines, stepped floors, truly vaulted ceilings where the pipeline's
+  single `ceiling_z` clips useful geometry).
+- Person filter (currently `person` is removed from YOLOE; no mask-only re-addition).
+- Mirrors when Mask2Former fails to label them as `glass`-bucket (e.g., reflected content
+  confuses the classifier in dim/complex scenes).
+- Calibration improvement (still requires manual checkerboard work; M0c only exposes the
+  existing quality).
