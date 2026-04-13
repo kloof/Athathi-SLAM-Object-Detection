@@ -125,8 +125,18 @@ def _export_pipeline_pngs(walls, room_poly, pts, binary, clean, g8, xe, ye,
 
 
 def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
-                         output_dir, name, floor_z, ceiling_z):
-    """Dedicated refined-polygon PNG with per-wall snap-kind coloring."""
+                         output_dir, name, floor_z, ceiling_z,
+                         openings=None):
+    """Dedicated refined-polygon PNG with per-wall snap-kind coloring.
+
+    M3: overlays structured openings on top of their hosting wall:
+        door    → wall line with ~1 m gap + two perpendicular ticks
+                  pointing inward (⊥⊥)
+        window  → wall line with gap + single perpendicular tick (⊤)
+        glass   → wall line with gap + dashed perpendicular tick (to
+                  distinguish from window)
+        passage → wall line with plain gap (no overlay)
+    """
     h = ceiling_z - floor_z
 
     res_v = 0.02
@@ -239,6 +249,76 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
                     ha='center', fontsize=7, color='#333',
                     rotation=a if a <= 90 else a - 180)
 
+    # --- M3: Opening overlays (doors, windows, glass, passages) ---
+    opening_legend_handles = []
+    if openings:
+        opening_colors = {
+            'door':    '#FF4500',  # red-orange, RoomPlan-style
+            'window':  '#1E88E5',  # blue
+            'glass':   '#80DEEA',  # cyan (matches type_color 'glass')
+            'passage': '#000000',  # black gap
+        }
+        seen_types = set()
+        wall_lookup = {i: w for i, w in enumerate(walls_d)}
+        for op in openings:
+            wid = int(op.get('wall_id', -1))
+            wall = wall_lookup.get(wid)
+            if wall is None:
+                continue
+            p1, p2, _a, _l = wall
+            p1 = np.asarray(p1, dtype=float)
+            p2 = np.asarray(p2, dtype=float)
+            edge = p2 - p1
+            L = float(np.linalg.norm(edge))
+            if L < 1e-6:
+                continue
+            udir = edge / L
+            perp = np.array([-udir[1], udir[0]])
+            a_start = float(op['along_start'])
+            a_end = float(op['along_end'])
+            otype = op['type']
+            color = opening_colors.get(otype, '#FF00FF')
+            # Cut a gap in the wall: draw a white overlay stub between
+            # the endpoints at the opening width.
+            gap_a = p1 + a_start * udir
+            gap_b = p1 + a_end * udir
+            ax.plot([gap_a[0], gap_b[0]], [gap_a[1], gap_b[1]],
+                    '-', color='white', linewidth=5.0,
+                    solid_capstyle='butt', zorder=3)
+            # Overlay the opening-specific glyph.
+            tick_len = 0.25  # visible on the plan (meters)
+            mid = 0.5 * (gap_a + gap_b)
+            if otype == 'door':
+                # Two perpendicular ticks pointing inward.
+                inner = perp * tick_len
+                for anchor in (gap_a, gap_b):
+                    tip = anchor + inner
+                    ax.plot([anchor[0], tip[0]], [anchor[1], tip[1]],
+                            '-', color=color, linewidth=2.0, zorder=4)
+            elif otype == 'window':
+                tip = mid + perp * tick_len
+                ax.plot([mid[0], tip[0]], [mid[1], tip[1]],
+                        '-', color=color, linewidth=2.2, zorder=4)
+            elif otype == 'glass':
+                tip = mid + perp * tick_len
+                ax.plot([mid[0], tip[0]], [mid[1], tip[1]],
+                        '--', color=color, linewidth=2.2, zorder=4)
+            # passage: plain gap only (handled by the white cut above).
+
+            # Redraw the opening span in the opening color, thinner, so
+            # the viewer can still see where the opening sits on the wall.
+            if otype != 'passage':
+                ax.plot([gap_a[0], gap_b[0]], [gap_a[1], gap_b[1]],
+                        '-', color=color, linewidth=2.0,
+                        alpha=0.9, zorder=4)
+
+            if otype not in seen_types:
+                seen_types.add(otype)
+                ls = '--' if otype == 'glass' else '-'
+                opening_legend_handles.append(
+                    Line2D([0], [0], color=color, linewidth=2.5,
+                           linestyle=ls, label=otype))
+
     ax.text(poly_d.centroid.x, poly_d.centroid.y,
             f"RANSAC-refined\nArea: {poly_d.area:.1f} m2\n"
             f"Ceiling: {ceiling_z:.2f}m\nHeight: {h:.2f}m\n"
@@ -268,8 +348,19 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
                    linestyle='--', label=f'{feat} (feature)'))
     if combined_type_handles:
         ax.add_artist(first_legend)
-        ax.legend(handles=combined_type_handles, loc='lower right',
-                  fontsize=9, framealpha=0.9, title='Vision type')
+        second_legend = ax.legend(
+            handles=combined_type_handles, loc='lower right',
+            fontsize=9, framealpha=0.9, title='Vision type')
+    else:
+        second_legend = None
+    # M3: third legend for opening symbols (door/window/glass/passage).
+    if opening_legend_handles:
+        if second_legend is not None:
+            ax.add_artist(second_legend)
+        else:
+            ax.add_artist(first_legend)
+        ax.legend(handles=opening_legend_handles, loc='center right',
+                  fontsize=9, framealpha=0.9, title='Openings')
     plt.tight_layout()
     plt.savefig(f'{output_dir}/{name}_refined.png', bbox_inches='tight')
     plt.close()
