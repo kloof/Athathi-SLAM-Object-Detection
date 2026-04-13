@@ -19,38 +19,7 @@ import numpy as np
 # Add parent dir so cloud_slam imports work
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-
-def create_box_points(center, dimensions, quat_xyzw, spacing=0.01):
-    """Sample points along OBB edges for PLY visualization."""
-    from scipy.spatial.transform import Rotation
-
-    R = Rotation.from_quat(quat_xyzw).as_matrix()
-    dx, dy, dz = dimensions / 2
-
-    # 8 corners of the box in local frame
-    corners_local = np.array([
-        [-dx, -dy, -dz], [dx, -dy, -dz], [dx, dy, -dz], [-dx, dy, -dz],
-        [-dx, -dy, dz], [dx, -dy, dz], [dx, dy, dz], [-dx, dy, dz],
-    ])
-
-    # Transform to world frame
-    corners = (R @ corners_local.T).T + center
-
-    # 12 edges of a box
-    edges = [
-        (0,1),(1,2),(2,3),(3,0),  # bottom
-        (4,5),(5,6),(6,7),(7,4),  # top
-        (0,4),(1,5),(2,6),(3,7),  # verticals
-    ]
-
-    points = []
-    for a, b in edges:
-        dist = np.linalg.norm(corners[b] - corners[a])
-        n_pts = max(int(dist / spacing), 2)
-        for t in np.linspace(0, 1, n_pts):
-            points.append(corners[a] + t * (corners[b] - corners[a]))
-
-    return np.array(points)
+from cloud_slam.box_render import create_box_points
 
 
 def main():
