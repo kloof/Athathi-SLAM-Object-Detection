@@ -22,8 +22,17 @@ def test_opening_required_keys_has_18():
     assert len(OPENING_REQUIRED_KEYS) == 18
 
 
-def test_opening_types_has_4():
-    assert OPENING_TYPES == frozenset({"door", "window", "glass", "passage"})
+def test_opening_types_has_5():
+    # M4b-ext added `mirror` to the vocabulary.
+    assert OPENING_TYPES == frozenset(
+        {"door", "window", "glass", "passage", "mirror"})
+
+
+def test_opening_types_includes_mirror():
+    """M4b-ext: mirror is a valid opening type."""
+    from cloud_slam.floorplan.schema import OPENING_TYPES
+    assert 'mirror' in OPENING_TYPES
+    assert len(OPENING_TYPES) == 5  # door, window, glass, passage, mirror
 
 
 def test_vote_room_category_empty():

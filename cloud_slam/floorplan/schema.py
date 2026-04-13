@@ -44,7 +44,11 @@ OPENING_REQUIRED_KEYS = frozenset({
 })
 
 # Controlled vocabulary for the `type` field on opening entries.
-OPENING_TYPES = frozenset({"door", "window", "glass", "passage"})
+# M4b-ext added `mirror` to catch wall-mounted mirrors that otherwise
+# trip the gap detector as phantom passages (lidar specular reflection
+# leaves empty cells bounded by wall material — exact passage signature).
+OPENING_TYPES = frozenset(
+    {"door", "window", "glass", "passage", "mirror"})
 
 
 # Per-wall default thickness. Real thickness would need multi-room scans

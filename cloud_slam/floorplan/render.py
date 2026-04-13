@@ -136,6 +136,10 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
         glass   → wall line with gap + dashed perpendicular tick (to
                   distinguish from window)
         passage → wall line with plain gap (no overlay)
+        mirror  → (M4b-ext) wall line with gap + DOTTED perpendicular
+                  tick plus a small "X" crosshatch at the gap center —
+                  visually distinct from `glass` (dashed tick) and from
+                  `passage` (no tick).
     """
     h = ceiling_z - floor_z
 
@@ -257,6 +261,10 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
             'window':  '#1E88E5',  # blue
             'glass':   '#80DEEA',  # cyan (matches type_color 'glass')
             'passage': '#000000',  # black gap
+            # M4b-ext: purple distinguishes mirrors from the cyan glass
+            # family (cyan already shades both 'glass' walls and 'glass'
+            # openings). A mirror is a distinct physical object.
+            'mirror':  '#8E24AA',
         }
         seen_types = set()
         wall_lookup = {i: w for i, w in enumerate(walls_d)}
@@ -303,6 +311,28 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
                 tip = mid + perp * tick_len
                 ax.plot([mid[0], tip[0]], [mid[1], tip[1]],
                         '--', color=color, linewidth=2.2, zorder=4)
+            elif otype == 'mirror':
+                # M4b-ext: dotted perpendicular tick (visually distinct
+                # from `glass`'s dashed tick) plus a small "X" drawn
+                # across the gap center.
+                tip = mid + perp * tick_len
+                ax.plot([mid[0], tip[0]], [mid[1], tip[1]],
+                        ':', color=color, linewidth=2.4, zorder=4)
+                # Gap half-width along the wall, capped to a visible
+                # minimum so a narrow mirror still gets a legible mark.
+                gap_w = float(np.linalg.norm(gap_b - gap_a))
+                x_half = max(min(gap_w * 0.5, 0.20), 0.06)
+                x_h = 0.08  # perp half-height of the "X"
+                # First stroke: lower-left to upper-right
+                a1 = mid - udir * x_half - perp * x_h
+                b1 = mid + udir * x_half + perp * x_h
+                ax.plot([a1[0], b1[0]], [a1[1], b1[1]],
+                        '-', color=color, linewidth=1.6, zorder=4)
+                # Second stroke: upper-left to lower-right
+                a2 = mid - udir * x_half + perp * x_h
+                b2 = mid + udir * x_half - perp * x_h
+                ax.plot([a2[0], b2[0]], [a2[1], b2[1]],
+                        '-', color=color, linewidth=1.6, zorder=4)
             # passage: plain gap only (handled by the white cut above).
 
             # Redraw the opening span in the opening color, thinner, so
@@ -314,7 +344,16 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
 
             if otype not in seen_types:
                 seen_types.add(otype)
-                ls = '--' if otype == 'glass' else '-'
+                # Legend linestyle hints at the tick glyph:
+                #   glass  → dashed   (--)
+                #   mirror → dotted   (:)
+                #   rest   → solid    (-)
+                if otype == 'glass':
+                    ls = '--'
+                elif otype == 'mirror':
+                    ls = ':'
+                else:
+                    ls = '-'
                 opening_legend_handles.append(
                     Line2D([0], [0], color=color, linewidth=2.5,
                            linestyle=ls, label=otype))

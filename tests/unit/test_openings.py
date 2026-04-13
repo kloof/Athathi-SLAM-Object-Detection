@@ -473,3 +473,179 @@ def test_temporal_vote_count_populated():
         assert 'temporal_vote_count' in o, (
             f"opening missing temporal_vote_count: {o}")
         assert o['temporal_vote_count'] >= 0
+
+
+# ---------------------------------------------------------------------
+# M4b-ext: mirror detection
+# ---------------------------------------------------------------------
+
+def _sample_rect_on_wall_offset(t0, t1, z0, z1, y_center, y_jitter=0.01,
+                                  density=500):
+    """Like `_sample_rect_on_wall` but samples points at a configurable
+    perpendicular offset (y) from the wall plane. Lets a test place
+    vision-labeled points INSIDE the 0.20 m vision band but OUTSIDE the
+    0.10 m density band — so cells are "empty" for the lidar occupancy
+    grid yet still get a vision bucket assignment.
+    """
+    n_t = max(int(density * (t1 - t0)), 10)
+    n_z = max(int(density * (z1 - z0)), 10)
+    tt, zz = np.meshgrid(
+        np.linspace(t0, t1, n_t),
+        np.linspace(z0, z1, n_z),
+        indexing='xy')
+    tt = tt.ravel()
+    zz = zz.ravel()
+    yy = (y_center
+          + np.random.default_rng(17).normal(0.0, y_jitter, len(tt)))
+    return np.column_stack([tt, yy, zz]).astype(np.float32)
+
+
+def test_mirror_detected_by_vision_override():
+    """A passage-shaped empty region with glass-bucket vision labels →
+    type='mirror'.
+
+    Geometry: a left solid wall block (t ∈ [0, 1.2]) + a stub jamb
+    column (t ∈ [2.5, 2.6]) identical to the `test_passage_single_side_jamb`
+    scene — both dense on the wall plane (y ≈ 0) so the density grid
+    sees them. BUT within the empty passage region (t ∈ [1.2, 2.5],
+    z ∈ [0, 2.5]) we seed a dense grid of glass-bucket points at y=0.15
+    (outside the 0.10 m density band but inside the 0.20 m vision
+    band). The gap detector still flags this as a passage blob (empty
+    on occupancy), but the vision-override reclassifies it as
+    type='mirror', source='vision-override-mirror'.
+    """
+    walls, meta = _single_wall(length=4.0)
+    left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
+    stub_wall = _sample_rect_on_wall(2.5, 2.6, 0.0, 2.5, density=700)
+    floor_line = _sample_rect_on_wall(2.6, 4.0, 0.0, 0.03, density=500)
+    ceiling_line = _sample_rect_on_wall(2.6, 4.0, 2.47, 2.5, density=500)
+    # Glass-bucket points at y=0.15 spanning the would-be passage —
+    # vision-band only, density-band misses them entirely.
+    mirror_vision = _sample_rect_on_wall_offset(
+        1.2, 2.5, 0.2, 2.3, y_center=0.15, y_jitter=0.005, density=600)
+    xyz = np.concatenate(
+        [left_wall, stub_wall, floor_line, ceiling_line, mirror_vision],
+        axis=0)
+    labels = np.concatenate([
+        np.ones(len(left_wall), dtype=np.uint8),
+        np.ones(len(stub_wall), dtype=np.uint8),
+        np.ones(len(floor_line), dtype=np.uint8),
+        np.ones(len(ceiling_line), dtype=np.uint8),
+        np.full(len(mirror_vision), 4, dtype=np.uint8),  # glass bucket
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0)
+    mirrors = [o for o in openings if o['type'] == 'mirror']
+    assert len(mirrors) >= 1, (
+        f"expected ≥1 mirror via vision override, got: "
+        f"{[(o['type'], o.get('source')) for o in openings]}")
+    m = mirrors[0]
+    assert m['source'] == 'vision-override-mirror', (
+        f"expected source='vision-override-mirror', got {m['source']}")
+    assert m['is_open'] is False
+    assert m['transparent'] is False
+    # No `passage` should remain where the mirror sits — vision override
+    # replaces the tentative passage, doesn't duplicate it.
+    passages = [o for o in openings if o['type'] == 'passage']
+    assert not passages, (
+        f"vision override produced a passage alongside the mirror: "
+        f"{[(o['type'], o.get('source')) for o in openings]}")
+
+
+def test_mirror_detected_by_behind_wall_points():
+    """A passage-shaped empty region with merged_pts BEHIND the wall
+    plane → type='mirror' via lidar-bimodal check (Option A).
+
+    Geometry: same stub-wall passage as the vision-override test, but
+    with NO glass-bucket labels. Instead, we add 200 points at y ≈ +0.7
+    (0.5-1.0 m behind the wall plane in the exterior direction from the
+    trajectory) spread across the passage's along-t range — these are
+    the "ghost reflections" a scanner sees through a mirror. The lidar
+    bimodal check must fire (n_behind ≥ 50) and reclassify the gap as
+    type='mirror', source='lidar-bimodal-mirror'.
+    """
+    walls, meta = _single_wall(length=4.0)
+    left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
+    stub_wall = _sample_rect_on_wall(2.5, 2.6, 0.0, 2.5, density=700)
+    floor_line = _sample_rect_on_wall(2.6, 4.0, 0.0, 0.03, density=500)
+    ceiling_line = _sample_rect_on_wall(2.6, 4.0, 2.47, 2.5, density=500)
+    # Ghost-reflection points behind the wall plane in the exterior
+    # direction. With a y=-5 trajectory below the wall (y=0), the
+    # exterior normal is +y; so +y points are "behind" the wall.
+    rng = np.random.default_rng(9)
+    n_ghost = 200
+    ghost_t = rng.uniform(1.3, 2.4, n_ghost)
+    ghost_y = rng.uniform(0.5, 1.0, n_ghost)   # 0.5-1.0 m behind
+    ghost_z = rng.uniform(0.3, 2.2, n_ghost)
+    ghost = np.column_stack([ghost_t, ghost_y, ghost_z]).astype(np.float32)
+    xyz = np.concatenate(
+        [left_wall, stub_wall, floor_line, ceiling_line, ghost], axis=0)
+    # All wall-plane points → bucket 1 (wall); ghost points → 0 (other).
+    # Importantly, NO bucket-4 glass labels — so the vision override
+    # cannot fire; only Option A should trigger.
+    labels = np.concatenate([
+        np.ones(len(left_wall), dtype=np.uint8),
+        np.ones(len(stub_wall), dtype=np.uint8),
+        np.ones(len(floor_line), dtype=np.uint8),
+        np.ones(len(ceiling_line), dtype=np.uint8),
+        np.zeros(len(ghost), dtype=np.uint8),
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    # Trajectory: a single line of 10 poses at y=-5, so traj_center_xy ≈
+    # (2.0, -5). Wall midpoint is (2.0, 0). to_exterior = (0, +5) → the
+    # edge-perp is oriented so positive perp means +y (exterior).
+    poses = np.column_stack([
+        np.linspace(0.5, 3.5, 10),
+        np.full(10, -5.0),
+        np.full(10, 1.2),
+    ]).astype(np.float64)
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0,
+        poses=poses)
+    mirrors = [o for o in openings if o['type'] == 'mirror']
+    assert len(mirrors) >= 1, (
+        f"expected ≥1 mirror via lidar-bimodal check, got: "
+        f"{[(o['type'], o.get('source')) for o in openings]}")
+    m = mirrors[0]
+    assert m['source'] == 'lidar-bimodal-mirror', (
+        f"expected source='lidar-bimodal-mirror', got {m['source']}")
+    assert m['is_open'] is False
+    assert m['transparent'] is False
+
+
+def test_real_passage_not_misclassified():
+    """A real open passage (empty region with NO behind-wall points and
+    NO glass-bucket labels) → type='passage', NOT mirror. Regression
+    guard so neither mirror signal fires falsely on standard doorways.
+    """
+    walls, meta = _single_wall(length=4.0)
+    left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
+    stub_wall = _sample_rect_on_wall(2.5, 2.6, 0.0, 2.5, density=700)
+    floor_line = _sample_rect_on_wall(2.6, 4.0, 0.0, 0.03, density=500)
+    ceiling_line = _sample_rect_on_wall(2.6, 4.0, 2.47, 2.5, density=500)
+    xyz = np.concatenate(
+        [left_wall, stub_wall, floor_line, ceiling_line], axis=0)
+    labels = np.ones(len(xyz), dtype=np.uint8)  # bucket 1 = wall
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    # Trajectory present (so Option A *could* fire), but no ghost points
+    # behind the wall → Option A must stay silent.
+    poses = np.column_stack([
+        np.linspace(0.5, 3.5, 10),
+        np.full(10, -5.0),
+        np.full(10, 1.2),
+    ]).astype(np.float64)
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0,
+        poses=poses)
+    mirrors = [o for o in openings if o['type'] == 'mirror']
+    passages = [o for o in openings if o['type'] == 'passage']
+    assert not mirrors, (
+        f"real passage wrongly flagged as mirror: "
+        f"{[(o['type'], o.get('source')) for o in openings]}")
+    assert passages, (
+        f"expected ≥1 passage, got: "
+        f"{[o['type'] for o in openings]}")

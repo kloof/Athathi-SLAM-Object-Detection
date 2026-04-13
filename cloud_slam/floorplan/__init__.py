@@ -1012,6 +1012,11 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                 config=OpeningsConfig(),
                 floor_z=float(floor_z),
                 ceiling_z=float(ceiling_z),
+                # M4b-ext: trajectory feeds the lidar-bimodal mirror
+                # check (wall-exterior orientation). When None, the
+                # Option-A branch of mirror detection is skipped —
+                # Option-B (vision override) still runs.
+                poses=poses,
             )
         except Exception as e:
             # Never let a detector failure crash the pipeline.

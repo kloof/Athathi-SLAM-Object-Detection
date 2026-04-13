@@ -373,6 +373,11 @@ def _extract_gap_components(occupancy, min_support, n_t, n_z):
             'support': n_cells,
             'lidar_adjacent_frac': float(lidar_adj_frac),
             'single_side_jamb': bool(single_side_jamb),
+            # M4b-ext: retain the component's cell mask so the mirror
+            # detectors (vision override + behind-wall check) can sample
+            # vision buckets and along-wall extents at exact component
+            # cells rather than the bounding rectangle.
+            'cell_mask': comp_mask.copy(),
         })
     return out
 
@@ -667,6 +672,7 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                       config: Optional[OpeningsConfig] = None,
                       ceiling_z: Optional[float] = None,
                       floor_z: Optional[float] = None,
+                      poses=None,
                       verbose: bool = False):
     """Detect doors/windows/glass/passages on a set of refined walls.
 
@@ -685,6 +691,12 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
         config:      OpeningsConfig; defaults to OpeningsConfig().
         ceiling_z:   scalar wall-top height (world Z). Required.
         floor_z:     scalar wall-bottom height (world Z). Required.
+        poses:       optional SLAM trajectory. Either an (N, 3) array of
+                     XYZ points or a sequence of 4x4 transform matrices.
+                     Used by the M4b-ext mirror detector to orient the
+                     wall's exterior normal for the behind-wall check.
+                     When absent, the lidar bimodal mirror check is
+                     skipped (vision-override still runs).
         verbose:     Print per-wall coverage percentages (M4b).
 
     Returns:
@@ -722,6 +734,23 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
 
     corner_cells = max(int(round(config.corner_reject_m / res)), 1)
     wall_height = max(ceiling_z - floor_z, 1e-3)
+
+    # --- M4b-ext: normalize SLAM trajectory for the mirror "behind-wall"
+    # check. Accept either (N, 3) point arrays or sequences of 4x4
+    # transform matrices; fall back to None when fewer than 2 poses are
+    # usable (the exterior-normal orientation needs at least the spread of
+    # a trajectory to pick the outward direction reliably).
+    traj_center_xy = None
+    if poses is not None:
+        try:
+            pose_arr = np.asarray(
+                [np.asarray(p)[:3, 3] if np.asarray(p).ndim == 2
+                 else np.asarray(p)[:3] for p in poses],
+                dtype=float)
+            if pose_arr.ndim == 2 and pose_arr.shape[0] >= 2:
+                traj_center_xy = np.mean(pose_arr[:, :2], axis=0)
+        except Exception:
+            traj_center_xy = None
 
     all_openings: list = []
     oid_counter = 0
@@ -886,6 +915,22 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
         gap_comps = _extract_gap_components(
             grid['occupancy'], min_support=config.min_support_gap_cells,
             n_t=grid['n_t'], n_z=grid['n_z'])
+        # Wall-frame axes for the M4b-ext lidar-bimodal mirror check.
+        # Computed once per wall (cheap) so each gap component can
+        # evaluate "behind the wall" without re-deriving these.
+        wall_dir_xy_full, wall_perp_xy_full, _wlen_xy = _wall_frame(p1, p2)
+        # Orient the perpendicular AWAY from the trajectory center so
+        # positive perp values mean "exterior" (beyond the wall from the
+        # scanner's POV). When no trajectory was supplied we still compute
+        # the axes but skip the lidar-bimodal check below.
+        wall_normal_xy = wall_perp_xy_full
+        if (wall_dir_xy_full is not None and wall_normal_xy is not None
+                and traj_center_xy is not None):
+            wall_mid_xy = np.mean(
+                [np.asarray(p1)[:2], np.asarray(p2)[:2]], axis=0)
+            to_exterior = wall_mid_xy - traj_center_xy
+            if float(np.dot(wall_normal_xy, to_exterior)) < 0.0:
+                wall_normal_xy = -wall_normal_xy
         for comp in gap_comps:
             t_lo = comp['t_lo']
             t_hi = comp['t_hi']
@@ -903,11 +948,71 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
             if not (hrange[0] <= h_m <= hrange[1]):
                 continue
             confidence = min(h_m / wall_height, 1.0)
+
+            # Default classification: real passage.
+            opening_type = 'passage'
+            cand_source = 'lidar'
+
+            # ---- M4b-ext B: vision-override for mirrors / glass panels --
+            # Count vision buckets over the gap's exact component cells.
+            # Mirrors are labeled `mirror` → bucket 4 (glass) by the ADE20K
+            # remap, so a majority-glass gap blob is a mirror (or glass
+            # partition), not an open passage. This runs BEFORE the lidar
+            # bimodal check so confident vision wins.
+            comp_mask = comp.get('cell_mask')
+            if (opening_type == 'passage' and comp_mask is not None
+                    and grid['vision'] is not None
+                    and grid['vision'].size > 0):
+                blob_cells_vision = np.asarray(
+                    grid['vision'][comp_mask], dtype=np.int64)
+                if blob_cells_vision.size > 0:
+                    counts = np.bincount(blob_cells_vision, minlength=5)
+                    total_vision = int(counts.sum())
+                    glass_count = int(counts[4]) if counts.size > 4 else 0
+                    glass_fraction = (
+                        glass_count / total_vision if total_vision > 0
+                        else 0.0)
+                    if glass_fraction >= 0.30:
+                        opening_type = 'mirror'
+                        cand_source = 'vision-override-mirror'
+                        if verbose:
+                            print(f"[Openings] wall {wall_idx} mirror via "
+                                  f"vision-override "
+                                  f"(glass_frac={glass_fraction:.2f})")
+
+            # ---- M4b-ext A: lidar bimodal / behind-wall check -----------
+            # Only fires if Option B didn't already flag this as a mirror.
+            # A real passage is the wall's edge — no lidar beyond the wall
+            # plane in the exterior direction. A mirror bounces the beam
+            # off the specular surface and the scanner records ghost
+            # points "behind" the wall (really: reflections of the interior
+            # scene). Count points in the exterior half-space within the
+            # blob's along-wall range and a 0.3-1.5 m perp band.
+            if (opening_type == 'passage'
+                    and merged_pts is not None and len(merged_pts) > 0
+                    and wall_dir_xy_full is not None
+                    and wall_normal_xy is not None
+                    and traj_center_xy is not None):
+                rel = np.asarray(merged_pts[:, :2],
+                                 dtype=float) - np.asarray(p1)[:2]
+                perp_all = rel @ wall_normal_xy
+                along_all = rel @ wall_dir_xy_full
+                in_blob_along = ((along_all >= float(along_s) - 0.1)
+                                 & (along_all <= float(along_e) + 0.1))
+                behind_wall = (perp_all > 0.3) & (perp_all < 1.5)
+                n_behind = int(np.sum(in_blob_along & behind_wall))
+                if n_behind >= 50:
+                    opening_type = 'mirror'
+                    cand_source = 'lidar-bimodal-mirror'
+                    if verbose:
+                        print(f"[Openings] wall {wall_idx} mirror via "
+                              f"lidar-bimodal (n_behind={n_behind})")
+
             per_wall.append({
                 't_lo': t_lo, 't_hi': t_hi, 'z_lo': z_lo, 'z_hi': z_hi,
                 'support': comp['support'],
-                'otype': 'passage',
-                'source': 'lidar',
+                'otype': opening_type,
+                'source': cand_source,
                 'along_start': along_s, 'along_end': along_e,
                 'z_bottom': z_b, 'z_top': z_t,
                 'width_m': w_m, 'height_m': h_m,
@@ -917,6 +1022,10 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
             })
 
         # --- Dedup: vision blobs outrank gap passages on IoU > threshold ---
+        # Mirrors (M4b-ext) are themselves the vision-winning interpretation
+        # of a gap — don't suppress them against door/window/glass vision
+        # blobs; a mirror blob overlapping a window blob is already the
+        # correct answer (the vision override trusted the glass bucket).
         kept = []
         for cand in per_wall:
             if cand['otype'] != 'passage':
@@ -927,7 +1036,7 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
             for other in per_wall:
                 if other is cand:
                     continue
-                if other['otype'] == 'passage':
+                if other['otype'] in ('passage', 'mirror'):
                     continue
                 if _bbox_iou(cand, other) > config.dedup_iou_threshold:
                     suppressed = True
@@ -942,10 +1051,11 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
             # M4b density-ratio guard: vision blobs (door / window / glass)
             # whose local density_ratio is None or below the floor are
             # phantom regions — likely unscanned area at the wall edge
-            # being mis-interpreted as a closed opening. Passages
-            # deliberately have ratio≈0 and use their own adjacency rule
-            # in `_extract_gap_components`, so they're exempt.
-            if cand['otype'] != 'passage':
+            # being mis-interpreted as a closed opening. Passages and
+            # mirrors (M4b-ext) deliberately have ratio≈0 (they're empty
+            # regions on the lidar) and use their own adjacency + vision/
+            # behind-wall signatures; both are exempt.
+            if cand['otype'] not in ('passage', 'mirror'):
                 ratio_is_low = (ratio is None
                                 or (isinstance(ratio, (int, float))
                                     and ratio < config.min_density_ratio_for_emit))
@@ -991,6 +1101,12 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                     transparent = True
             elif cand['otype'] == 'passage':
                 is_open = True
+            elif cand['otype'] == 'mirror':
+                # M4b-ext: mirrors are closed (lidar didn't penetrate the
+                # glass — specular reflection) and are NOT transparent
+                # from the scan's POV (the beam didn't pass through).
+                is_open = False
+                transparent = False
 
             entry = _make_opening_entry(
                 oid=oid_counter, wall_idx=wall_idx,
