@@ -25,6 +25,40 @@ from cloud_slam.box_render import create_box_points
 from cloud_slam.transforms import apply_transform_to_buffers
 
 
+def _load_calibration_info(calibration_dir):
+    """Extract M0a calibration-block fields from the scan's extrinsics.yaml.
+
+    Reads `method` and `calibration_date` (if present). Derives
+    `age_days` as today-date minus calibration-date when parseable.
+    All fields are optional — anything missing falls back to the
+    M0a defaults inside `cloud_slam.floorplan.schema._build_calibration_block`.
+    """
+    import datetime
+    import yaml
+
+    info = {}
+    ext_path = os.path.join(calibration_dir, "extrinsics.yaml")
+    try:
+        with open(ext_path) as f:
+            ext = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[Floorplan] calibration_info: couldn't read {ext_path}: {e}")
+        return info
+
+    if 'method' in ext:
+        info['method'] = str(ext['method'])
+    if 'calibration_date' in ext:
+        date_str = str(ext['calibration_date'])
+        info['calibration_date'] = date_str
+        try:
+            cal_date = datetime.date.fromisoformat(date_str)
+            info['age_days'] = (datetime.date.today() - cal_date).days
+        except ValueError:
+            # Unparseable date → leave age_days unset (falls back to None).
+            pass
+    return info
+
+
 def main():
     # M0b: RANSAC seeding for byte-for-byte regression reproducibility.
     # See docs/plans/roomplan-quality.md (M0b) — Open3D >=0.15 exposes
@@ -265,12 +299,18 @@ def main():
                           if wall_labels is not None
                           and len(wall_labels.get('labels', [])) > 0
                           else None)
+        # M0a calibration block: pull `method` / `calibration_date` from
+        # the scan's extrinsics.yaml if present. Compute `age_days` from
+        # today's date so downstream converters can flag drifted
+        # calibrations. Any missing field falls back to M0a defaults.
+        calibration_info = _load_calibration_info(args.calibration)
         _variants, fp_meta = generate_floorplan(
             merged,
             fp_out_dir,
             name="floorplan",
             gravity_up=np.array([0.0, 0.0, 1.0]),
             wall_labels=fp_wall_labels,
+            calibration_info=calibration_info,
             verbose=False,
         )
         v = fp_meta['variants']

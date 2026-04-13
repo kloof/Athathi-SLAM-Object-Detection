@@ -68,6 +68,12 @@ class WallSegmenter:
         self._model = None
         self._loaded = False
         self._disabled = False
+        # M0a: per-call ADE20K class histogram accumulator. Lets the
+        # floorplan pipeline vote on `room.category` (bed → bedroom,
+        # sofa → livingroom, etc.) without re-running inference. Keys
+        # are the raw ADE-150 ids (NOT the 5-bucket remap), values are
+        # cumulative pixel counts across every successful segment() call.
+        self._ade_class_counts: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Lazy model load
@@ -152,7 +158,32 @@ class WallSegmenter:
                   f"{type(e).__name__}: {e}")
             return None
 
+        # M0a: accumulate per-frame ADE20K class pixel counts for the
+        # room.category vote. np.bincount over the flattened mask gives a
+        # dense histogram for any id 0..max; we fold that into the
+        # cumulative counter. Cheap (~microseconds per frame).
+        try:
+            flat = ade_mask.ravel()
+            if flat.size > 0:
+                counts = np.bincount(flat[flat >= 0])
+                for cid in np.nonzero(counts)[0]:
+                    self._ade_class_counts[int(cid)] = (
+                        self._ade_class_counts.get(int(cid), 0)
+                        + int(counts[cid]))
+        except Exception:
+            # Histogram update is best-effort; never fail segment() on it.
+            pass
+
         return self._remap_ade(ade_mask)
+
+    def get_ade_class_counts(self) -> dict:
+        """Return cumulative ADE20K class histogram across every segment() call.
+
+        Keys are raw ADE-150 class ids (e.g. 7=bed, 23=sofa, 71=stove);
+        values are cumulative pixel counts. Empty dict if segment() has
+        never run or was always disabled.
+        """
+        return dict(self._ade_class_counts)
 
     # ------------------------------------------------------------------
     # ADE20K → 5-bucket remap

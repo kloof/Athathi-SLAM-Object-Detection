@@ -258,6 +258,15 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
             'xyz': np.zeros((0, 3), dtype=np.float32),
             'labels': np.zeros((0,), dtype=np.uint8),
         }
+    # M0a: carry the segmenter's cumulative ADE20K class histogram
+    # alongside the bucket labels so the floorplan pipeline can vote on
+    # `room.category` without re-running inference. Empty dict when
+    # wall_segmenter is None — the floorplan then emits
+    # "category": "unknown" / "category_source": "unavailable".
+    if wall_segmenter is not None:
+        wall_labels['ade_class_counts'] = wall_segmenter.get_ade_class_counts()
+    else:
+        wall_labels['ade_class_counts'] = {}
     stats['wall_labels_count'] = int(wall_labels['labels'].shape[0])
 
     return merged, poses, objects, stats, wall_labels

@@ -2,30 +2,168 @@
 
 Extracted from the pre-split `generate_floorplan` orchestrator so the
 metadata-construction loop (per-variant + per-wall entries) lives in one
-place. M0a will lean on `SCHEMA_VERSION` when expanding the schema with
-the wall / opening payload. Zero behavior change relative to the pre-split
-code path.
+place. M0a expanded the schema with per-wall `id`/`uuid`/`p1`/`p2`/
+`thickness_m`/`next_wall_id`/`prev_wall_id` and top-level
+`schema_version`/`units`/`world_up`/`handedness`/`origin`/`calibration`/
+`room` keys so downstream converters (USDZ/IFC/Revit/RoomPlan) and the
+M3 openings module have a stable contract.
+
+Back-compat: the M0a additions are a strict *superset* — every pre-M0a
+key still exists at the same path with the same value.
 """
 
+import hashlib
 import json
+from collections import Counter
 
 
-# Bumped by M0a when the JSON schema grows (dominant_directions, per-wall
-# UUIDs, openings list). Kept as a module constant so importers can assert
-# compatibility without reading from the file.
+# Bumped by M0a when the JSON schema grew (per-wall UUIDs, cyclic
+# id links, calibration block, room category). Kept as a module constant
+# so importers can assert compatibility without reading from the file.
 SCHEMA_VERSION = "2.0"
 
 
-def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean):
+# M3 opening schema keys (documented here so M3 populates them consistently).
+# Doors / windows / passages emitted by the M3 openings detector must
+# populate every key in this set on every opening entry — downstream
+# converters rely on the contract being total, not best-effort.
+OPENING_REQUIRED_KEYS = frozenset({
+    "id", "uuid", "type", "wall_id", "wall_uuid",
+    "along_start", "along_end", "z_bottom", "z_top",
+    "width_m", "height_m", "center_xy", "transform_4x4",
+    "source", "is_open", "transparent", "transom_of", "confidence",
+})
+
+# Controlled vocabulary for the `type` field on opening entries.
+OPENING_TYPES = frozenset({"door", "window", "glass", "passage"})
+
+
+# Per-wall default thickness. Real thickness would need multi-room scans
+# (inside + outside surface). The 0.1 m default mirrors IFC wall-layer
+# conventions and is recorded at the root as `thickness_source`.
+_DEFAULT_WALL_THICKNESS_M = 0.1
+
+
+# --- ADE20K → room-category vote table (M0a room classifier) ---
+#
+# Signature object classes in ADE20K-150 that disambiguate interior spaces.
+# Majority vote across the whole scan; winner must exceed a 0.4 fraction
+# of the total signature-class votes or we emit "unknown". Ignores all
+# background clutter (floor, wall, cabinet etc.) — only the signatures
+# listed here contribute.
+_ADE_ROOM_SIGNATURES = {
+    # bedroom
+    7:   "bedroom",      # bed
+    # livingroom
+    23:  "livingroom",   # sofa
+    31:  "livingroom",   # armchair (ADE20K "armchair")
+    # kitchen
+    50:  "kitchen",      # refrigerator
+    71:  "kitchen",      # stove/oven
+    124: "kitchen",      # microwave
+    # bathroom
+    37:  "bathroom",     # bathtub
+    65:  "bathroom",     # toilet
+    # diningroom
+    15:  "diningroom",   # table / dining_table
+}
+
+_ROOM_MIN_CONFIDENCE = 0.4
+
+
+def _wall_uuid(p1, p2):
+    """Deterministic MD5-hex UUID for a wall's geometry.
+
+    Rounding to 4 decimals (0.1 mm) before hashing ensures two runs on
+    the same scan produce the same UUIDs (point-cloud float noise from
+    ICP/voxel-downsample is far below that threshold). Full 32-char hex.
+    """
+    s = (f"{float(p1[0]):.4f},{float(p1[1]):.4f},"
+         f"{float(p2[0]):.4f},{float(p2[1]):.4f}")
+    return hashlib.md5(s.encode()).hexdigest()
+
+
+def _vote_room_category(ade_class_counts):
+    """Aggregate ADE20K class histogram → (category, confidence, source).
+
+    ade_class_counts: dict[int, int] — ADE20K class id → total pixel count
+                      across the scan. Only the signature classes in
+                      `_ADE_ROOM_SIGNATURES` are considered.
+
+    Returns ("unknown", 0.0, "ade20k_vote") when no signature class crosses
+    the `_ROOM_MIN_CONFIDENCE` fraction; returns
+    ("unknown", 0.0, "unavailable") when ade_class_counts is None/empty.
+    """
+    if not ade_class_counts:
+        return "unknown", 0.0, "unavailable"
+
+    category_votes = Counter()
+    for ade_id, count in ade_class_counts.items():
+        cat = _ADE_ROOM_SIGNATURES.get(int(ade_id))
+        if cat is not None:
+            category_votes[cat] += int(count)
+
+    total = sum(category_votes.values())
+    if total == 0:
+        return "unknown", 0.0, "ade20k_vote"
+
+    winner, winner_votes = category_votes.most_common(1)[0]
+    confidence = winner_votes / total
+    if confidence < _ROOM_MIN_CONFIDENCE:
+        return "unknown", float(round(confidence, 3)), "ade20k_vote"
+    return winner, float(round(confidence, 3)), "ade20k_vote"
+
+
+def _build_calibration_block(calibration_info):
+    """Build the `calibration` root block.
+
+    calibration_info: optional dict with keys
+        method (str), calibration_date (str 'YYYY-MM-DD'), age_days (int)
+        — any subset. Everything missing falls back to sensible defaults.
+        M0c will populate the reprojection-IoU fields; for M0a they're
+        left as null so downstream consumers can detect "not yet verified".
+    """
+    info = calibration_info or {}
+    return {
+        "method": info.get("method", "manual_visual_alignment"),
+        "date": info.get("calibration_date"),
+        "age_days": info.get("age_days"),
+        # M0c will populate these (per-scan reprojection IoU). Left null
+        # so consumers can detect "not yet verified".
+        "reprojection_iou_mean": None,
+        "reprojection_iou_min": None,
+        "reprojection_iou_frames_checked": 0,
+        # Hard-coded from cloud_slam/colorizer.py::match_nearest_image(max_dt=0.15).
+        # If the colorizer's threshold changes, update both places.
+        "time_sync_max_dt_ms": 150,
+        # Placeholder — M0c will flip to "fine" once per-scan verification
+        # achieves a reprojection-IoU threshold.
+        "accuracy_tier": "coarse",
+    }
+
+
+def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean,
+                               n_walls):
     """Build a single wall entry dict for the variants.<key>.walls list.
 
-    Mirrors the per-variant loop that was inlined in `generate_floorplan`
-    before the package split. Kept as a helper so the orchestrator stays
-    thin and schema changes land in one place (see M0a).
+    M0a expansion: every wall entry (regardless of variant) now carries
+    `id`, `uuid`, `p1`, `p2`, `thickness_m`, `next_wall_id`, `prev_wall_id`
+    alongside the pre-existing `length_m`/`angle_deg`. The D_refined variant
+    also keeps its `snapped_to`/`residual_m`/`confidence`/`type`/`features`
+    fields. Back-compat: the pre-M0a keys are unchanged in name and value.
     """
-    _, _, a, l = wall_tuple
-    entry = {'length_m': round(float(l), 3),
-             'angle_deg': round(float(a), 1)}
+    p1, p2, a, l = wall_tuple
+    entry = {
+        'id': int(idx),
+        'uuid': _wall_uuid(p1, p2),
+        'p1': [round(float(p1[0]), 4), round(float(p1[1]), 4)],
+        'p2': [round(float(p2[0]), 4), round(float(p2[1]), 4)],
+        'thickness_m': _DEFAULT_WALL_THICKNESS_M,
+        'next_wall_id': int((idx + 1) % n_walls) if n_walls > 0 else 0,
+        'prev_wall_id': int((idx - 1) % n_walls) if n_walls > 0 else 0,
+        'length_m': round(float(l), 3),
+        'angle_deg': round(float(a), 1),
+    }
 
     # D_refined: add per-wall snap kind + residual + confidence
     if (key == 'D_refined' and idx < len(walls_d_meta_clean)
@@ -53,14 +191,47 @@ def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean):
 
 def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               corner_coords_real, variants, walls_d_meta_clean,
-                              vision_stats, elapsed):
+                              vision_stats, elapsed,
+                              calibration_info=None,
+                              ade_class_counts=None):
     """Assemble the floorplan metadata dict (pre-serialization).
 
-    Extracted verbatim from `generate_floorplan`'s bottom block. The
-    returned dict matches the JSON produced by the pre-split code byte-
-    for-byte for every existing code path.
+    M0a additions (all strict superset — pre-existing keys unchanged):
+        schema_version, units, angle_units, world_up, handedness, origin,
+        thickness_source, calibration (block), room (block).
+
+    calibration_info: optional dict from the scan's extrinsics.yaml
+        (method / calibration_date / age_days). Missing values fall back
+        to `_build_calibration_block` defaults.
+
+    ade_class_counts: optional dict[int, int] of ADE20K class id → total
+        pixel count across the scan. Drives the `room.category` vote.
+        When None/empty (segmenter disabled), emits
+        `{"category": "unknown", "category_confidence": 0.0,
+          "category_source": "unavailable"}`.
     """
+    room_category, room_confidence, room_source = _vote_room_category(
+        ade_class_counts)
+
     meta = {
+        # --- M0a root metadata ---
+        'schema_version': SCHEMA_VERSION,
+        'units': 'm',
+        'angle_units': 'deg',
+        # Z-up right-handed frame — the floorplan post-process runs after
+        # leveling in scripts/detect_and_slam.py, so all wall/point
+        # coordinates are already in the canonical gravity-aligned frame.
+        'world_up': [0, 0, 1],
+        'handedness': 'right',
+        'origin': 'first_lidar_frame',
+        'thickness_source': 'default_0.1m',
+        'calibration': _build_calibration_block(calibration_info),
+        'room': {
+            'category': room_category,
+            'category_confidence': room_confidence,
+            'category_source': room_source,
+        },
+        # --- pre-M0a keys (unchanged in name and value) ---
         'n_points_raw': int(n_raw),
         'n_points_processed': int(len(pts)),
         'floor_z': round(float(floor_z), 3),
@@ -80,15 +251,16 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
         meta['vision_wall_blob_count'] = int(
             vision_stats['wall_blob_count'])
     for key, (walls, poly, label) in variants.items():
+        n_walls = len(walls)
         wall_entries = []
         for idx, wall_tuple in enumerate(walls):
             entry = _build_variant_wall_entry(
-                idx, wall_tuple, key, walls_d_meta_clean)
+                idx, wall_tuple, key, walls_d_meta_clean, n_walls)
             wall_entries.append(entry)
         meta['variants'][key] = {
             'label': label,
             'area_m2': round(float(poly.area), 2),
-            'n_walls': int(len(walls)),
+            'n_walls': int(n_walls),
             'walls': wall_entries,
         }
     return meta

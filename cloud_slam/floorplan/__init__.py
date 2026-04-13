@@ -496,7 +496,9 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                        resolution=0.03, epsilon=0.012, snap_angle=45,
                        voxel_size=0.03, ceil_band=0.12,
                        close_kernel=11, angle_flex=3.0,
-                       wall_labels=None, verbose=True):
+                       wall_labels=None,
+                       calibration_info=None,
+                       verbose=True):
     """Extract a 2D floor plan from an in-memory point cloud.
 
     Writes to `output_dir` (PNG only — DXF export is intentionally omitted):
@@ -514,7 +516,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     beats the real ceiling.
 
     Optional `wall_labels` is a dict
-        {'xyz': (M, 3) float32, 'labels': (M,) uint8}
+        {'xyz': (M, 3) float32, 'labels': (M,) uint8,
+         'ade_class_counts': dict[int,int] (optional — M0a room vote)}
     of world-frame lidar points tagged with vision bucket ids (bucket
     layout: 0 other / 1 wall / 2 window / 3 door / 4 glass). When
     provided and non-empty, three vision augmentations activate:
@@ -522,6 +525,15 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
       Tier 2 — wall-band filter (drops 'other' clutter) before RANSAC.
       Tier 3 — diagnostic wall-point / wall-blob counts in the metadata.
     When None or empty, behavior is byte-identical to the vision-less path.
+
+    The optional `ade_class_counts` entry (raw ADE20K class id →
+    pixel-count histogram across the scan) drives the M0a `room.category`
+    vote. When absent or the segmenter was disabled, the metadata emits
+    `{"room": {"category": "unknown", ..., "category_source": "unavailable"}}`.
+
+    Optional `calibration_info` is a dict with keys `method`,
+    `calibration_date`, and `age_days` (any subset). Missing values fall
+    back to the M0a defaults inside `schema._build_calibration_block`.
 
     Returns:
         (variants, meta) where variants is a dict of
@@ -720,11 +732,18 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
 
     # ---- Metadata JSON ----
     elapsed = time.time() - t0
+    # M0a room-vote input — pulled from wall_labels when the segmenter
+    # exposed a per-scan ADE histogram; otherwise None → "unavailable".
+    ade_class_counts = None
+    if wall_labels is not None:
+        ade_class_counts = wall_labels.get('ade_class_counts')
     meta = build_floorplan_metadata(
         n_raw=n_raw, pts=pts, floor_z=floor_z, ceiling_z=ceiling_z, h=h,
         n_removed=n_removed, corner_coords_real=corner_coords_real,
         variants=variants, walls_d_meta_clean=walls_d_meta_clean,
-        vision_stats=vision_stats, elapsed=elapsed)
+        vision_stats=vision_stats, elapsed=elapsed,
+        calibration_info=calibration_info,
+        ade_class_counts=ade_class_counts)
     write_floorplan_metadata(meta, output_dir, name)
 
     if verbose:

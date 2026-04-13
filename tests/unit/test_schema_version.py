@@ -12,3 +12,7 @@ def test_schema_version_is_2_0_or_higher():
         "Schema version must be 2.0 or higher — M0a introduced the "
         f"2.0 baseline; got {SCHEMA_VERSION}"
     )
+
+
+def test_schema_version_is_2_0():
+    assert SCHEMA_VERSION == "2.0"
