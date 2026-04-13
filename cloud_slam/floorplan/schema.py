@@ -20,7 +20,10 @@ from collections import Counter
 # Bumped by M0a when the JSON schema grew (per-wall UUIDs, cyclic
 # id links, calibration block, room category). Kept as a module constant
 # so importers can assert compatibility without reading from the file.
-SCHEMA_VERSION = "2.0"
+# Bumped again by M3 when `D_refined.openings` (doors / windows / glass /
+# passages) joined each variant's per-wall list — mirrors Apple RoomPlan's
+# `CapturedOpening` contract.
+SCHEMA_VERSION = "2.1"
 
 
 # M3 opening schema keys (documented here so M3 populates them consistently).
@@ -215,7 +218,8 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               vision_stats, elapsed,
                               calibration_info=None,
                               ade_class_counts=None,
-                              stage8_diagnostics=None) -> dict:
+                              stage8_diagnostics=None,
+                              openings=None) -> dict:
     """Assemble the floorplan metadata dict (pre-serialization).
 
     M0a additions (all strict superset — pre-existing keys unchanged):
@@ -239,6 +243,12 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
         `kkt_cond`. Surfaced at the metadata root under `stage8` for
         downstream inspection. None (default) keeps the pre-M1a JSON
         layout unchanged — the regression path.
+
+    openings: optional list of opening dicts (M3) — doors / windows /
+        glass / passages detected on D_refined walls. Emitted as
+        `variants.D_refined.openings` (array). When None, the key is
+        still emitted as `[]` (total contract: consumers can
+        unconditionally iterate `D_refined.openings`).
     """
     room_category, room_confidence, room_source = _vote_room_category(
         ade_class_counts)
@@ -299,6 +309,13 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
             'n_walls': int(n_walls),
             'walls': wall_entries,
         }
+        # M3: openings are emitted only on D_refined (the only variant
+        # with per-wall type/vision provenance). Empty list when M3
+        # didn't run or nothing was detected — the key is always
+        # present so downstream iteration can be unconditional.
+        if key == 'D_refined':
+            meta['variants'][key]['openings'] = (
+                list(openings) if openings else [])
     return meta
 
 

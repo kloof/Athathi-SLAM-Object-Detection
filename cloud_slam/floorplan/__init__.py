@@ -48,7 +48,8 @@ from .refine import (
     _lookup_vision_labels_for_pts,
     _stage8_polygon_closure,
 )
-from .config import Stage8Config
+from .openings import _detect_openings
+from .config import Stage8Config, OpeningsConfig
 from .schema import (
     SCHEMA_VERSION,
     build_floorplan_metadata,
@@ -774,6 +775,34 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                   f"wall_blob_count={vision_stats['wall_blob_count']}, "
                   f"D_refined n_walls={len(walls_d_clean)}")
 
+    # --- M3: Structured openings (doors / windows / glass / passages) ---
+    # Runs only when vision-labeled points are available — otherwise we
+    # return an empty list so the JSON key stays present but empty.
+    openings = []
+    if wall_labels is not None and 'xyz' in wall_labels:
+        try:
+            openings = _detect_openings(
+                walls=walls_d_clean,
+                walls_meta=walls_d_meta_clean,
+                merged_pts=pts,
+                wall_labels=wall_labels,
+                config=OpeningsConfig(),
+                floor_z=float(floor_z),
+                ceiling_z=float(ceiling_z),
+            )
+        except Exception as e:
+            # Never let a detector failure crash the pipeline.
+            if verbose:
+                print(f"  [openings] detector failed — "
+                      f"{type(e).__name__}: {e}")
+            openings = []
+        if verbose:
+            type_tally = {}
+            for op in openings:
+                type_tally[op['type']] = type_tally.get(op['type'], 0) + 1
+            print(f"  [openings] detected {len(openings)} total; "
+                  f"types={type_tally}")
+
     variants = {
         'A_natural': (walls_a, poly_a, 'Natural angles (no snap)'),
         'B_corners': (walls_b, poly_b, 'Corner detection'),
@@ -792,7 +821,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     _export_corners_png(clean, g8, xe, ye, poly_b, corner_coords_real,
                         output_dir, name)
     _export_refined_png(walls_d_clean, poly_d, walls_d_meta_clean, pts,
-                        output_dir, name, floor_z, ceiling_z)
+                        output_dir, name, floor_z, ceiling_z,
+                        openings=openings)
 
     # ---- Metadata JSON ----
     elapsed = time.time() - t0
@@ -808,7 +838,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         vision_stats=vision_stats, elapsed=elapsed,
         calibration_info=calibration_info,
         ade_class_counts=ade_class_counts,
-        stage8_diagnostics=stage8_diagnostics)
+        stage8_diagnostics=stage8_diagnostics,
+        openings=openings)
     write_floorplan_metadata(meta, output_dir, name)
 
     if verbose:
@@ -834,4 +865,5 @@ __all__ = [
     'build_room_polygon',
     'SCHEMA_VERSION',
     'Stage8Config',
+    'OpeningsConfig',
 ]
