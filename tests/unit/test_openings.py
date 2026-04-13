@@ -554,72 +554,10 @@ def test_mirror_detected_by_vision_override():
         f"{[(o['type'], o.get('source')) for o in openings]}")
 
 
-def test_mirror_detected_by_behind_wall_points():
-    """A passage-shaped empty region with merged_pts BEHIND the wall
-    plane → type='mirror' via lidar-bimodal check (Option A).
-
-    Geometry: same stub-wall passage as the vision-override test, but
-    with NO glass-bucket labels. Instead, we add 200 points at y ≈ +0.7
-    (0.5-1.0 m behind the wall plane in the exterior direction from the
-    trajectory) spread across the passage's along-t range — these are
-    the "ghost reflections" a scanner sees through a mirror. The lidar
-    bimodal check must fire (n_behind ≥ 50) and reclassify the gap as
-    type='mirror', source='lidar-bimodal-mirror'.
-    """
-    walls, meta = _single_wall(length=4.0)
-    left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
-    stub_wall = _sample_rect_on_wall(2.5, 2.6, 0.0, 2.5, density=700)
-    floor_line = _sample_rect_on_wall(2.6, 4.0, 0.0, 0.03, density=500)
-    ceiling_line = _sample_rect_on_wall(2.6, 4.0, 2.47, 2.5, density=500)
-    # Ghost-reflection points behind the wall plane in the exterior
-    # direction. With a y=-5 trajectory below the wall (y=0), the
-    # exterior normal is +y; so +y points are "behind" the wall.
-    rng = np.random.default_rng(9)
-    n_ghost = 200
-    ghost_t = rng.uniform(1.3, 2.4, n_ghost)
-    ghost_y = rng.uniform(0.5, 1.0, n_ghost)   # 0.5-1.0 m behind
-    ghost_z = rng.uniform(0.3, 2.2, n_ghost)
-    ghost = np.column_stack([ghost_t, ghost_y, ghost_z]).astype(np.float32)
-    xyz = np.concatenate(
-        [left_wall, stub_wall, floor_line, ceiling_line, ghost], axis=0)
-    # All wall-plane points → bucket 1 (wall); ghost points → 0 (other).
-    # Importantly, NO bucket-4 glass labels — so the vision override
-    # cannot fire; only Option A should trigger.
-    labels = np.concatenate([
-        np.ones(len(left_wall), dtype=np.uint8),
-        np.ones(len(stub_wall), dtype=np.uint8),
-        np.ones(len(floor_line), dtype=np.uint8),
-        np.ones(len(ceiling_line), dtype=np.uint8),
-        np.zeros(len(ghost), dtype=np.uint8),
-    ])
-    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
-    # Trajectory: a single line of 10 poses at y=-5, so traj_center_xy ≈
-    # (2.0, -5). Wall midpoint is (2.0, 0). to_exterior = (0, +5) → the
-    # edge-perp is oriented so positive perp means +y (exterior).
-    poses = np.column_stack([
-        np.linspace(0.5, 3.5, 10),
-        np.full(10, -5.0),
-        np.full(10, 1.2),
-    ]).astype(np.float64)
-    openings = _detect_openings(
-        walls=walls, walls_meta=meta, merged_pts=xyz,
-        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0,
-        poses=poses)
-    mirrors = [o for o in openings if o['type'] == 'mirror']
-    assert len(mirrors) >= 1, (
-        f"expected ≥1 mirror via lidar-bimodal check, got: "
-        f"{[(o['type'], o.get('source')) for o in openings]}")
-    m = mirrors[0]
-    assert m['source'] == 'lidar-bimodal-mirror', (
-        f"expected source='lidar-bimodal-mirror', got {m['source']}")
-    assert m['is_open'] is False
-    assert m['transparent'] is False
-
-
 def test_real_passage_not_misclassified():
-    """A real open passage (empty region with NO behind-wall points and
-    NO glass-bucket labels) → type='passage', NOT mirror. Regression
-    guard so neither mirror signal fires falsely on standard doorways.
+    """A real open passage (empty region with NO glass-bucket labels)
+    → type='passage', NOT mirror. Regression guard so the vision-
+    override mirror signal doesn't fire falsely on standard doorways.
     """
     walls, meta = _single_wall(length=4.0)
     left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
@@ -630,100 +568,14 @@ def test_real_passage_not_misclassified():
         [left_wall, stub_wall, floor_line, ceiling_line], axis=0)
     labels = np.ones(len(xyz), dtype=np.uint8)  # bucket 1 = wall
     wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
-    # Trajectory present (so Option A *could* fire), but no ghost points
-    # behind the wall → Option A must stay silent.
-    poses = np.column_stack([
-        np.linspace(0.5, 3.5, 10),
-        np.full(10, -5.0),
-        np.full(10, 1.2),
-    ]).astype(np.float64)
     openings = _detect_openings(
         walls=walls, walls_meta=meta, merged_pts=xyz,
-        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0,
-        poses=poses)
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0)
     mirrors = [o for o in openings if o['type'] == 'mirror']
     passages = [o for o in openings if o['type'] == 'passage']
     assert not mirrors, (
         f"real passage wrongly flagged as mirror: "
         f"{[(o['type'], o.get('source')) for o in openings]}")
-    assert passages, (
-        f"expected ≥1 passage, got: "
-        f"{[o['type'] for o in openings]}")
-
-
-def test_real_passage_with_trajectory_both_sides_not_misclassified():
-    """A passage-shaped empty region WITH scanner poses on both sides of
-    the wall MUST remain a passage, even if there are behind-wall points
-    in merged_pts.
-
-    This is the false-positive case from the L-shape canonical scan: the
-    scanner walks through an archway, the next room's walls/floor show
-    up as 'behind the wall plane' points, but it's a real passage, not
-    a mirror.
-
-    Geometry mirrors `test_mirror_detected_by_behind_wall_points` — same
-    stub-wall passage + 200 'behind-wall' points that would normally
-    trip Option A. The difference: trajectory has poses on BOTH sides of
-    the wall plane at the blob's along-wall position (scanner walked
-    through the passage into the next room).
-    """
-    walls, meta = _single_wall(length=4.0)
-    left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
-    stub_wall = _sample_rect_on_wall(2.5, 2.6, 0.0, 2.5, density=700)
-    floor_line = _sample_rect_on_wall(2.6, 4.0, 0.0, 0.03, density=500)
-    ceiling_line = _sample_rect_on_wall(2.6, 4.0, 2.47, 2.5, density=500)
-    # Behind-wall points: next room's walls/floor/ceiling reflected in
-    # the exterior direction (+y relative to interior trajectory). Same
-    # as the behind-wall mirror test — Option A would normally fire on
-    # these (n_behind > 50 within blob along-range).
-    rng = np.random.default_rng(9)
-    n_ghost = 200
-    ghost_t = rng.uniform(1.3, 2.4, n_ghost)
-    ghost_y = rng.uniform(0.5, 1.0, n_ghost)  # 0.5-1.0 m behind
-    ghost_z = rng.uniform(0.3, 2.2, n_ghost)
-    ghost = np.column_stack([ghost_t, ghost_y, ghost_z]).astype(np.float32)
-    xyz = np.concatenate(
-        [left_wall, stub_wall, floor_line, ceiling_line, ghost], axis=0)
-    labels = np.concatenate([
-        np.ones(len(left_wall), dtype=np.uint8),
-        np.ones(len(stub_wall), dtype=np.uint8),
-        np.ones(len(floor_line), dtype=np.uint8),
-        np.ones(len(ceiling_line), dtype=np.uint8),
-        np.zeros(len(ghost), dtype=np.uint8),
-    ])
-    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
-    # Trajectory walks THROUGH the passage: 5 poses at y=-3 (interior),
-    # 5 poses at y=+3 (exterior). Passage along-range is t≈[1.2, 2.5].
-    # traj_center_xy is roughly (2.0, 0) → mean(y) = 0 → wall_mid_xy -
-    # traj_center_xy = (0, 0); dot with (0, 1) = 0 — not strictly
-    # positive, so the sign flip may or may not apply.
-    # To keep exterior = +y unambiguously, spread the exterior poses at
-    # larger +y so traj_center_xy.y < 0 (most of the mass is interior).
-    # We use 7 interior poses at y=-5 plus 5 exterior poses at y=+3,
-    # giving mean_y = (7*(-5) + 5*3) / 12 = -20/12 ≈ -1.67 < 0, so
-    # to_exterior = +y and exterior is the +y side.
-    interior_poses = np.column_stack([
-        np.linspace(0.5, 3.5, 7),
-        np.full(7, -5.0),
-        np.full(7, 1.2),
-    ]).astype(np.float64)
-    exterior_poses = np.column_stack([
-        np.linspace(1.4, 2.4, 5),
-        np.full(5, 3.0),
-        np.full(5, 1.2),
-    ]).astype(np.float64)
-    poses = np.concatenate([interior_poses, exterior_poses], axis=0)
-    openings = _detect_openings(
-        walls=walls, walls_meta=meta, merged_pts=xyz,
-        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0,
-        poses=poses)
-    # The trajectory-both-sides gate must suppress Option A — blob
-    # emits as 'passage', not 'mirror'.
-    mirrors = [o for o in openings if o['type'] == 'mirror']
-    passages = [o for o in openings if o['type'] == 'passage']
-    assert not mirrors, (
-        f"real passage with trajectory on both sides wrongly flagged "
-        f"as mirror: {[(o['type'], o.get('source')) for o in openings]}")
     assert passages, (
         f"expected ≥1 passage, got: "
         f"{[o['type'] for o in openings]}")
