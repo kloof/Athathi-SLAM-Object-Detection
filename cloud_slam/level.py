@@ -109,7 +109,7 @@ def detect_floor_plane(points, distance_thresh=0.03, max_attempts=3):
 
     Returns (normal, inlier_indices) or None if no horizontal plane found.
     """
-    import open3d as o3d  # noqa: F401  (used transitively via _numpy_to_o3d)
+    import open3d as o3d  # used transitively via _numpy_to_o3d and for RANSAC seeding
 
     xyz = points[:, :3]
     extents = xyz.max(axis=0) - xyz.min(axis=0)
@@ -126,6 +126,13 @@ def detect_floor_plane(points, distance_thresh=0.03, max_attempts=3):
             break
 
         try:
+            # M0b: reseed Open3D's RANSAC RNG each call so the pipeline is
+            # byte-for-byte reproducible. Open3D 0.19 lacks a `seed=` kwarg
+            # on segment_plane(). See docs/plans/roomplan-quality.md (M0b).
+            try:
+                o3d.utility.random.seed(42)
+            except AttributeError:
+                pass
             plane_model, inliers = remaining.segment_plane(
                 distance_threshold=distance_thresh,
                 ransac_n=3,

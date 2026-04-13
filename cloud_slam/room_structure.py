@@ -144,6 +144,14 @@ def _ransac_plane(pcd, distance_threshold, ransac_n=3, num_iterations=1000):
         return None
 
     try:
+        # M0b: reseed Open3D's RANSAC RNG each call so the pipeline is
+        # byte-for-byte reproducible. Open3D 0.19 lacks a `seed=` kwarg
+        # on segment_plane(), so the global seed API is the only lever.
+        # See docs/plans/roomplan-quality.md (M0b).
+        try:
+            o3d.utility.random.seed(42)
+        except AttributeError:
+            pass
         model, inliers = pcd.segment_plane(
             distance_threshold=distance_threshold,
             ransac_n=ransac_n,

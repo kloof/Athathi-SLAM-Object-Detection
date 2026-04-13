@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import time
+import random
 import argparse
 import numpy as np
 
@@ -20,6 +21,109 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from cloud_slam.box_render import create_box_points
+
+# M0b: RANSAC seeding for byte-for-byte regression reproducibility.
+# See docs/plans/roomplan-quality.md (M0b) — Open3D >=0.15 exposes
+# o3d.utility.random.seed() which seeds the internal Mersenne twister
+# that segment_plane() samples from. numpy/random are seeded too for
+# any downstream helpers. Without this, rerunning the pipeline on the
+# same scan gives non-deterministic floorplan corners.
+np.random.seed(0)
+random.seed(0)
+try:
+    import open3d as _o3d_for_seed  # local alias to avoid shadowing
+    _o3d_for_seed.utility.random.seed(42)
+except (AttributeError, ImportError):
+    # older Open3D (< 0.15) has no seed API — regression tests will
+    # still produce slightly different corners but all callers assume
+    # Open3D >= 0.17 per requirements-dev.txt.
+    pass
+
+
+def _apply_transform_to_buffers(
+    R,
+    t=None,
+    *,
+    merged=None,
+    wall_labels=None,
+    objects=None,
+    lines=None,
+):
+    """Apply (R, t) to every non-None post-SLAM buffer in lockstep.
+
+    The 16-agent review flagged that adding buffers one at a time with
+    inline transforms creates a silent-drift hazard: if any site
+    forgets one buffer, that buffer drifts relative to merged by a
+    rotation. This helper is the single chokepoint for post-SLAM
+    transforms so new buffers can be added with one signature change.
+
+    Quaternion convention: the codebase uses scipy's (x, y, z, w)
+    ordering — see box_refiner.py:134 ('format': 'xyzw'). We compose
+    R_new = R @ R_obj and re-emit via scipy.spatial.transform.Rotation.
+
+    Args:
+        R: 3x3 rotation matrix (numpy array).
+        t: optional 3-vector translation; if None, rotate-only.
+        merged: optional Open3D PointCloud (rotated in place, translated if t given).
+        wall_labels: optional dict with 'xyz' key holding an (N, 3) ndarray.
+                     Operates on wall_labels['xyz'] in place. The numeric
+                     dtype is preserved by casting the intermediate to
+                     float64 and back to the original dtype (current
+                     pipeline uses float32 for wall_labels['xyz']).
+        objects: optional iterable of dicts with 'center' (3-vec list/array)
+                 and optional 'orientation.quaternion' (xyzw 4-vec). Updated
+                 in place. Translation does not affect orientation.
+        lines: optional dict with 'start' and 'end' keys holding (N, 3)
+               ndarrays. Lines are expected to ALREADY be in the current
+               world frame — this helper applies post-SLAM global rotations
+               only; it must NOT be used to promote lines from sensor to
+               world frame. (Lines buffer is pre-wired for M2 and will be
+               None until that milestone lands.)
+    """
+    # Local import to keep module import cost minimal if the helper
+    # isn't called (it will always be, but preserves the original
+    # pattern where scipy/open3d are imported lazily in main()).
+    from scipy.spatial.transform import Rotation as _SciRot
+
+    if merged is not None:
+        merged.rotate(R, center=(0, 0, 0))
+        if t is not None:
+            merged.translate(t)
+
+    if wall_labels is not None:
+        xyz = wall_labels.get('xyz')
+        if xyz is not None and len(xyz) > 0:
+            orig_dtype = xyz.dtype
+            rotated = xyz.astype(np.float64) @ R.T
+            if t is not None:
+                rotated = rotated + np.asarray(t, dtype=np.float64)
+            wall_labels['xyz'] = rotated.astype(orig_dtype)
+
+    if objects is not None:
+        t_arr = None if t is None else np.asarray(t, dtype=np.float64)
+        for obj in objects:
+            c = np.array(obj['center'], dtype=np.float64)
+            c_new = R @ c
+            if t_arr is not None:
+                c_new = c_new + t_arr
+            obj['center'] = c_new.tolist()
+            if 'orientation' in obj and 'quaternion' in obj['orientation']:
+                q = np.array(obj['orientation']['quaternion'], dtype=np.float64)
+                R_obj = _SciRot.from_quat(q).as_matrix()
+                R_new = R @ R_obj
+                obj['orientation']['quaternion'] = (
+                    _SciRot.from_matrix(R_new).as_quat().tolist())
+
+    if lines is not None:
+        for key in ('start', 'end'):
+            arr = lines.get(key)
+            if arr is None or len(arr) == 0:
+                continue
+            orig_dtype = arr.dtype
+            rotated = np.asarray(arr, dtype=np.float64) @ R.T
+            if t is not None:
+                rotated = rotated + np.asarray(t, dtype=np.float64)
+            lines[key] = rotated.astype(orig_dtype)
 
 
 def main():
@@ -115,24 +219,13 @@ def main():
             R_level = SciRot.align_vectors([z_up], [gravity_up])[0].as_matrix()
             print(f"[INFO] Leveling scan (gravity was {gravity_up})")
 
-            # Rotate the point cloud
-            merged.rotate(R_level, center=(0, 0, 0))
-
-            # Rotate vision-labeled points in lockstep
-            if wall_labels is not None and len(wall_labels['xyz']) > 0:
-                wall_labels['xyz'] = (
-                    wall_labels['xyz'].astype(np.float64) @ R_level.T
-                ).astype(np.float32)
-
-            # Rotate all object centers and orientations
-            for obj in objects:
-                c = np.array(obj['center'])
-                obj['center'] = (R_level @ c).tolist()
-                if 'orientation' in obj:
-                    q = np.array(obj['orientation']['quaternion'])
-                    R_obj = SciRot.from_quat(q).as_matrix()
-                    R_new = R_level @ R_obj
-                    obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+            # Lockstep transform: merged + wall_labels + objects.
+            _apply_transform_to_buffers(
+                R_level,
+                merged=merged,
+                wall_labels=wall_labels,
+                objects=objects,
+            )
 
     # Align room to axes: detect wall direction on the LEVELED cloud
     from cloud_slam.room_structure import detect_room
@@ -150,22 +243,19 @@ def main():
             if abs(residual) > 0.01:
                 R_align = SciRot.from_euler('z', -residual).as_matrix()
                 print(f"[INFO] Aligning room to axes (rotating {np.degrees(-residual):.1f}° around Z)")
-                merged.rotate(R_align, center=(0, 0, 0))
-                # Rotate vision-labeled points in lockstep
-                if wall_labels is not None and len(wall_labels['xyz']) > 0:
-                    wall_labels['xyz'] = (
-                        wall_labels['xyz'].astype(np.float64) @ R_align.T
-                    ).astype(np.float32)
-                for obj in objects:
-                    c = np.array(obj['center'])
-                    obj['center'] = (R_align @ c).tolist()
-                    if 'orientation' in obj:
-                        q = np.array(obj['orientation']['quaternion'])
-                        R_obj = SciRot.from_quat(q).as_matrix()
-                        R_new = R_align @ R_obj
-                        obj['orientation']['quaternion'] = SciRot.from_matrix(R_new).as_quat().tolist()
+                # Lockstep transform: merged + wall_labels + objects.
+                _apply_transform_to_buffers(
+                    R_align,
+                    merged=merged,
+                    wall_labels=wall_labels,
+                    objects=objects,
+                )
 
             # Re-snap object quaternions to the leveled+aligned Manhattan directions.
+            # NOTE: yaw-snap is a *quaternion-only* operation that rebuilds each
+            # object's orientation from scratch (not a rotation applied to an
+            # existing one), so it intentionally stays OUTSIDE
+            # _apply_transform_to_buffers() — it is not a lockstep transform.
             # The OBBs were fit in the raw world frame, so after R_level their yaw
             # doesn't match the leveled Manhattan. Fix by snapping each object's yaw
             # to the nearest 90° (which are now the aligned wall directions).
@@ -221,24 +311,18 @@ def main():
         # Propagate the same transform to `merged` and to objects so that
         # the subsequently-saved objects.json and map_with_boxes.ply align
         # with the leveled cloud.
+        # NOTE: `merged.points` is directly assigned from leveled_pcd (which
+        # is in the new frame already), so we pass merged=None to the helper
+        # here — rotating it again would double-apply. wall_labels / objects
+        # still need R_level + shift_vec.
         merged.points = leveled_pcd.points
         shift_vec = np.array([0.0, 0.0, -z_shift])
-        # Propagate to vision-labeled points as well so the floorplan
-        # receives labels in the same coordinate frame as the merged cloud.
-        if wall_labels is not None and len(wall_labels['xyz']) > 0:
-            wall_labels['xyz'] = (
-                (wall_labels['xyz'].astype(np.float64) @ R_level.T)
-                + shift_vec
-            ).astype(np.float32)
-        for obj in objects:
-            c = np.array(obj['center'])
-            obj['center'] = (R_level @ c + shift_vec).tolist()
-            if 'orientation' in obj:
-                q = np.array(obj['orientation']['quaternion'])
-                R_obj = SciRot.from_quat(q).as_matrix()
-                R_new = R_level @ R_obj
-                obj['orientation']['quaternion'] = (
-                    SciRot.from_matrix(R_new).as_quat().tolist())
+        _apply_transform_to_buffers(
+            R_level,
+            shift_vec,
+            wall_labels=wall_labels,
+            objects=objects,
+        )
     except Exception as e:
         print(f"[WARNING] level.py post-process failed: {e}")
 
