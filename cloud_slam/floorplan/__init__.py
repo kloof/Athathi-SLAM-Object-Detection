@@ -46,7 +46,9 @@ from .refine import (
     _classify_wall_from_endpoints,
     _compute_vision_wall_stats,
     _lookup_vision_labels_for_pts,
+    _stage8_polygon_closure,
 )
+from .config import Stage8Config
 from .schema import (
     SCHEMA_VERSION,
     build_floorplan_metadata,
@@ -498,6 +500,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                        close_kernel=11, angle_flex=3.0,
                        wall_labels=None,
                        calibration_info=None,
+                       run_stage8=True,
+                       emit_stage8_diagnostics=False,
                        verbose=True):
     """Extract a 2D floor plan from an in-memory point cloud.
 
@@ -679,6 +683,56 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     if verbose:
         print(f"  {poly_d.area:.1f} m2, {len(walls_d_clean)} walls")
 
+    # --- Stage 8: polygon-closure solver (M1a) ---
+    # Redistributes the residual closure gap Δ = Σ (p2 − p1) across
+    # corners via confidence-weighted constrained least squares. Closed-
+    # form KKT first, SLSQP + demotion cascade on degenerate snap
+    # configurations. Strict no-op on already-closed polygons (|Δ| <
+    # no_op_threshold_mm) so the default path remains byte-identical to
+    # the pre-M1a baseline. Disable via --no-stage8 → run_stage8=False.
+    #
+    # Diagnostics emission policy:
+    #   - When `emit_stage8_diagnostics` is False (default), the JSON
+    #     keeps its pre-M1a layout on no-op runs (no `stage8` key),
+    #     but surfaces a `stage8` block when the solver actually moved
+    #     walls so the user can see what was redistributed.
+    #   - When True, always emit (even on no-op) — useful for A/B
+    #     benchmarks and integration tests.
+    #   - `--no-stage8` (`run_stage8=False`) skips the solver entirely,
+    #     guaranteeing zero schema drift.
+    stage8_diagnostics = None
+    if run_stage8 and len(walls_d_clean) >= 3:
+        # Always compute diagnostics internally — they're <100 floats and
+        # the orchestrator decides whether to surface them. This also keeps
+        # the no-op / non-no-op dispatch below a pure metadata decision.
+        walls_d_clean, raw_diag = _stage8_polygon_closure(
+            walls_d_clean, walls_d_meta_clean,
+            config=Stage8Config(),
+            emit_diagnostics=True,
+            verbose=verbose,
+        )
+        # Rebuild the polygon from the closed walls so the variants dict
+        # and the refined-PNG renderer see the updated geometry.
+        try:
+            corners_closed = np.array([w[0] for w in walls_d_clean])
+            poly_d = build_room_polygon(corners_closed)
+        except Exception:
+            # Any polygon-construction failure → keep the Stage-7 polygon.
+            # Stage 8's walls still describe a closed ring of corners;
+            # this just means the Shapely polygon couldn't be re-built.
+            pass
+        if verbose and raw_diag is not None:
+            print(f"  [Stage 8] solver={raw_diag.get('solver_used')}, "
+                  f"|Δ|={raw_diag.get('closure_gap_mm', 0.0)} mm, "
+                  f"demotions={len(raw_diag.get('demotions_cascade', []))}")
+        # Decide whether to surface diagnostics in the JSON.
+        # Explicit opt-in → always emit. Default → emit only when Stage 8
+        # did non-trivial work (solver_used != 'noop').
+        if raw_diag is not None and (
+                emit_stage8_diagnostics
+                or raw_diag.get('solver_used') != 'noop'):
+            stage8_diagnostics = raw_diag
+
     # --- Tier 1: per-wall vision type label on D_refined walls ---
     # Runs only when pts_labels was computed above (i.e. vision gave useful
     # signal). Attaches 'type' (the wall's dominant vision bucket) and
@@ -743,7 +797,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         variants=variants, walls_d_meta_clean=walls_d_meta_clean,
         vision_stats=vision_stats, elapsed=elapsed,
         calibration_info=calibration_info,
-        ade_class_counts=ade_class_counts)
+        ade_class_counts=ade_class_counts,
+        stage8_diagnostics=stage8_diagnostics)
     write_floorplan_metadata(meta, output_dir, name)
 
     if verbose:
@@ -768,4 +823,5 @@ __all__ = [
     'snap_polygon_to_angles',
     'build_room_polygon',
     'SCHEMA_VERSION',
+    'Stage8Config',
 ]

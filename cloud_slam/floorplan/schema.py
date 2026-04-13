@@ -214,7 +214,8 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               corner_coords_real, variants, walls_d_meta_clean,
                               vision_stats, elapsed,
                               calibration_info=None,
-                              ade_class_counts=None) -> dict:
+                              ade_class_counts=None,
+                              stage8_diagnostics=None) -> dict:
     """Assemble the floorplan metadata dict (pre-serialization).
 
     M0a additions (all strict superset — pre-existing keys unchanged):
@@ -230,6 +231,14 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
         When None/empty (segmenter disabled), emits
         `{"category": "unknown", "category_confidence": 0.0,
           "category_source": "unavailable"}`.
+
+    stage8_diagnostics: optional dict produced by
+        `cloud_slam.floorplan.refine._stage8_polygon_closure` when
+        emit_diagnostics=True. Keys: `solver_used`, `closure_gap_mm`,
+        `per_corner_shift_mm`, `per_corner_weight`, `demotions_cascade`,
+        `kkt_cond`. Surfaced at the metadata root under `stage8` for
+        downstream inspection. None (default) keeps the pre-M1a JSON
+        layout unchanged — the regression path.
     """
     room_category, room_confidence, room_source = _vote_room_category(
         ade_class_counts)
@@ -271,6 +280,12 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
             vision_stats['wall_point_count'])
         meta['vision_wall_blob_count'] = int(
             vision_stats['wall_blob_count'])
+    # Stage 8 (M1a) diagnostics — only when emit_diagnostics was set AND
+    # Stage 8 actually computed a diagnostics dict. Missing / None keeps
+    # the JSON layout identical to the pre-M1a baseline (the regression
+    # path — used when --no-stage8 disables the solver).
+    if stage8_diagnostics is not None:
+        meta['stage8'] = dict(stage8_diagnostics)
     for key, (walls, poly, label) in variants.items():
         n_walls = len(walls)
         wall_entries = []

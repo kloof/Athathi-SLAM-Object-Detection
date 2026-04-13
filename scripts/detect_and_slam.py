@@ -104,6 +104,14 @@ def main():
                              "a `type` field in the metadata and a colored "
                              "edge in floorplan_refined.png. Opt-in — off "
                              "by default, zero regression otherwise.")
+    parser.add_argument("--no-stage8", action="store_true",
+                        help="Disable the Stage 8 polygon-closure solver "
+                             "(M1a). Without this flag, Stage 8 runs by "
+                             "default and no-ops when |Δ| < 10 mm, so the "
+                             "default path is byte-identical on already-"
+                             "closed polygons. Use this flag for A/B "
+                             "regression comparison against the pre-M1a "
+                             "baseline.")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -450,6 +458,7 @@ def main():
             gravity_up=np.array([0.0, 0.0, 1.0]),
             wall_labels=fp_wall_labels,
             calibration_info=calibration_info_fp,
+            run_stage8=not args.no_stage8,
             verbose=False,
         )
         v = fp_meta['variants']
