@@ -164,3 +164,34 @@ def test_multi_level_ceiling_reported_as_set():
     # ceiling_height is the MAX — keeps wall-band/opening detection
     # unclipped (walls extend up to the highest ceiling point).
     assert abs(room.ceiling_height - 3.3) < 0.15
+
+
+def test_multi_fragment_ceiling_merged_into_one():
+    """A single physical ceiling split into 3 RANSAC-noise fragments at
+    z=3.00, 3.03, 3.06 (within 5cm) must merge into one ceiling_plane.
+    This was Issue 1 from the M5a review — real scans had plaster warp
+    + sensor noise + sequential RANSAC slicing one physical ceiling
+    into multiple thin sheets."""
+    # Build a floor at 0 + 3 ceiling fragments at the same XY footprint
+    floor_pts = _synth_horizontal_plane(
+        0.0, x_range=(-3, 3), y_range=(-3, 3), step=0.04)
+    # Three ceiling fragments at very close heights, same XY footprint.
+    # Use slightly different XY offsets so RANSAC actually separates
+    # them rather than fitting one plane to all three.
+    ceil1 = _synth_horizontal_plane_with_normal_down(
+        3.00, x_range=(-2, 2), y_range=(-2, 2), step=0.04)
+    ceil2 = _synth_horizontal_plane_with_normal_down(
+        3.03, x_range=(-2, 2), y_range=(-2, 2), step=0.04)
+    ceil3 = _synth_horizontal_plane_with_normal_down(
+        3.06, x_range=(-2, 2), y_range=(-2, 2), step=0.04)
+
+    pcd = _make_pcd([floor_pts, ceil1, ceil2, ceil3])
+    room = detect_room(pcd, gravity_up=np.array([0, 0, 1]),
+                       voxel_size=0.05)
+
+    # After clustering, should be exactly 1 ceiling plane (not 3).
+    heights = [float(p.centroid @ np.array([0, 0, 1]))
+               for p in room.ceiling_planes]
+    assert len(room.ceiling_planes) == 1, (
+        f"Expected 1 merged plane, got {len(room.ceiling_planes)} "
+        f"at heights {heights}")

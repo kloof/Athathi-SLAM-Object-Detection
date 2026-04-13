@@ -166,6 +166,62 @@ def test_build_floorplan_metadata_stores_roles_verbatim():
     assert roles[3.3] == 'raised'
 
 
+def test_furniture_excluded_from_secondary_features():
+    """A horizontal plane at floor+0.8m (e.g., a desk top) must NOT
+    appear in secondary_ceiling_features. Only planes ABOVE floor+1.0m
+    that are also BELOW the main ceiling qualify as architectural
+    soffits. This was Issue 2 from the M5a review: real scans showed
+    the 0.5-1.0m band catching desk tops and mattress surfaces."""
+    from cloud_slam.floorplan import _build_secondary_features
+    from cloud_slam.room_structure import Plane, RoomStructure
+
+    # Furniture-height plane (should be rejected).
+    desk = Plane(
+        normal=np.array([0., 0., 1.]),
+        offset=-0.8,
+        centroid=np.array([0., 0., 0.8]),
+        num_inliers=500,
+    )
+    # Real soffit, between floor+1m and main-0.1m (should be kept).
+    soffit = Plane(
+        normal=np.array([0., 0., 1.]),
+        offset=-2.5,
+        centroid=np.array([0., 0., 2.5]),
+        num_inliers=1200,
+    )
+    floor = Plane(
+        normal=np.array([0., 0., 1.]),
+        offset=0.0,
+        centroid=np.array([0., 0., 0.0]),
+        num_inliers=5000,
+    )
+    room = RoomStructure(
+        floor=floor,
+        ceiling=None,
+        floor_height=0.0,
+        ceiling_height=3.0,
+        gravity_up=np.array([0., 0., 1.]),
+        below_ceiling_features=[desk, soffit],
+    )
+
+    features = _build_secondary_features(
+        room=room,
+        pts=np.zeros((10, 3)),   # unused by soffit filter
+        gravity_up=np.array([0., 0., 1.]),
+        swapped=False,
+        main_ceiling_height=3.0,
+    )
+
+    heights = [f.get('height_m', 0) for f in features]
+    # Desk at 0.8m is below 1.0m, must be filtered out.
+    assert not any(abs(h - 0.8) < 0.1 for h in heights), (
+        f"Desk at 0.8m wrongly kept in secondary_features: {heights}")
+    # Soffit at 2.5m is between 1.0m and main-0.1m=2.9m, must be kept.
+    assert any(abs(h - 2.5) < 0.1 for h in heights), (
+        f"Soffit at 2.5m wrongly filtered from secondary_features: "
+        f"{heights}")
+
+
 def test_default_ceiling_planes_is_empty_list():
     """When the caller doesn't supply ceiling_planes, the key is still
     emitted as an empty list so consumers can unconditionally iterate."""

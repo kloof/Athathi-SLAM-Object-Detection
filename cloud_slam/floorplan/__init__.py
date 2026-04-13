@@ -245,7 +245,13 @@ def _build_secondary_features(room, pts, gravity_up, swapped=False,
     a raised ceiling (tray / cathedral peak) and lives in
     `ceiling_planes` with role="raised"; a plane at the same level as
     main is still main. Only planes below `main_ceiling_height - 0.1m`
-    (10 cm tolerance) and above `floor + 0.5m` are real soffits.
+    (10 cm tolerance) and above `floor + 1.0m` are real soffits.
+
+    M5a fixup: lower bound tightened from `floor + 0.5m` to
+    `floor + 1.0m`. Real architectural soffits / coffers / HVAC
+    bulkheads sit in the 2-3 m range; the 0.5-1.0 m band was
+    catching desk tops and mattress surfaces (furniture, not
+    architecture).
 
     Each Plane becomes `{height_m, n_inliers, type_hint}`. `height_m`
     is the plane centroid projected onto gravity (Z along gravity_up);
@@ -278,8 +284,10 @@ def _build_secondary_features(room, pts, gravity_up, swapped=False,
         # `ceiling_planes`, not here.
         if main_ceiling_height is not None and z >= main_ceiling_height - 0.1:
             continue
-        # Floor guard: soffits sit above floor+0.5m.
-        if floor_h is not None and z <= floor_h + 0.5:
+        # Floor guard: soffits sit above floor+1.0m. The 0.5-1.0m band
+        # is furniture territory (desk tops, mattresses) and must not
+        # be mislabeled as architectural soffits.
+        if floor_h is not None and z <= floor_h + 1.0:
             continue
         if swapped:
             z_emit = -z
@@ -337,6 +345,15 @@ def _build_ceiling_planes(room, pts, gravity_up, swapped=False):
     # Pick "main" by largest XY footprint. Ties broken by inlier count.
     # Guard against all-zero area (degenerate synth inputs): if every
     # area_m2 is zero, fall back to inlier count as the main pick.
+    #
+    # NOTE: this "main" selection (largest XY footprint) is the
+    # AUTHORITATIVE definition for JSON output. room_structure.py has
+    # an inlier-count-based main-proxy used only for filtering
+    # below_ceiling_features upstream; this area-based definition here
+    # overrides it by recomputing the soffit filter in
+    # _build_secondary_features. Two-layer filter is intentional — the
+    # upstream proxy is a coarse guard when no hulls are yet available;
+    # the final authoritative filter runs here with real footprints.
     areas = [e['area_m2'] for e in entries]
     if all(a <= 0.0 for a in areas):
         main_idx = int(max(range(len(entries)),
@@ -501,7 +518,7 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
         # already filtered to >floor+1m by detect_room.
         # M5a: no ceiling planes were detected (room.ceiling is None),
         # so ceiling_planes is empty on Tier 2. Below-ceiling features
-        # still surface as soffits using floor+0.5m as the bound.
+        # still surface as soffits using floor+1.0m as the bound.
         secondary = _build_secondary_features(
             room, pts, gravity_up, swapped=False)
         above = z_along[z_along > floor_z + 1.0]

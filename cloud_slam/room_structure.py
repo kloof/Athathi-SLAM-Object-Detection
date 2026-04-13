@@ -47,14 +47,74 @@ class RoomStructure:
     # callers that still expect one ceiling); `ceiling_height` is the
     # max Z along gravity across the set (unchanged numerically).
     ceiling_planes: List[Plane] = field(default_factory=list)
-    # M5a: horizontal planes between `floor_height + 0.5m` and
+    # M5a: horizontal planes between `floor_height + 1.0m` and
     # `main_ceiling_height - 0.1m` — architectural soffits / coffers /
-    # HVAC bulkheads / countertops strictly BELOW the main ceiling.
-    # A multi-level ceiling plane (higher than main) does NOT land here;
-    # it goes to `ceiling_planes` with role="raised". A stepped-down
-    # ceiling plane (between floor+1m and main-0.1m) does NOT land here
-    # either; it goes to `ceiling_planes` with role="lower_step".
+    # HVAC bulkheads strictly BELOW the main ceiling. A multi-level
+    # ceiling plane (higher than main) does NOT land here; it goes to
+    # `ceiling_planes` with role="raised". A stepped-down ceiling plane
+    # (between floor+1m and main-0.1m) does NOT land here either; it
+    # goes to `ceiling_planes` with role="lower_step".
+    #
+    # M5a fixup: lower bound tightened from floor+0.5m to floor+1.0m.
+    # The 0.5-1.0 m band was catching desk tops / mattresses /
+    # countertops (furniture surfaces), which are not soffits.
     below_ceiling_features: List[Plane] = field(default_factory=list)
+
+
+# M5a fixup: RANSAC fragmentation tolerance. Sequential RANSAC slices a
+# single warped ceiling (±3-5 cm plaster thickness + sensor noise) into
+# multiple thin sheets because removing the first plane's inliers
+# (within `distance_threshold=voxel_size=0.03m`) still leaves points
+# just outside the 3 cm band that fit a second, third, etc. plane.
+# 5 cm is wide enough to catch real plaster warp but too narrow to
+# absorb legitimate tray / stepped-ceiling offsets (those are typically
+# >=15 cm).
+CEILING_MERGE_TOL_M = 0.05
+
+
+def _cluster_planes_by_height(planes, gravity_up, tol_m):
+    """Group planes by height along gravity_up, merging within tol_m.
+
+    Sequential RANSAC can split a single physical plane into several
+    fragments at slightly different heights. This helper walks the sorted
+    list of planes by height and greedily merges any plane whose height
+    is within `tol_m` of the first plane in the current cluster.
+
+    The representative of each merged cluster is the plane with the
+    LARGEST inlier count (the fragment with the best geometric support),
+    but its `num_inliers` is replaced with the sum across the cluster so
+    downstream "main" picks and area-weighting reflect the full physical
+    plane.
+    """
+    if not planes:
+        return []
+    heights = [(p.centroid @ gravity_up, p) for p in planes]
+    heights.sort(key=lambda x: x[0])
+    clusters = [[heights[0]]]
+    for h, p in heights[1:]:
+        # Within tol of the FIRST member of the current cluster so a
+        # chain of near-neighbors doesn't drift off indefinitely.
+        if h - clusters[-1][0][0] <= tol_m:
+            clusters[-1].append((h, p))
+        else:
+            clusters.append([(h, p)])
+    merged = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            merged.append(cluster[0][1])
+            continue
+        # Merge: keep the largest-support fragment's normal/offset/centroid
+        # (best geometric evidence for the plane's true location) but sum
+        # inliers across the cluster.
+        rep = max(cluster, key=lambda x: x[1].num_inliers)[1]
+        total_inliers = sum(p.num_inliers for _, p in cluster)
+        merged.append(Plane(
+            normal=rep.normal,
+            offset=rep.offset,
+            centroid=rep.centroid,
+            num_inliers=total_inliers,
+        ))
+    return merged
 
 
 def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
@@ -149,6 +209,15 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
                 p for p in floor_candidates[1:]
                 if (p.centroid @ gravity_up) > floor_h + 1.0
             ]
+
+            # --- M5a fixup: merge ceiling-plane fragments within 5cm ---
+            # Sequential RANSAC can split a single physical ceiling into
+            # multiple thin sheets (3-5 cm offsets from plaster warp +
+            # sensor noise). Cluster planes whose height along gravity
+            # differs by < 0.05 m into one representative plane so one
+            # physical ceiling produces exactly one entry downstream.
+            ceiling_planes = _cluster_planes_by_height(
+                ceiling_planes, gravity_up, CEILING_MERGE_TOL_M)
             result.ceiling_planes = list(ceiling_planes)
 
             # Back-compat: `ceiling` is the single highest plane in the
@@ -168,9 +237,14 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
 
             # M5a: `below_ceiling_features` — horizontal planes strictly
             # BELOW the main (largest-footprint) ceiling by at least
-            # 10 cm, still above floor + 0.5 m. These are the actual
+            # 10 cm, still above floor + 1.0 m. These are the actual
             # architectural soffits / coffers / HVAC bulkheads — not
             # multi-level ceiling planes.
+            #
+            # M5a fixup: lower bound raised from floor+0.5m to
+            # floor+1.0m. Real architectural soffits sit in the 2-3 m
+            # range; the 0.5-1.0 m band was catching desk tops and
+            # mattresses.
             #
             # We need the main-ceiling height here. The floorplan layer
             # re-computes "main" by XY footprint (the authoritative
@@ -187,21 +261,28 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
                 main_proxy = max(
                     ceiling_planes, key=lambda p: p.num_inliers)
                 main_h_proxy = float(main_proxy.centroid @ gravity_up)
-                result.below_ceiling_features = [
+                below_features = [
                     p for p in floor_candidates[1:]
                     if (
-                        (p.centroid @ gravity_up) > floor_h + 0.5
+                        (p.centroid @ gravity_up) > floor_h + 1.0
                         and (p.centroid @ gravity_up) < main_h_proxy - 0.1
                     )
                 ]
             else:
                 # No ceiling picked — nothing to compare against; every
-                # intermediate horizontal plane above floor+0.5m is a
+                # intermediate horizontal plane above floor+1.0m is a
                 # below-ceiling feature in its own right.
-                result.below_ceiling_features = [
+                below_features = [
                     p for p in floor_candidates[1:]
-                    if (p.centroid @ gravity_up) > floor_h + 0.5
+                    if (p.centroid @ gravity_up) > floor_h + 1.0
                 ]
+
+            # Apply the same RANSAC-fragmentation merge as ceiling_planes:
+            # soffits are also horizontal planes and can be sliced into
+            # thin sheets by sequential RANSAC. Cluster within 5 cm so a
+            # single soffit produces exactly one entry.
+            result.below_ceiling_features = _cluster_planes_by_height(
+                below_features, gravity_up, CEILING_MERGE_TOL_M)
 
             # M5a back-compat: `intermediate_horiz` is an alias for
             # `below_ceiling_features`. Legacy callers that read it get
