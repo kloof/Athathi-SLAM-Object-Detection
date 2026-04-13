@@ -57,6 +57,27 @@ from .schema import (
 )
 
 
+# Buffer (metres) added to the convex hull of the SLAM trajectory XY when
+# deciding which walls belong to the current room (trajectory-containment
+# filter — see generate_floorplan, near the "M4b" section).
+#
+# A 1.0 m buffer was too narrow for L-shaped rooms where the scanner only
+# walked one leg: real walls on the un-visited leg sit 1.0-2.5 m beyond
+# the trajectory hull and were dropped as phantoms. Empirically, real
+# walls sit 1-2.5 m beyond the trajectory hull in practice; legitimate
+# next-room phantoms (seen through open doorways) typically sit 3 m+
+# away. A 2.5 m buffer strikes the balance. See tests/unit/
+# test_trajectory_filter.py for the edge cases this value must satisfy.
+TRAJECTORY_HULL_BUFFER_M = 2.5
+
+# Tolerance (metres) for the M4b connectivity rescue: an initially
+# excluded wall is rescued if BOTH its endpoints fall within this
+# distance of a kept wall's endpoint (i.e. it closes the polygon by
+# bridging two kept walls). 0.2 m is tight enough to avoid pulling in
+# chains of phantom walls but wide enough to tolerate corner-snap jitter.
+TRAJECTORY_RESCUE_ENDPOINT_EPS_M = 0.2
+
+
 # ============================================================
 # FLOOR / CEILING DETECTION (the robust replacement)
 # ============================================================
@@ -868,15 +889,21 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
             stage8_diagnostics = raw_diag
 
     # --- M4b: trajectory-containment polygon filter ---
-    # Build a convex hull of the SLAM trajectory XY + a 1 m buffer. Any
-    # wall whose midpoint falls OUTSIDE that buffered hull is almost
-    # certainly a phantom from an adjacent room seen through an open
-    # doorway — the scanner never physically occupied that region, so
-    # those walls cannot belong to the current room. The 1 m buffer is
-    # deliberately generous: trajectories rarely hug the room perimeter,
-    # so walls ~0.5-1.0 m outside the hull are still legitimate.
-    # Hard-coded (not exposed via config) because the rationale is
-    # geometric (trajectory extent + scanner reach), not per-scan.
+    # Build a convex hull of the SLAM trajectory XY + a buffer
+    # (TRAJECTORY_HULL_BUFFER_M = 2.5 m). Any wall whose midpoint falls
+    # OUTSIDE that buffered hull is almost certainly a phantom from an
+    # adjacent room seen through an open doorway — the scanner never
+    # physically occupied that region, so those walls cannot belong to
+    # the current room.
+    #
+    # Then a connectivity rescue pass: initially-excluded walls whose
+    # BOTH endpoints fall within TRAJECTORY_RESCUE_ENDPOINT_EPS_M of
+    # kept-wall endpoints are re-admitted (they close the polygon by
+    # connecting to kept walls on both sides). Iterated once — not to
+    # fixed point — to avoid pulling in chains of phantom walls.
+    #
+    # Hard-coded constants (not exposed via config) because the rationale
+    # is geometric (trajectory extent + scanner reach), not per-scan.
     excluded_walls_meta: list = []
     # Skip entirely when `poses` wasn't supplied — back-compat with
     # callers that don't have SLAM trajectory data (e.g. stand-alone
@@ -898,7 +925,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                 try:
                     hull = _ConvexHull(pose_xy)
                     hull_pts = pose_xy[hull.vertices]
-                    hull_polygon = _ShPoly(hull_pts).buffer(1.0)
+                    hull_polygon = _ShPoly(hull_pts).buffer(
+                        TRAJECTORY_HULL_BUFFER_M)
                 except Exception:
                     hull_polygon = None
             else:
@@ -931,6 +959,47 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                         walls_out_meta.append(
                             walls_d_meta_clean[wi] if wi < len(walls_d_meta_clean)
                             else {})
+
+                # Connectivity rescue (single pass, NOT iterated to fixed
+                # point): an initially-excluded wall is rescued if BOTH
+                # its endpoints fall within TRAJECTORY_RESCUE_ENDPOINT_EPS_M
+                # of a kept-wall endpoint. This catches the case where a
+                # real wall sits just beyond the buffered hull but closes
+                # the polygon by bridging two already-kept walls on both
+                # sides (e.g. the north wall of an L-shape when only the
+                # south leg was traversed). We do not re-seed
+                # `kept_endpoints` during the loop, so a chain of phantom
+                # next-room walls won't cascade in.
+                rescued_count = 0
+                if walls_out and walls_in_room:
+                    kept_endpoints = []
+                    for _w in walls_in_room:
+                        kept_endpoints.append(np.asarray(_w[0], dtype=float))
+                        kept_endpoints.append(np.asarray(_w[1], dtype=float))
+                    eps = TRAJECTORY_RESCUE_ENDPOINT_EPS_M
+                    still_out = []
+                    still_out_meta = []
+                    for w_out, m_out in zip(walls_out, walls_out_meta):
+                        p1 = np.asarray(w_out[0], dtype=float)
+                        p2 = np.asarray(w_out[1], dtype=float)
+                        p1_connects = any(
+                            float(np.linalg.norm(p1 - kp)) < eps
+                            for kp in kept_endpoints)
+                        p2_connects = any(
+                            float(np.linalg.norm(p2 - kp)) < eps
+                            for kp in kept_endpoints)
+                        if p1_connects and p2_connects:
+                            walls_in_room.append(w_out)
+                            walls_in_meta.append(m_out if m_out else {
+                                'snapped_to': 'free',
+                                'residual_m': 0.0, 'confidence': 0.0})
+                            rescued_count += 1
+                        else:
+                            still_out.append(w_out)
+                            still_out_meta.append(m_out)
+                    walls_out = still_out
+                    walls_out_meta = still_out_meta
+
                 if walls_out and len(walls_in_room) >= 3:
                     # Only apply when at least 3 walls remain — refuse to
                     # strip the whole room if the trajectory was unusually
@@ -957,7 +1026,26 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                     if verbose:
                         print(f"  [trajectory-filter] excluded "
                               f"{len(walls_out)} wall(s) outside "
-                              f"1 m-buffered trajectory hull")
+                              f"{TRAJECTORY_HULL_BUFFER_M:.1f} m-buffered "
+                              f"trajectory hull"
+                              + (f" (rescued {rescued_count} by "
+                                 f"connectivity)" if rescued_count else ""))
+                elif rescued_count > 0 and not walls_out:
+                    # All initially-excluded walls were rescued by
+                    # connectivity — adopt the rescued set, which is now
+                    # walls_in_room.
+                    walls_d_clean = walls_in_room
+                    walls_d_meta_clean = walls_in_meta
+                    try:
+                        corners_in = np.array([w[0] for w in walls_d_clean])
+                        poly_d = build_room_polygon(corners_in)
+                    except Exception:
+                        pass
+                    if verbose:
+                        print(f"  [trajectory-filter] rescued "
+                              f"{rescued_count} wall(s) by connectivity "
+                              f"(all initially-excluded walls closed the "
+                              f"polygon via kept-wall endpoints)")
                 elif walls_out and verbose:
                     print(f"  [trajectory-filter] would exclude "
                           f"{len(walls_out)} wall(s) but only "

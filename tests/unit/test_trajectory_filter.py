@@ -1,9 +1,12 @@
 """M4b: trajectory-containment polygon filter tests.
 
 The floorplan pipeline builds a convex hull of the SLAM trajectory XY,
-buffers by 1 m, and drops any wall whose midpoint falls outside that
-buffered polygon. The tests below exercise the filter directly by
-running `generate_floorplan` on small synthetic clouds with varied
+buffers by TRAJECTORY_HULL_BUFFER_M (= 2.5 m), and drops any wall whose
+midpoint falls outside that buffered polygon. A connectivity rescue
+pass then re-admits walls whose both endpoints fall within
+TRAJECTORY_RESCUE_ENDPOINT_EPS_M (= 0.2 m) of a kept-wall endpoint.
+The tests below exercise the filter directly by running
+`generate_floorplan` on small synthetic clouds with varied
 trajectories — the wall-exclusion counts are read back from the
 returned metadata.
 """
@@ -90,7 +93,7 @@ def test_walls_inside_hull_kept(tmp_path):
     walls = walls_closed_rectangle(length=4.0, width=3.0)
     pcd = _build_pcd_from_walls(walls, floor_z=0.0, ceiling_z=2.5)
     # Trajectory spans the rectangle interior, hugging close to each
-    # wall (0.5 m inset) so the 1 m buffered hull comfortably clears
+    # wall (0.5 m inset) so the 2.5 m buffered hull comfortably clears
     # every wall midpoint outward.
     poses = np.array([
         [0.5, 0.5, 0.0],
@@ -108,47 +111,67 @@ def test_walls_inside_hull_kept(tmp_path):
 
 
 def test_walls_outside_hull_excluded(tmp_path):
-    """A phantom wall 10 m from the rectangle is dropped; the 4
-    rectangle walls are kept.
+    """Phantom walls whose midpoints sit beyond the 2.5 m buffer AND
+    whose endpoints don't both connect to kept walls are excluded.
 
-    The synthetic cloud has a 4-wall rectangle plus one 'phantom' wall
-    segment far outside the trajectory hull. Only the rectangle walls
-    fall within the 1 m-buffered hull; the phantom is excluded.
+    The synthetic cloud is a hexagonal room (lower rectangle + angled
+    upper half). Trajectory stays in the lower rectangle only; the
+    three upper walls sit well beyond the 2.5 m buffered hull and
+    their endpoints at the top (non-sharing corners) don't match any
+    kept-wall endpoints, so the connectivity rescue cannot re-admit
+    them.
     """
-    walls = walls_closed_rectangle(length=4.0, width=3.0)
-    phantom = (np.array([12.0, 12.0]), np.array([14.0, 12.0]), 0.0, 2.0)
-    walls_with_phantom = walls + [phantom]
-    pcd = _build_pcd_from_walls(walls_with_phantom, floor_z=0.0,
-                                 ceiling_z=2.5)
+    # Hexagonal-ish room: rectangle (0..4, 0..5) with angled upper
+    # section narrowing to a top at y=7. Six walls; trajectory visits
+    # only the lower rectangle.
+    walls = [
+        (np.array([0.0, 0.0]), np.array([4.0, 0.0]), 0.0, 4.0),
+        (np.array([4.0, 0.0]), np.array([4.0, 5.0]), 90.0, 5.0),
+        (np.array([4.0, 5.0]), np.array([3.0, 7.0]), 117.0,
+         float(np.sqrt(5))),
+        (np.array([3.0, 7.0]), np.array([1.0, 7.0]), 180.0, 2.0),
+        (np.array([1.0, 7.0]), np.array([0.0, 5.0]), 243.0,
+         float(np.sqrt(5))),
+        (np.array([0.0, 5.0]), np.array([0.0, 0.0]), 270.0, 5.0),
+    ]
+    pcd = _build_pcd_from_walls(walls, floor_z=0.0, ceiling_z=2.5)
+    # Trajectory within the lower rectangle (0.5..3.5, 0.5..2.5).
+    # Buffered hull (2.5 m) reaches y ~ 5, so the upper walls are
+    # initially excluded. The two diagonal walls share one kept
+    # endpoint each (the east/west wall-top) but their OTHER endpoint
+    # is (3, 7) / (1, 7) — not shared with any kept wall, so the
+    # connectivity rescue does not re-admit them. Likewise the top
+    # wall's endpoints are both at y=7 — not kept.
     poses = np.array([
+        [0.5, 0.5, 0.0],
+        [3.5, 0.5, 0.0],
+        [3.5, 2.5, 0.0],
+        [0.5, 2.5, 0.0],
         [2.0, 1.5, 0.0],
-        [1.0, 0.5, 0.0],
-        [3.0, 0.5, 0.0],
-        [3.0, 2.5, 0.0],
-        [1.0, 2.5, 0.0],
+        [2.0, 2.5, 0.0],
     ])
     meta = _run_floorplan(pcd, poses, tmp_path)
-    # At least one wall must be excluded (the phantom's midpoint at
-    # (13, 12) sits far outside the (0..4, 0..3) + 1m hull).
+    # At least one wall must be excluded. Expected: 3 upper walls.
     excluded = meta.get('excluded_walls', [])
     assert len(excluded) >= 1, (
-        f"phantom not excluded — excluded_walls={excluded}")
+        f"upper-room phantoms not excluded — excluded_walls={excluded}")
     # And walls_excluded_phantom count must match the list length.
     assert meta.get('walls_excluded_phantom', 0) == len(excluded)
 
 
 def test_buffer_zone_walls_kept(tmp_path):
-    """A wall just outside the raw convex hull but within the 1 m
-    buffer stays in the filtered set.
+    """Walls just outside the raw hull but within the 2.5 m buffer stay in.
 
-    Trajectory hugs a ~2x1 inner rectangle; the 4x3 outer walls are
-    up to 1 m outside the hull — the 1 m buffer is exactly enough to
-    keep them in.
+    Trajectory hugs a tight ~1x1 inner box; the 4x3 outer walls are
+    up to 2 m outside the hull — the 2.5 m buffer is large enough to
+    keep them in. (With the prior 1 m buffer they would have been
+    dropped.)
     """
     walls = walls_closed_rectangle(length=4.0, width=3.0)
     pcd = _build_pcd_from_walls(walls, floor_z=0.0, ceiling_z=2.5)
-    # Trajectory is a 2x1 box centered at the room center — walls at
-    # (x=0, x=4, y=0, y=3) are all within 1 m of the hull.
+    # Trajectory is a ~1x1 box centered at the room center — walls at
+    # (x=0, x=4, y=0, y=3) are up to 2 m from the hull. 2.5 m buffer
+    # keeps them all.
     poses = np.array([
         [1.5, 1.0, 0.0],
         [2.5, 1.0, 0.0],
@@ -157,8 +180,59 @@ def test_buffer_zone_walls_kept(tmp_path):
         [2.0, 1.5, 0.0],
     ])
     meta = _run_floorplan(pcd, poses, tmp_path)
-    # All 4 rectangle walls should be within the 1 m-buffered hull,
+    # All 4 rectangle walls should be within the 2.5 m-buffered hull,
     # so nothing excluded.
     assert meta.get('walls_excluded_phantom', 0) == 0, (
         f"walls within buffer wrongly excluded: "
         f"{meta.get('excluded_walls')}")
+
+
+def test_connectivity_rescue_keeps_closing_walls(tmp_path):
+    """A wall just beyond the 2.5 m buffer whose endpoints close the
+    polygon by connecting to kept walls is rescued.
+
+    Setup: 4-wall rectangle (0..6, 0..3). Trajectory sits far to the
+    south-west so that the north wall (y=3) midpoint is ~3 m beyond
+    the buffered hull — initially excluded. But the north wall's
+    endpoints are (0,3) and (6,3), which coincide with endpoints of
+    the west wall ((0,0)-(0,3)) and the east wall ((6,0)-(6,3)), which
+    are kept by the buffered hull check. The connectivity rescue must
+    re-admit the north wall so the polygon closes.
+    """
+    # Long thin rectangle so that the trajectory, placed along the
+    # south side only, leaves the north wall far from the hull.
+    walls = walls_closed_rectangle(length=6.0, width=3.0)
+    pcd = _build_pcd_from_walls(walls, floor_z=0.0, ceiling_z=2.5)
+    # Trajectory: scanner walked only the south leg (y ~= 0.5),
+    # covering the full length (x = 0..6). The convex hull of these
+    # poses is a tiny sliver around y=0.5; with a 2.5 m buffer the
+    # hull reaches y ~= 3.0. The north-wall midpoint at y=3 sits
+    # right on the boundary, so we push the box further to put the
+    # north wall JUST beyond the buffer. We use a slightly taller
+    # box for clearance.
+    walls_tall = walls_closed_rectangle(length=6.0, width=5.5)
+    pcd = _build_pcd_from_walls(walls_tall, floor_z=0.0, ceiling_z=2.5)
+    poses = np.array([
+        [0.5, 0.5, 0.0],
+        [2.0, 0.5, 0.0],
+        [3.5, 0.5, 0.0],
+        [5.5, 0.5, 0.0],
+        [3.0, 0.8, 0.0],
+    ])
+    # With this trajectory (y ~= 0.5..0.8), the convex hull is a
+    # thin strip near y=0.5. With a 2.5 m buffer the hull reaches
+    # y ~= 3.3. The north wall midpoint is at y=5.5 — well beyond
+    # the buffer — so it is initially excluded. Its endpoints
+    # (0, 5.5) and (6, 5.5) coincide with the west-wall endpoint
+    # (0, 5.5) and the east-wall endpoint (6, 5.5), so the
+    # connectivity rescue re-admits it.
+    meta = _run_floorplan(pcd, poses, tmp_path)
+    # After rescue, all 4 rectangle walls should be kept.
+    excluded = meta.get('excluded_walls', [])
+    kept = meta['variants']['D_refined']['n_walls']
+    assert kept >= 4, (
+        f"connectivity rescue failed: kept={kept}, "
+        f"excluded_walls={excluded}")
+    assert meta.get('walls_excluded_phantom', 0) == 0, (
+        f"connectivity rescue did not fully close the polygon — "
+        f"excluded_walls={excluded}")
