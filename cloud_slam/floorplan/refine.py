@@ -1076,3 +1076,588 @@ def refine_walls(walls_in, pts_3d, floor_z, ceiling_z, *,
             'length_m_data_extent': round(length_data, 3),
         })
     return out_walls, out_meta
+
+
+# ----- Stage 8: polygon-closure solver (M1a) -----
+
+# Which `snapped_to` values pin a wall's direction (so corner movement
+# is restricted to the 1D subspace along the wall's line).
+_SNAPPED_KINDS = frozenset({'dominant', 'manhattan', 'diagonal', 'hex'})
+
+
+def _stage8_wall_direction(wall_tuple):
+    """Unit 2D direction of the given wall tuple (p1, p2, angle, length).
+
+    Computed from the endpoints (p2 − p1). See `_stage8_snap_direction`
+    for the intended-snap-axis variant used when enforcing constraints.
+    """
+    p1, p2, _angle, _length = wall_tuple
+    v = np.asarray(p2, dtype=np.float64) - np.asarray(p1, dtype=np.float64)
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return np.array([1.0, 0.0])
+    return v / n
+
+
+def _stage8_wall_perp(wall_tuple):
+    """Unit 2D normal (perpendicular) to the wall, derived from endpoints."""
+    d = _stage8_wall_direction(wall_tuple)
+    return np.array([-d[1], d[0]])
+
+
+def _stage8_snap_direction(wall_tuple):
+    """Unit 2D direction of the wall's SNAPPED axis (from angle_deg).
+
+    A wall that has been snapped (by Stage 3) carries its intended axis
+    in `angle_deg`; the (p2 − p1) direction should already match, but
+    after Stage 5 vertex translation or Stage 7 corner clamping the
+    endpoints may drift slightly off-axis. Using `angle_deg` as the
+    ground truth for direction-enforcement avoids ambiguity and keeps
+    the constraint rows numerically consistent.
+    """
+    _p1, _p2, angle, _length = wall_tuple
+    rad = float(angle) * np.pi / 180.0
+    return np.array([np.cos(rad), np.sin(rad)])
+
+
+def _stage8_snap_perp(wall_tuple):
+    """Unit 2D normal to the wall's snapped direction."""
+    d = _stage8_snap_direction(wall_tuple)
+    return np.array([-d[1], d[0]])
+
+
+def _stage8_adjacent_snap_reject(walls, meta, tol_deg):
+    """Return a copy of meta + log of demotions for near-collinear neighbours.
+
+    When two adjacent walls' snapped directions are within tol_deg of
+    each other, they are effectively collinear — forcing both to be
+    snapped means corners are overdetermined. Demote the lower-
+    confidence snap to 'free'. The returned log entries are appended to
+    `demotions_cascade` so diagnostics capture them.
+
+    Returns:
+        (working_meta, log_entries) where log_entries is a list of
+        dicts of the same shape as the main cascade.
+    """
+    n = len(walls)
+    log = []
+    if n < 2:
+        return [dict(m) for m in meta], log
+    demoted = [dict(m) for m in meta]
+    for i in range(n):
+        mi = demoted[i]
+        mj = demoted[(i + 1) % n]
+        if mi.get('snapped_to') not in _SNAPPED_KINDS:
+            continue
+        if mj.get('snapped_to') not in _SNAPPED_KINDS:
+            continue
+        # Angular difference in degrees, on [0, 90] (collinearity is symmetric
+        # under 180° flip).
+        a_i = float(walls[i][2])
+        a_j = float(walls[(i + 1) % n][2])
+        d = abs(a_i - a_j) % 180.0
+        d = min(d, 180.0 - d)
+        if d < tol_deg:
+            # Demote the lower-confidence snap.
+            ci = float(mi.get('confidence', 0.0))
+            cj = float(mj.get('confidence', 0.0))
+            demote_idx = (i + 1) % n if cj <= ci else i
+            prev_kind = demoted[demote_idx].get('snapped_to', 'free')
+            demoted[demote_idx]['snapped_to'] = 'free'
+            log.append({
+                'attempt': -1,  # negative = pre-flight rejection
+                'wall_idx': int(demote_idx),
+                'previous_snap': prev_kind,
+                'reason': 'adjacent_snap_reject',
+                'angle_diff_deg': float(d),
+            })
+    return demoted, log
+
+
+def _stage8_build_corner_positions(walls):
+    """Corner position list + closure gap Δ.
+
+    Corner j is shared by wall_{j-1}.p2 and wall_j.p1. For a closed
+    polygon these are identical; for an open one they differ (the
+    closure distributes the mismatch).
+
+    Returns:
+        corners: (N, 2) original corner positions (averaged per vertex).
+        delta:   (2,) closure gap Σ (p2_i - p1_i).
+    """
+    n = len(walls)
+    corners = np.zeros((n, 2), dtype=np.float64)
+    for j in range(n):
+        prev_p2 = np.asarray(walls[(j - 1) % n][1], dtype=np.float64)
+        curr_p1 = np.asarray(walls[j][0], dtype=np.float64)
+        corners[j] = 0.5 * (prev_p2 + curr_p1)
+    delta = np.zeros(2, dtype=np.float64)
+    for (p1, p2, _a, _l) in walls:
+        delta += np.asarray(p2, dtype=np.float64) - np.asarray(p1, dtype=np.float64)
+    return corners, delta
+
+
+def _stage8_solve_kkt(walls, meta, corners, delta, weights, cond_threshold):
+    """Closed-form KKT solve for the weighted corner adjustment.
+
+    Problem: minimise Σ w_j · ||c_j - c_j_orig||² subject to
+       (i) polygon closure: each wall's direction constraint
+       (ii) for snapped walls, corner movement along wall direction only
+    All constraints are LINEAR in (c_j) so the KKT system is one
+    numpy.linalg.solve call.
+
+    Formulation:
+      Variables: x ∈ R^{2N} (corner displacements around original).
+      Objective: x^T H x with H = diag(w_j) blown up to 2N×2N (each
+                 corner contributes w_j · I_2).
+      Constraints: A x = b, where A encodes (stacked by row pair):
+        - For each snapped wall i, the perpendicular projection of
+          (x_{i+1} - x_i) must equal the perpendicular component of
+          the original wall's drift (i.e. the wall's new direction
+          stays parallel to the snap line). The RHS is 0 because we
+          pin the wall direction; the original endpoints may already
+          be off-axis but the SNAPPED direction is what we take as
+          truth.
+        - Polygon closure: Σ (x_{i+1} - x_i along each wall direction)
+          not directly — instead we encode "the corners must close":
+          Σ (c_{i+1} - c_i) = 0 is automatic since corners live on a
+          ring. What we actually need is that the TOTAL drift from
+          the ORIGINAL endpoints' chain Σ (wall_i.p2 - wall_i.p1)
+          must equal the distance from c_i to c_{i+1} summed. By
+          pinning c_{j} positions and letting the wall vectors be
+          c_{j+1} - c_j, the closure gap Δ becomes the "soft
+          constraint we absorb" into the objective.
+
+    Returns:
+        new_corners: (N, 2) shifted corners, or None if infeasible /
+                     ill-conditioned.
+        cond_number: float condition number of the KKT matrix.
+    """
+    n = len(walls)
+
+    # Decision vector: x ∈ R^{2N}, stacked as (c_0x, c_0y, c_1x, c_1y, ...).
+    # Unknowns are the NEW corner positions. Objective minimises
+    # Σ w_j ||c_j - c_j_orig||² → 0.5 * x^T (2 diag(w)⊗I_2) x - (2 diag(w)⊗I_2 c_orig)^T x.
+    # H_diag has length 2N (the 2×2 identity per corner times w_j).
+    w_tile = np.repeat(np.asarray(weights, dtype=np.float64), 2)   # (2N,)
+    two_H_diag = 2.0 * w_tile                                       # (2N,)
+    x0 = corners.flatten()                                          # (2N,)
+    rhs_top = two_H_diag * x0                                       # (2N,)
+
+    # Build equality constraints A x = b.
+    #
+    # (1) For each snapped wall i, new wall direction (c_{i+1} - c_i) must
+    #     be parallel to the snap direction d_i. Equivalently,
+    #     (c_{i+1} - c_i) · n_i = 0 where n_i is the wall's perpendicular.
+    #     That is 1 row per snapped wall.
+    #
+    # (2) Polygon closure: sum of wall vectors == 0 is automatic for a
+    #     ring of corners (telescopes to zero). The actual closure
+    #     condition we need is that the final corner list forms a closed
+    #     polygon — which, since we decided to represent walls as
+    #     (c_i, c_{i+1}) with indices mod N, is always true. So no
+    #     separate closure row needed.
+    #
+    # The role of Δ: Δ is the amount of "drift" the input data has that
+    # we absorb by shifting corners away from the old broken endpoints.
+    # It shows up implicitly because the ORIGINAL corners (defined as
+    # averaged endpoints) are shifted from the ideal ring — the solver
+    # finds new corners close to the originals but consistent with snap.
+    n_snapped = sum(1 for m in meta if m.get('snapped_to') in _SNAPPED_KINDS)
+    if n_snapped > 0:
+        A_rows = []
+        b_rows = []
+        for i in range(n):
+            if meta[i].get('snapped_to') not in _SNAPPED_KINDS:
+                continue
+            # Use the SNAPPED axis perpendicular (from angle_deg), not the
+            # endpoint-derived perpendicular — a snapped wall's direction
+            # is the one Stage 3 locked in, and small endpoint drift from
+            # Stage 5 / Stage 7 must not rotate the snap.
+            perp = _stage8_snap_perp(walls[i])     # (2,)
+            row = np.zeros(2 * n, dtype=np.float64)
+            # Coefficients of c_{i+1} minus c_i projected on perp.
+            row[2 * i:2 * i + 2] = -perp
+            row[2 * ((i + 1) % n):2 * ((i + 1) % n) + 2] = perp
+            A_rows.append(row)
+            b_rows.append(0.0)
+        A = np.asarray(A_rows, dtype=np.float64)
+        b = np.asarray(b_rows, dtype=np.float64)
+    else:
+        A = np.zeros((0, 2 * n), dtype=np.float64)
+        b = np.zeros(0, dtype=np.float64)
+
+    k = A.shape[0]
+    # Pre-flight rank check — if A isn't full row rank, the system is
+    # degenerate and the cascade must kick in.
+    if k > 0:
+        rank = int(np.linalg.matrix_rank(A))
+        if rank < k:
+            return None, float('inf')
+    # Build KKT matrix [[2H, Aᵀ], [A, 0]] (size (2N+k) × (2N+k)).
+    m = 2 * n + k
+    K = np.zeros((m, m), dtype=np.float64)
+    K[np.arange(2 * n), np.arange(2 * n)] = two_H_diag
+    if k > 0:
+        K[:2 * n, 2 * n:] = A.T
+        K[2 * n:, :2 * n] = A
+    rhs = np.concatenate([rhs_top, b])
+
+    # Condition-number check — ill-conditioned → fall back.
+    try:
+        cond = float(np.linalg.cond(K))
+    except Exception:
+        cond = float('inf')
+    if cond > cond_threshold:
+        return None, cond
+
+    try:
+        sol = np.linalg.solve(K, rhs)
+    except np.linalg.LinAlgError:
+        return None, cond
+    new_corners = sol[:2 * n].reshape(n, 2)
+    return new_corners, cond
+
+
+def _stage8_solve_slsqp(walls, meta, corners, weights):
+    """SLSQP fallback: same objective + linear snap equality constraints.
+
+    Slower than the KKT path but tolerates rank-deficient constraint
+    matrices by finding a feasible least-squares projection.
+    """
+    from scipy.optimize import minimize
+
+    n = len(walls)
+    w_arr = np.asarray(weights, dtype=np.float64)
+    x0 = corners.flatten()
+
+    def objective(x):
+        diff = (x - x0).reshape(n, 2)
+        per_corner_sq = (diff ** 2).sum(axis=1)
+        return float(np.dot(w_arr, per_corner_sq))
+
+    def objective_jac(x):
+        diff = (x - x0)
+        w_tile = np.repeat(w_arr, 2)
+        return 2.0 * w_tile * diff
+
+    constraints = []
+    for i in range(n):
+        if meta[i].get('snapped_to') not in _SNAPPED_KINDS:
+            continue
+        perp = _stage8_snap_perp(walls[i])
+        i_next = (i + 1) % n
+
+        def make_constraint(i_curr, i_nxt, n_perp):
+            row = np.zeros(2 * n)
+            row[2 * i_curr:2 * i_curr + 2] = -n_perp
+            row[2 * i_nxt:2 * i_nxt + 2] = n_perp
+            return (
+                lambda x, r=row: float(np.dot(r, x)),
+                lambda x, r=row: r,
+            )
+        f, j = make_constraint(i, i_next, perp)
+        constraints.append({'type': 'eq', 'fun': f, 'jac': j})
+
+    try:
+        res = minimize(
+            objective, x0, jac=objective_jac, method='SLSQP',
+            constraints=constraints, options={'maxiter': 200, 'ftol': 1e-10},
+        )
+    except Exception:
+        return None
+    if not res.success:
+        return None
+    return res.x.reshape(n, 2)
+
+
+def _stage8_rebuild_walls(walls, new_corners):
+    """Recompute (p1, p2, angle, length) tuples from new corner positions."""
+    n = len(walls)
+    out = []
+    for i in range(n):
+        p1 = new_corners[i].copy()
+        p2 = new_corners[(i + 1) % n].copy()
+        v = p2 - p1
+        length = float(np.linalg.norm(v))
+        if length < 1e-9:
+            angle = float(walls[i][2])
+        else:
+            angle = float(np.degrees(np.arctan2(v[1], v[0])) % 180)
+        out.append((p1, p2, angle, length))
+    return out
+
+
+def _stage8_polygon_closure(walls, meta, *, config=None,
+                             emit_diagnostics=False, verbose=False):
+    """Stage 8 — weighted polygon-closure solver (M1a).
+
+    Redistributes the closure gap Δ = Σ (p2_i − p1_i) across polygon
+    corners via confidence-weighted constrained least squares. Closed-
+    form KKT first (one numpy.linalg.solve call), SLSQP fallback when
+    the KKT system is ill-conditioned or infeasible, and a demotion
+    cascade (snap-to-free) when the snap constraints are rank-deficient.
+
+    Algorithm (per docs/plans/roomplan-quality.md M1a):
+
+     1. Compute Δ = Σ (p2_i − p1_i)    # closure gap, typically 10-50 mm
+     2. Hard no-op short-circuit:
+          if |Δ| < no_op_threshold_mm AND caller did not request
+          diagnostics: return walls unchanged (byte-identical path).
+     3. Constraint formulation (constrained least squares):
+          Variables: corner positions {c_j}
+          Soft cost: Σ w_j · ||c_j − c_j_original||²
+                     where w_j = 1 / ((confidence_left_j +
+                                         confidence_right_j)/2 + ε)
+                            clamped so max(w_j)/min(w_j) ≤
+                            weight_clamp_ratio (10.0 by default).
+          Hard constraints:
+             (a) Polygon must close: chain of wall vectors sums to
+                 zero — automatic because walls are re-expressed as
+                 (c_i, c_{i+1}) with indices mod N.
+             (b) For each wall with snapped_to ∈ {dominant,
+                 manhattan, diagonal, hex}: direction is fixed —
+                 corner movement is restricted to the 1D subspace
+                 along that wall's line. 1 equation per snapped wall
+                 ((c_{i+1} - c_i) · n_i = 0 where n_i is the wall's
+                 perpendicular).
+             (c) For free walls: corners are free 2D variables.
+     4. Solver preference: closed-form KKT first, SLSQP fallback.
+        Check cond(KKT) < kkt_cond_threshold (1e10); only if ill-
+        conditioned or infeasible, fall back to scipy SLSQP.
+     5. Degeneracy fallback:
+        A Manhattan rectangle with all 4 walls snapped has ZERO DoF per
+        corner — the feasible set is empty whenever Δ ≠ 0. Rank check
+        on A_eq catches this; the demotion criterion is:
+            argmax (|n_j · Δ| / conf_j)
+        Cascade: demote top-ranked wall to free, retry KKT → SLSQP,
+        demote next, until feasible. Bound max_demotions.
+     6. Safeguards post-solve:
+        - No wall length < min_wall_length_m → revert
+        - No wall direction flip (dot(new_dir, old_dir) > 0)
+        - Per-corner |shift| ≤ max(per_corner_reject_mm,
+                                    per_corner_reject_frac_of_delta·|Δ|_mm)
+     7. Log per-corner shift + weight + demotion decisions.
+
+    Note on the "Compass Rule" pedigree: the classical Bowditch /
+    Compass Rule distributes closure error proportional to wall
+    lengths. We substitute inverse-confidence weighting — this is no
+    longer the classical technique but a principled variant for
+    sparse-lidar floorplans where some walls have weaker support.
+
+    Args:
+        walls: list of (p1, p2, angle_deg, length_m) tuples (the
+               existing refine.py format).
+        meta:  parallel list of per-wall metadata dicts with
+               'snapped_to' and 'confidence' fields (as produced by
+               refine_walls).
+        config: Stage8Config instance (see
+                cloud_slam.floorplan.config.Stage8Config). Defaults
+                to Stage8Config() when None.
+        emit_diagnostics: when True, the returned tuple's second
+                element is a dict with per-corner shifts/weights,
+                demotion cascade, and solver choice. When False,
+                returns None in slot 2 — and the |Δ| < threshold
+                path does zero extra work.
+        verbose: print per-stage progress (default False).
+
+    Returns:
+        (walls_closed, diagnostics_or_None).
+    """
+    from .config import Stage8Config
+
+    if config is None:
+        config = Stage8Config()
+
+    n = len(walls)
+    if n < 3:
+        return list(walls), (None if not emit_diagnostics else {
+            'solver_used': 'noop_too_few_walls',
+            'closure_gap_mm': 0.0,
+            'per_corner_shift_mm': [],
+            'per_corner_weight': [],
+            'demotions_cascade': [],
+            'kkt_cond': 0.0,
+        })
+
+    # Step 1: closure gap.
+    corners, delta = _stage8_build_corner_positions(walls)
+    delta_mm = float(np.linalg.norm(delta) * 1000.0)
+
+    # Step 2: hard no-op short-circuit.
+    if delta_mm < config.no_op_threshold_mm and not emit_diagnostics:
+        return list(walls), None
+    if delta_mm < config.no_op_threshold_mm:
+        # Emit a minimal diagnostics block so tests can assert no-op.
+        return list(walls), {
+            'solver_used': 'noop',
+            'closure_gap_mm': round(delta_mm, 3),
+            'per_corner_shift_mm': [0.0] * n,
+            'per_corner_weight': [0.0] * n,
+            'demotions_cascade': [],
+            'kkt_cond': 0.0,
+        }
+
+    # Reject adjacent snaps that are near-collinear (degenerate — two
+    # "perpendicular" walls that are actually parallel).
+    working_meta, adjacent_reject_log = _stage8_adjacent_snap_reject(
+        walls, meta, config.adjacent_snap_reject_deg)
+
+    # Compute per-corner weights. Symmetric (mean of left + right confidence)
+    # to behave correctly at T-junctions of non-rectangular rooms.
+    eps = 1e-3
+    conf = np.array(
+        [float(working_meta[i].get('confidence', 0.0)) for i in range(n)],
+        dtype=np.float64,
+    )
+    weights = np.zeros(n, dtype=np.float64)
+    for j in range(n):
+        c_left = conf[(j - 1) % n]
+        c_right = conf[j]
+        weights[j] = 1.0 / ((c_left + c_right) / 2.0 + eps)
+    # Clamp max/min ratio to prevent a single weak corner absorbing all of Δ.
+    w_min = float(np.min(weights))
+    w_max = float(np.max(weights))
+    if w_min > 0 and w_max / w_min > config.weight_clamp_ratio:
+        weights = np.clip(weights, w_min, w_min * config.weight_clamp_ratio)
+
+    # Step 4/5: solver cascade. Seed with any demotions from the
+    # adjacent-snap-reject pre-flight so the diagnostics log is complete.
+    demotions_cascade = list(adjacent_reject_log)
+    solver_used = None
+    new_corners = None
+    kkt_cond = 0.0
+
+    # Rank snapped walls by |n_j · Δ| / conf_j  (precomputed once; we
+    # may re-rank after each demotion because the list shrinks).
+    def _snapped_ranking(meta_cur):
+        ranking = []
+        for idx in range(n):
+            if meta_cur[idx].get('snapped_to') not in _SNAPPED_KINDS:
+                continue
+            n_perp = _stage8_snap_perp(walls[idx])
+            score = abs(float(np.dot(n_perp, delta))) / (
+                float(meta_cur[idx].get('confidence', 0.0)) + eps)
+            ranking.append((score, idx))
+        # Descending by score.
+        ranking.sort(key=lambda t: -t[0])
+        return ranking
+
+    for attempt in range(config.max_demotions + 1):
+        # Try KKT first.
+        trial_corners, cond = _stage8_solve_kkt(
+            walls, working_meta, corners, delta, weights,
+            config.kkt_cond_threshold)
+        if trial_corners is not None:
+            new_corners = trial_corners
+            kkt_cond = cond
+            solver_used = 'kkt' if solver_used is None else solver_used
+            break
+        # KKT failed → SLSQP.
+        kkt_cond = cond
+        trial_corners = _stage8_solve_slsqp(walls, working_meta, corners, weights)
+        if trial_corners is not None:
+            new_corners = trial_corners
+            solver_used = 'slsqp'
+            break
+        # Degenerate → demote.
+        ranking = _snapped_ranking(working_meta)
+        if not ranking:
+            # No snapped walls left to demote.
+            break
+        _score, demote_idx = ranking[0]
+        prev_kind = working_meta[demote_idx].get('snapped_to', 'free')
+        working_meta[demote_idx] = dict(working_meta[demote_idx])
+        working_meta[demote_idx]['snapped_to'] = 'free'
+        demotions_cascade.append({
+            'attempt': attempt,
+            'wall_idx': int(demote_idx),
+            'previous_snap': prev_kind,
+            'score': float(_score),
+        })
+
+    if new_corners is None:
+        # All demotions exhausted → give up gracefully.
+        if verbose:
+            print(f"  [Stage 8] infeasible after {len(demotions_cascade)} "
+                  f"demotions — returning walls unchanged")
+        return list(walls), {
+            'solver_used': 'fallback_unchanged',
+            'closure_gap_mm': round(delta_mm, 3),
+            'per_corner_shift_mm': [0.0] * n,
+            'per_corner_weight': [round(float(w), 4) for w in weights],
+            'demotions_cascade': demotions_cascade,
+            'kkt_cond': float(kkt_cond),
+        } if emit_diagnostics else None
+
+    # Step 6: safeguards post-solve.
+    shifts_mm = np.linalg.norm(new_corners - corners, axis=1) * 1000.0
+    max_shift_allowed_mm = max(
+        config.per_corner_reject_mm,
+        config.per_corner_reject_frac_of_delta * delta_mm,
+    )
+    if shifts_mm.max() > max_shift_allowed_mm:
+        if verbose:
+            print(f"  [Stage 8] rejected: max shift "
+                  f"{shifts_mm.max():.1f} mm > {max_shift_allowed_mm:.1f} mm")
+        return list(walls), ({
+            'solver_used': 'fallback_unchanged',
+            'closure_gap_mm': round(delta_mm, 3),
+            'per_corner_shift_mm': [round(float(s), 3) for s in shifts_mm],
+            'per_corner_weight': [round(float(w), 4) for w in weights],
+            'demotions_cascade': demotions_cascade,
+            'kkt_cond': float(kkt_cond),
+            'rejection_reason': 'per_corner_shift_exceeded',
+        } if emit_diagnostics else None)
+
+    # Build candidate walls.
+    proposed_walls = _stage8_rebuild_walls(walls, new_corners)
+
+    # Wall direction flip + min-length guard. Revert the whole solve
+    # if any wall would flip direction (dot(new_dir, old_dir) <= 0) or
+    # shrink below min_wall_length_m.
+    for i in range(n):
+        old_dir = _stage8_wall_direction(walls[i])
+        new_dir = _stage8_wall_direction(proposed_walls[i])
+        if float(np.dot(old_dir, new_dir)) <= 0.0:
+            if verbose:
+                print(f"  [Stage 8] wall {i} would flip direction — reverting solve")
+            return list(walls), ({
+                'solver_used': 'fallback_unchanged',
+                'closure_gap_mm': round(delta_mm, 3),
+                'per_corner_shift_mm': [round(float(s), 3) for s in shifts_mm],
+                'per_corner_weight': [round(float(w), 4) for w in weights],
+                'demotions_cascade': demotions_cascade,
+                'kkt_cond': float(kkt_cond),
+                'rejection_reason': 'wall_direction_flip',
+            } if emit_diagnostics else None)
+        if proposed_walls[i][3] < config.min_wall_length_m:
+            if verbose:
+                print(f"  [Stage 8] wall {i} would shrink to "
+                      f"{proposed_walls[i][3]:.3f} m — reverting solve")
+            return list(walls), ({
+                'solver_used': 'fallback_unchanged',
+                'closure_gap_mm': round(delta_mm, 3),
+                'per_corner_shift_mm': [round(float(s), 3) for s in shifts_mm],
+                'per_corner_weight': [round(float(w), 4) for w in weights],
+                'demotions_cascade': demotions_cascade,
+                'kkt_cond': float(kkt_cond),
+                'rejection_reason': 'wall_too_short',
+            } if emit_diagnostics else None)
+
+    if verbose:
+        print(f"  [Stage 8] {solver_used}: |Δ|={delta_mm:.1f} mm, "
+              f"max corner shift={shifts_mm.max():.1f} mm, "
+              f"demotions={len(demotions_cascade)}")
+
+    diagnostics = None
+    if emit_diagnostics:
+        diagnostics = {
+            'solver_used': solver_used,
+            'closure_gap_mm': round(delta_mm, 3),
+            'per_corner_shift_mm': [round(float(s), 3) for s in shifts_mm],
+            'per_corner_weight': [round(float(w), 4) for w in weights],
+            'demotions_cascade': demotions_cascade,
+            'kkt_cond': float(kkt_cond),
+        }
+    return proposed_walls, diagnostics
