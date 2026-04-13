@@ -1,4 +1,4 @@
-"""M0b: validates _apply_transform_to_buffers() applies (R, t) in lockstep.
+"""M0b: validates apply_transform_to_buffers() applies (R, t) in lockstep.
 
 Covers the Risk #8 silent-drift hazard: if any buffer is missed at a
 transform site, that buffer silently rotates relative to merged.
@@ -8,25 +8,12 @@ scipy (x, y, z, w) — see cloud_slam/box_refiner.py ('format': 'xyzw').
 The helper uses scipy.spatial.transform.Rotation, matching the existing
 call sites in scripts/detect_and_slam.py.
 """
-import importlib.util
-import os
-
 import numpy as np
 import open3d as o3d
 import pytest
 from scipy.spatial.transform import Rotation as SciRot
 
-
-def _load_helper():
-    # Script is at <repo>/scripts/detect_and_slam.py — anchor via __file__
-    # so the test is runnable from any cwd (CI, local editor, etc.).
-    script_path = os.path.normpath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "scripts", "detect_and_slam.py"
-    ))
-    spec = importlib.util.spec_from_file_location("detect_and_slam", script_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod._apply_transform_to_buffers
+from cloud_slam.transforms import apply_transform_to_buffers
 
 
 def _make_merged(n=50):
@@ -36,13 +23,12 @@ def _make_merged(n=50):
 
 
 def test_identity_is_noop():
-    helper = _load_helper()
     merged = _make_merged()
     wall_labels = {'xyz': np.random.rand(20, 3).astype(np.float32)}
     before = np.asarray(merged.points).copy()
     before_xyz = wall_labels['xyz'].copy()
 
-    helper(np.eye(3), np.zeros(3), merged=merged, wall_labels=wall_labels)
+    apply_transform_to_buffers(np.eye(3), np.zeros(3), merged=merged, wall_labels=wall_labels)
 
     np.testing.assert_allclose(np.asarray(merged.points), before)
     np.testing.assert_allclose(wall_labels['xyz'], before_xyz)
@@ -50,7 +36,6 @@ def test_identity_is_noop():
 
 def test_all_buffers_transform_in_lockstep():
     """If a helper call is 'lockstep', every buffer must pick up the same R."""
-    helper = _load_helper()
     # 90-degree rotation around Z
     R = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float)
 
@@ -70,7 +55,7 @@ def test_all_buffers_transform_in_lockstep():
 
     before_merged = np.asarray(merged.points).copy()
 
-    helper(R, np.zeros(3),
+    apply_transform_to_buffers(R, np.zeros(3),
            merged=merged, wall_labels=wall_labels,
            objects=objects, lines=lines)
 
@@ -94,7 +79,6 @@ def test_all_buffers_transform_in_lockstep():
 
 
 def test_translation_applies_to_all():
-    helper = _load_helper()
     t = np.array([10.0, 20.0, 30.0])
     merged = _make_merged()
     wall_labels = {'xyz': np.array([[0.0, 0.0, 0.0]], dtype=np.float32)}
@@ -109,7 +93,7 @@ def test_translation_applies_to_all():
 
     before = np.asarray(merged.points).copy()
 
-    helper(np.eye(3), t,
+    apply_transform_to_buffers(np.eye(3), t,
            merged=merged, wall_labels=wall_labels,
            objects=objects, lines=lines)
 
@@ -125,13 +109,22 @@ def test_translation_applies_to_all():
 
 
 def test_none_buffers_skipped():
-    helper = _load_helper()
     # Should not raise regardless of which subset of buffers is provided.
-    helper(np.eye(3), np.zeros(3))              # nothing provided
-    helper(np.eye(3), None)                      # no translation
-    helper(np.eye(3), np.zeros(3), merged=None)  # explicit None
+    apply_transform_to_buffers(np.eye(3), np.zeros(3))              # nothing provided
+    apply_transform_to_buffers(np.eye(3), None)                      # no translation
+    apply_transform_to_buffers(np.eye(3), np.zeros(3), merged=None)  # explicit None
     # Empty wall_labels / lines / objects iterables must also be safe.
-    helper(np.eye(3), None,
+    apply_transform_to_buffers(np.eye(3), None,
            wall_labels={'xyz': np.zeros((0, 3), dtype=np.float32)},
            lines={'start': np.zeros((0, 3)), 'end': np.zeros((0, 3))},
            objects=[])
+
+
+def test_rotation_and_translation_compose_for_lines():
+    R = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float)
+    t = np.array([10.0, 20.0, 30.0])
+    lines = {'start': np.array([[1.0, 0.0, 0.0]]),
+             'end':   np.array([[0.0, 1.0, 0.0]])}
+    apply_transform_to_buffers(R, t, lines=lines)
+    np.testing.assert_allclose(lines['start'][0], [10.0, 21.0, 30.0], atol=1e-9)
+    np.testing.assert_allclose(lines['end'][0], [9.0, 20.0, 30.0], atol=1e-9)
