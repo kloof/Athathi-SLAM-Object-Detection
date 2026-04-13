@@ -22,12 +22,10 @@ here; the PNG export lives in `render`, the wall-refinement pipeline in
 `openings` is reserved for M3. See `docs/plans/roomplan-quality.md`.
 """
 
-import json
 import os
 import time
 
 import numpy as np
-import open3d as o3d
 from scipy.ndimage import binary_fill_holes, gaussian_filter1d
 from scipy.signal import find_peaks
 from shapely.geometry import Polygon as ShapelyPolygon

@@ -158,12 +158,6 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
         'glass':  '#ADD8E6',   # light cyan
     }
 
-    # Detect whether any wall has a vision-derived type — decides whether
-    # to draw the second legend (types) at all.
-    has_any_type = any(
-        isinstance(m, dict) and 'type' in m for m in walls_d_meta
-    ) if walls_d_meta else False
-
     fig, ax = plt.subplots(figsize=(14, 14), dpi=200)
     ax.imshow(g8v.T, origin='lower', cmap='gray_r', extent=extv, alpha=0.25)
     ax.set_facecolor('#FAFAFA')
@@ -175,7 +169,6 @@ def _export_refined_png(walls_d, poly_d, walls_d_meta, pts,
     legend_types = set()      # type legend entries (cyan/orange/...)
     type_handles = []         # keep matplotlib Line2D refs for the 2nd legend
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
     # Track which feature-class markers we drew so the features legend can
     # aggregate them (dashed-line markers drawn on walls that carry a
     # feature but are not themselves typed as that class).
