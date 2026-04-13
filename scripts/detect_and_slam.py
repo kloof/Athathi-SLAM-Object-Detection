@@ -153,6 +153,133 @@ def main():
 
     t_total = time.time() - t0
 
+    # --- M0c: per-scan calibration verification (must run BEFORE leveling) ---
+    # Reprojection IoU only makes sense while the merged cloud's world frame
+    # still matches the per-frame poses. Once we apply R_level / R_align /
+    # RANSAC-leveler below, the cloud rotates but `poses` keep pointing at
+    # the raw frame, so we verify here first. The returned dict gets merged
+    # into `calibration_info` and surfaces in the floorplan JSON schema.
+    calibration_info = _load_calibration_info(args.calibration)
+    try:
+        from cloud_slam.calibration import (
+            verify_calibration, should_warn, warning_message,
+        )
+        from cloud_slam.projection import project_lidar_to_camera
+
+        frame_masks = (wall_labels.get('frame_wall_masks')
+                       if wall_labels is not None else None)
+        if frame_masks:
+            # Geometric wall inliers on the pre-leveling merged cloud.
+            # Uses room_structure.detect_room (RANSAC + IMU gravity prior)
+            # to pick wall planes; we concat their inliers into a single
+            # (N, 3) array for reprojection. Avoids circularity: these
+            # points are chosen by geometry, not by Mask2Former.
+            from cloud_slam.room_structure import detect_room as _detect_room
+
+            try:
+                _gravity_up_for_rooms = None  # detect_room resolves via IMU
+                _room_raw = _detect_room(merged, gravity_up=_gravity_up_for_rooms)
+                # Plane dataclass doesn't store inlier points — only the
+                # plane equation + count. Recover inliers by thresholding
+                # the full merged cloud with `|p.n + d| < tol`.
+                _all_pts = np.asarray(merged.points, dtype=np.float64)
+                _wall_pts_list = []
+                _wall_tol = 0.05  # 5 cm — tight enough to pin to wall surface
+                for _wall in (_room_raw.walls or []):
+                    _n = np.asarray(_wall.normal, dtype=np.float64)
+                    _d = float(_wall.offset)
+                    _dist = np.abs(_all_pts @ _n + _d)
+                    _mask = _dist < _wall_tol
+                    if not _mask.any():
+                        continue
+                    _wall_pts_list.append(_all_pts[_mask])
+                if _wall_pts_list:
+                    _merged_wall_pts = np.concatenate(_wall_pts_list, axis=0)
+                    # Cap to 50k points — reprojection is O(N per frame),
+                    # and the IoU signal saturates well before 50k points.
+                    if len(_merged_wall_pts) > 50_000:
+                        _rng = np.random.default_rng(42)
+                        _idx = _rng.choice(len(_merged_wall_pts),
+                                           50_000, replace=False)
+                        _merged_wall_pts = _merged_wall_pts[_idx]
+                else:
+                    _merged_wall_pts = np.zeros((0, 3), dtype=np.float64)
+            except Exception as _e:
+                print(f"[Calibration] detect_room failed "
+                      f"({type(_e).__name__}: {_e}); skipping verification")
+                _merged_wall_pts = np.zeros((0, 3), dtype=np.float64)
+
+            if len(_merged_wall_pts) > 0:
+                # Build the parallel lists expected by verify_calibration.
+                # images_with_poses: (None, pose, wall_mask) per sampled frame.
+                # lidar_wall_inliers_per_frame: same merged array reused per
+                # slot (M0c pragmatic simplification — the docstring documents
+                # this). The `project_fn` adapter converts world→lidar via
+                # inverse pose, then calls project_lidar_to_camera.
+                def _project_world_to_image(pts_world, pose_l2w):
+                    R = pose_l2w[:3, :3]
+                    t = pose_l2w[:3, 3]
+                    # world -> lidar frame: p_l = R^T (p_w - t)
+                    pts_lidar = (R.T @ (pts_world - t).T).T
+                    _cam, pixels, in_front = project_lidar_to_camera(
+                        pts_lidar, calib)
+                    return pixels, in_front
+
+                # Build a list of max(frame_idx)+1 slots so that
+                # verify_calibration can index by frame_idx. The iterable
+                # only yields entries for sampled frames, so we build
+                # those slots explicitly.
+                _max_idx = max(fi for fi, _, _ in frame_masks)
+                _triplets = [(None, None, None)] * (_max_idx + 1)
+                _inliers_slots = [np.zeros((0, 3))] * (_max_idx + 1)
+                for _fi, _pose, _mask in frame_masks:
+                    _triplets[_fi] = (None, _pose, _mask)
+                    _inliers_slots[_fi] = _merged_wall_pts
+
+                _img_shape = None
+                for _fi, _, _mask in frame_masks:
+                    _img_shape = _mask.shape[:2]
+                    break
+
+                cal_result = verify_calibration(
+                    images_with_poses=_triplets,
+                    lidar_wall_inliers_per_frame=_inliers_slots,
+                    project_fn=_project_world_to_image,
+                    image_shape=_img_shape,
+                    sample_every=1,  # triplets already subsampled
+                )
+                print(f"[Calibration] reprojection IoU mean="
+                      f"{cal_result['reprojection_iou_mean']}, "
+                      f"min={cal_result['reprojection_iou_min']}, "
+                      f"frames={cal_result['reprojection_iou_frames_checked']}, "
+                      f"tier={cal_result['accuracy_tier']}")
+                # Merge into calibration_info so the floorplan schema picks
+                # up the IoU fields. Renamed keys match what
+                # schema._build_calibration_block already looks up.
+                calibration_info['reprojection_iou_mean'] = (
+                    cal_result['reprojection_iou_mean'])
+                calibration_info['reprojection_iou_min'] = (
+                    cal_result['reprojection_iou_min'])
+                calibration_info['reprojection_iou_frames_checked'] = (
+                    cal_result['reprojection_iou_frames_checked'])
+                calibration_info['accuracy_tier'] = cal_result['accuracy_tier']
+                # Stash the built calibration block for the end-of-run warning.
+                calibration_info['_verified_block'] = {
+                    'reprojection_iou_mean': cal_result['reprojection_iou_mean'],
+                    'reprojection_iou_min': cal_result['reprojection_iou_min'],
+                    'reprojection_iou_frames_checked': cal_result[
+                        'reprojection_iou_frames_checked'],
+                    'accuracy_tier': cal_result['accuracy_tier'],
+                }
+        else:
+            if wall_segmenter is not None:
+                print("[Calibration] no per-frame wall masks accumulated; "
+                      "skipping reprojection-IoU verification")
+    except Exception as e:
+        print(f"[Calibration] verification failed "
+              f"({type(e).__name__}: {e}); calibration IoU fields stay null")
+    # ------------------------------------------------------------------
+
     from scipy.spatial.transform import Rotation as SciRot
     z_up = np.array([0.0, 0.0, 1.0])
 
@@ -303,14 +430,21 @@ def main():
         # the scan's extrinsics.yaml if present. Compute `age_days` from
         # today's date so downstream converters can flag drifted
         # calibrations. Any missing field falls back to M0a defaults.
-        calibration_info = _load_calibration_info(args.calibration)
+        # M0c: `calibration_info` already loaded + enriched above (pre-
+        # leveling verification) — we just pass it through. Strip the
+        # internal `_verified_block` key so only the documented contract
+        # leaks into the floorplan schema builder.
+        calibration_info_fp = {
+            k: v for k, v in calibration_info.items()
+            if not k.startswith('_')
+        }
         _variants, fp_meta = generate_floorplan(
             merged,
             fp_out_dir,
             name="floorplan",
             gravity_up=np.array([0.0, 0.0, 1.0]),
             wall_labels=fp_wall_labels,
-            calibration_info=calibration_info,
+            calibration_info=calibration_info_fp,
             verbose=False,
         )
         v = fp_meta['variants']
@@ -377,6 +511,21 @@ def main():
               f"size {dims[0]:.2f}x{dims[1]:.2f}x{dims[2]:.2f}m "
               f"({obj['num_observations']} obs)")
     print(f"{'='*60}")
+
+    # M0c: loud warning if reprojection IoU was below 0.6. Emitted LAST so
+    # it's the final thing the user sees — calibration drift silently caps
+    # M2's wall-edge accuracy, and a mid-run message buried in floorplan
+    # logs is easy to miss.
+    _verified = calibration_info.get('_verified_block')
+    if _verified is not None:
+        try:
+            from cloud_slam.calibration import should_warn, warning_message
+            if should_warn(_verified):
+                print()
+                print(warning_message(_verified))
+        except Exception:
+            # Never let the warning path break the pipeline.
+            pass
 
 
 if __name__ == "__main__":

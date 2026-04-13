@@ -123,27 +123,37 @@ def _build_calibration_block(calibration_info) -> dict:
     """Build the `calibration` root block.
 
     calibration_info: optional dict with keys
-        method (str), calibration_date (str 'YYYY-MM-DD'), age_days (int)
-        — any subset. Everything missing falls back to sensible defaults.
-        M0c will populate the reprojection-IoU fields; for M0a they're
-        left as null so downstream consumers can detect "not yet verified".
+        method (str), calibration_date (str 'YYYY-MM-DD'), age_days (int),
+        reprojection_iou_mean (float | None),
+        reprojection_iou_min (float | None),
+        reprojection_iou_frames_checked (int),
+        accuracy_tier (str: "coarse" | "good" | "tight")
+        — any subset. Everything missing falls back to sensible defaults
+        (null IoU, "coarse" tier = "not yet verified").
+
+    M0c populates the reprojection-IoU fields via
+    `cloud_slam.calibration.verify_calibration` in scripts/detect_and_slam.py;
+    when that path doesn't run (e.g. Mask2Former disabled), the fields
+    remain null and `accuracy_tier` stays "coarse".
     """
     info = calibration_info or {}
     return {
         "method": info.get("method", "manual_visual_alignment"),
         "date": info.get("calibration_date"),
         "age_days": info.get("age_days"),
-        # M0c will populate these (per-scan reprojection IoU). Left null
-        # so consumers can detect "not yet verified".
-        "reprojection_iou_mean": None,
-        "reprojection_iou_min": None,
-        "reprojection_iou_frames_checked": 0,
+        # M0c: reprojection-IoU verification. Null when Mask2Former didn't
+        # run or accumulated no wall masks — consumers read this as
+        # "not yet verified".
+        "reprojection_iou_mean": info.get("reprojection_iou_mean"),
+        "reprojection_iou_min": info.get("reprojection_iou_min"),
+        "reprojection_iou_frames_checked": int(
+            info.get("reprojection_iou_frames_checked", 0)),
         # Hard-coded from cloud_slam/colorizer.py::match_nearest_image(max_dt=0.15).
         # If the colorizer's threshold changes, update both places.
         "time_sync_max_dt_ms": 150,
-        # Placeholder — M0c will flip to "fine" once per-scan verification
-        # achieves a reprojection-IoU threshold.
-        "accuracy_tier": "coarse",
+        # Default "coarse" — flips to "good" / "tight" when M0c measures
+        # mean IoU above 0.70 / 0.85.
+        "accuracy_tier": info.get("accuracy_tier", "coarse"),
     }
 
 

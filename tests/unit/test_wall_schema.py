@@ -58,3 +58,39 @@ def test_wall_uuid_determinism():
     assert _wall_uuid([0.0, 0.0], [1.0, 1.0]) != _wall_uuid([0.0, 0.0], [1.0, 2.0])
     # 32 hex chars
     assert len(_wall_uuid([0.0, 0.0], [1.0, 1.0])) == 32
+
+
+# ---- M0c: calibration block pass-through ----------------------------------
+
+def test_calibration_block_default_is_coarse_null_iou():
+    """No calibration_info → nulls for IoU, 'coarse' tier, 'manual' method."""
+    from cloud_slam.floorplan.schema import _build_calibration_block
+    block = _build_calibration_block(None)
+    assert block["method"] == "manual_visual_alignment"
+    assert block["reprojection_iou_mean"] is None
+    assert block["reprojection_iou_min"] is None
+    assert block["reprojection_iou_frames_checked"] == 0
+    assert block["accuracy_tier"] == "coarse"
+    assert block["time_sync_max_dt_ms"] == 150
+
+
+def test_calibration_block_passes_through_iou_and_tier():
+    """M0c: IoU + tier in calibration_info land in the block verbatim."""
+    from cloud_slam.floorplan.schema import _build_calibration_block
+    info = {
+        "method": "target_based",
+        "calibration_date": "2026-04-01",
+        "age_days": 12,
+        "reprojection_iou_mean": 0.87,
+        "reprojection_iou_min": 0.74,
+        "reprojection_iou_frames_checked": 16,
+        "accuracy_tier": "tight",
+    }
+    block = _build_calibration_block(info)
+    assert block["method"] == "target_based"
+    assert block["date"] == "2026-04-01"
+    assert block["age_days"] == 12
+    assert block["reprojection_iou_mean"] == 0.87
+    assert block["reprojection_iou_min"] == 0.74
+    assert block["reprojection_iou_frames_checked"] == 16
+    assert block["accuracy_tier"] == "tight"

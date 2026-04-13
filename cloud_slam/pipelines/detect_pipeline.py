@@ -61,7 +61,9 @@ def _z_buffer_visible(pts_cam, pixels, image_shape):
     return visible
 
 
-def _accumulate_wall_labels(segmenter, xyz, pose, image, calib, buffer):
+def _accumulate_wall_labels(segmenter, xyz, pose, image, calib, buffer,
+                            frame_idx=None, sample_every=30,
+                            frame_mask_buffer=None):
     """Segment one frame and append (world_xyz, bucket_id) to buffer.
 
     - Lidar points are in the lidar sensor frame.
@@ -69,6 +71,17 @@ def _accumulate_wall_labels(segmenter, xyz, pose, image, calib, buffer):
     - `pose` transforms lidar frame → world frame.
     - `buffer` is a dict {'xyz': list[ndarray], 'labels': list[ndarray]}.
       One append per call that yields at least one non-'other' bucket.
+
+    M0c additions:
+    - `frame_idx`: integer frame index, used to decide whether this frame's
+      wall mask gets stashed in `frame_mask_buffer` for calibration
+      reprojection-IoU verification.
+    - `sample_every`: only every `sample_every`-th frame's wall mask is
+      retained. A 500-frame scan at 1280x720 would otherwise need
+      ~460 MB of bool masks; 30x subsampling drops that to ~15 MB.
+    - `frame_mask_buffer`: optional list that receives
+      (frame_idx, pose_copy, wall_mask_hw_bool) triplets on sampled frames.
+      When None, no per-frame accumulation happens (backwards compatible).
     """
     if image is None or len(xyz) == 0:
         return
@@ -83,6 +96,19 @@ def _accumulate_wall_labels(segmenter, xyz, pose, image, calib, buffer):
     bucket_mask = segmenter.segment(image_rgb)
     if bucket_mask is None:
         return
+
+    # M0c: on sampled frames, snapshot the wall-bucket mask + pose into
+    # the calibration verification buffer BEFORE we do anything destructive
+    # below. The wall-bucket id is 1 (see wall_segmenter._ADE_TO_BUCKET).
+    if (frame_mask_buffer is not None
+            and frame_idx is not None
+            and sample_every > 0
+            and frame_idx % sample_every == 0):
+        frame_mask_buffer.append((
+            int(frame_idx),
+            np.asarray(pose, dtype=np.float64).copy(),
+            (bucket_mask == 1),
+        ))
 
     pts_cam, pixels, _in_front = project_lidar_to_camera(
         xyz.astype(np.float64), calib)
@@ -113,7 +139,8 @@ def _accumulate_wall_labels(segmenter, xyz, pose, image, calib, buffer):
 
 
 def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
-        leveling_mode="legacy", wall_segmenter=None):
+        leveling_mode="legacy", wall_segmenter=None,
+        calibration_check_every=30):
     """
     Run SLAM + object detection pipeline.
 
@@ -136,6 +163,12 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
             are tagged and accumulated in the returned `wall_labels` dict.
             When None, this path is a no-op — YOLOE and D_refined are
             byte-identical to the pre-vision behavior.
+        calibration_check_every: every Nth frame's wall-class mask is
+            stashed into `wall_labels['frame_wall_masks']` so the downstream
+            `cloud_slam.calibration.verify_calibration` pass can measure
+            reprojection IoU. Default 30 → ~16 masks on a 500-frame scan.
+            Ignored when `wall_segmenter` is None. Set to 0 / negative to
+            disable accumulation entirely.
 
     Returns:
         merged: Open3D PointCloud (colored)
@@ -157,6 +190,12 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
     # we concatenate into a single array. Keeping it as a list-of-arrays
     # avoids repeated concat/growing across frames.
     wall_label_chunks = {'xyz': [], 'labels': []}
+
+    # M0c: every Nth frame's wall-class mask + pose, used by
+    # cloud_slam.calibration.verify_calibration downstream. Stays empty when
+    # wall_segmenter is None or calibration_check_every <= 0.
+    frame_wall_masks: list = []
+    _cal_every = int(calibration_check_every) if calibration_check_every else 0
 
     def on_frame(frame_idx, stamp, xyz, pose, image):
         nonlocal detection_count
@@ -196,7 +235,11 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
         # object-tracker state.
         if wall_segmenter is not None:
             _accumulate_wall_labels(
-                wall_segmenter, xyz, pose, image, calib, wall_label_chunks)
+                wall_segmenter, xyz, pose, image, calib, wall_label_chunks,
+                frame_idx=frame_idx,
+                sample_every=_cal_every,
+                frame_mask_buffer=(frame_wall_masks if _cal_every > 0
+                                   else None))
 
     # Run SLAM with detection callback
     merged, poses, stats = icp_imu_pipeline.run(
@@ -267,6 +310,10 @@ def run(clouds, imus, images, calib, voxel_size=0.005, detector_config=None,
         wall_labels['ade_class_counts'] = wall_segmenter.get_ade_class_counts()
     else:
         wall_labels['ade_class_counts'] = {}
+    # M0c: per-frame wall masks (subsampled) for calibration verification.
+    # Consumer: cloud_slam.calibration.verify_calibration in detect_and_slam.py.
+    wall_labels['frame_wall_masks'] = frame_wall_masks
     stats['wall_labels_count'] = int(wall_labels['labels'].shape[0])
+    stats['calibration_frames_sampled'] = len(frame_wall_masks)
 
     return merged, poses, objects, stats, wall_labels
