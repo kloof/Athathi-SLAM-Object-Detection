@@ -29,6 +29,12 @@ class RoomStructure:
     gravity_up: np.ndarray = field(default_factory=lambda: np.array([0., 0., 1.]))
     floor_height: float = 0.0
     ceiling_height: float = 3.0
+    # M4a: horizontal planes between floor+1m and the selected ceiling.
+    # These are dropped soffits / coffers / trays / HVAC bulkheads /
+    # countertops — not the structural ceiling itself. Empty list by
+    # default (pre-M4a behavior). Populated from `floor_candidates`
+    # with the floor and ceiling picks removed.
+    intermediate_horiz: List[Plane] = field(default_factory=list)
 
 
 def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
@@ -81,13 +87,25 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
         horiz_pts = points[horiz_indices]
 
         # Find ALL horizontal plane candidates, pick the LOWEST as floor
+        # and the HIGHEST (above floor+1m) as ceiling.
+        #
+        # M4a: loop caps bumped 5 → 10 and min-inliers lowered 100 → 50 so
+        # dropped ceiling features (perimeter soffits / coffered ceilings /
+        # tray ceilings / HVAC bulkheads) don't starve the actual ceiling
+        # out of the candidate list. The actual structural ceiling is
+        # often heavily occluded by the dropped feature and surfaces with
+        # only ~50-100 inliers, so min=100 used to silently reject it and
+        # the soffit would win as "the ceiling".
+        #
+        # The LOWEST plane is still overwhelmingly the true floor because
+        # no horizontal plane below the actual floor exists in normal scans.
         floor_candidates = []
         remaining_horiz = horiz_pcd
-        for _ in range(5):
-            if len(remaining_horiz.points) < 100:
+        for _ in range(10):
+            if len(remaining_horiz.points) < 50:
                 break
             candidate = _ransac_plane(remaining_horiz, distance_threshold)
-            if candidate is None or candidate.num_inliers < 100:
+            if candidate is None or candidate.num_inliers < 50:
                 break
             floor_candidates.append(candidate)
             remaining_horiz = _remove_plane_inliers(
@@ -107,10 +125,24 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
                 p for p in floor_candidates[1:]
                 if (p.centroid @ gravity_up) > floor_h + 1.0
             ]
+            ceil_plane = None
             if ceil_candidates:
                 ceil_plane = max(ceil_candidates, key=lambda p: p.centroid @ gravity_up)
                 result.ceiling = ceil_plane
                 result.ceiling_height = float(ceil_plane.centroid @ gravity_up)
+
+            # M4a: surface dropped soffits / coffers / trays so the
+            # floorplan schema can emit them as `secondary_ceiling_features`.
+            # These are horizontal planes strictly above floor+1m but NOT
+            # the highest (which we just picked as the ceiling).
+            if ceil_plane is not None:
+                result.intermediate_horiz = [
+                    p for p in ceil_candidates if p is not ceil_plane
+                ]
+            else:
+                # No ceiling picked — every "above floor+1m" plane is an
+                # intermediate horizontal feature in its own right.
+                result.intermediate_horiz = list(ceil_candidates)
 
     # --- Detect walls from vertical points ---
     vert_indices = np.where(vertical_mask)[0]
