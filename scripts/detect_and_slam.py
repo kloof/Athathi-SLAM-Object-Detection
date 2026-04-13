@@ -22,6 +22,7 @@ import open3d as o3d
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from cloud_slam.box_render import create_box_points
+from cloud_slam.frustum import estimate_gravity
 from cloud_slam.transforms import apply_transform_to_buffers
 
 
@@ -177,7 +178,13 @@ def main():
             from cloud_slam.room_structure import detect_room as _detect_room
 
             try:
-                _gravity_up_for_rooms = None  # detect_room resolves via IMU
+                # RANSAC wall detection with IMU-derived gravity prior (the
+                # merged cloud hasn't been leveled yet at this point — its
+                # gravity still points in the raw-sensor direction, which
+                # is NOT [0, 0, 1]). detect_room's default would be
+                # [0, 0, 1], which would misclassify floor+ceiling as walls
+                # on the tilted L2 scanner.
+                _gravity_up_for_rooms = estimate_gravity(imus)
                 _room_raw = _detect_room(merged, gravity_up=_gravity_up_for_rooms)
                 # Plane dataclass doesn't store inlier points — only the
                 # plane equation + count. Recover inliers by thresholding
@@ -288,8 +295,6 @@ def main():
         # This is the original, working path — untouched by the floor-leveling
         # feature. In "floor" mode the pipeline has already leveled merged +
         # tracker and left us in a Z-up frame with the floor at Z=0.
-        from cloud_slam.frustum import estimate_gravity
-
         gravity_up = estimate_gravity(imus)
         if not np.allclose(gravity_up, z_up, atol=0.01):
             R_level = SciRot.align_vectors([z_up], [gravity_up])[0].as_matrix()

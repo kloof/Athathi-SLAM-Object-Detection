@@ -92,6 +92,14 @@ def _rasterize_projected_mask(pixels_uv: np.ndarray,
     if not np.any(valid):
         return mask.astype(bool)
 
+    # Filter out astronomical finite values that cv2.projectPoints can produce
+    # on points at glancing angles (they'd overflow int32 cast silently).
+    sane = np.abs(uv[:, 0]) < 1e6
+    sane &= np.abs(uv[:, 1]) < 1e6
+    valid = valid & sane
+    if not np.any(valid):
+        return mask.astype(bool)
+
     u = uv[valid, 0].astype(np.int32)
     v = uv[valid, 1].astype(np.int32)
     in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)

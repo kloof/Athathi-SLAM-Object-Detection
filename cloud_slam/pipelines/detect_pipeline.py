@@ -37,6 +37,9 @@ def _z_buffer_visible(pts_cam, pixels, image_shape):
     v = pixels[:, 1]
 
     valid = (depths > 0) & np.isfinite(u) & np.isfinite(v)
+    # Filter out astronomical finite values that cv2.projectPoints can produce
+    # on points at glancing angles (they'd overflow int32 cast silently).
+    valid &= (np.abs(u) < 1e6) & (np.abs(v) < 1e6)
     if not valid.any():
         return np.zeros(len(pts_cam), dtype=bool)
 
