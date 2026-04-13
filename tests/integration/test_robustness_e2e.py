@@ -56,8 +56,8 @@ def _make_walls_d_meta(n_walls, *, with_coverage=True, with_curved=False):
     return out
 
 
-def test_schema_version_is_2_2():
-    assert SCHEMA_VERSION == "2.2"
+def test_schema_version_is_2_3():
+    assert SCHEMA_VERSION == "2.3"
 
 
 def test_opening_types_has_5_with_mirror():
@@ -103,7 +103,7 @@ def test_m4_full_metadata_shape():
         excluded_walls=excluded_walls,
     )
     # --- top-level schema contract ---
-    assert meta['schema_version'] == '2.2'
+    assert meta['schema_version'] == '2.3'
     # --- scan_quality block (M4a) ---
     sq = meta['scan_quality']
     assert sq['vision']['frame_quality_pct'] == 42.5

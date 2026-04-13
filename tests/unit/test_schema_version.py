@@ -5,6 +5,8 @@ M0a introduced the 2.0 baseline; M3 bumped to 2.1 when D_refined.openings
 M4a bumped to 2.2 when the top-level `scan_quality` block,
 `secondary_ceiling_features`, per-wall `frames_seen_count`, and
 `curved` fields were added.
+M5a bumped to 2.3 when `ceiling_planes` (the ceiling-as-a-set array
+with per-plane `role` labels) joined the top-level schema.
 """
 from cloud_slam.floorplan import SCHEMA_VERSION
 
@@ -21,8 +23,10 @@ def test_schema_version_is_2_0_or_higher():
     )
 
 
-def test_schema_version_is_2_2():
-    """M4a bumped the schema version to 2.2 — the JSON now emits a
-    top-level `scan_quality` block, `secondary_ceiling_features`, and
-    per-wall `frames_seen_count` + `curved` fields."""
-    assert SCHEMA_VERSION == "2.2"
+def test_schema_version_is_2_3():
+    """M5a bumped the schema version to 2.3 — the JSON now emits a
+    top-level `ceiling_planes` array with per-plane role labels
+    ("main" / "raised" / "lower_step"). Multi-level ceilings (tray,
+    stepped, cathedral) surface as a set rather than being relegated
+    to `secondary_ceiling_features`."""
+    assert SCHEMA_VERSION == "2.3"

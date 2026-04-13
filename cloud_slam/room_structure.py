@@ -34,7 +34,27 @@ class RoomStructure:
     # countertops — not the structural ceiling itself. Empty list by
     # default (pre-M4a behavior). Populated from `floor_candidates`
     # with the floor and ceiling picks removed.
+    #
+    # M5a: kept as an alias of `below_ceiling_features` — legacy callers
+    # that read `intermediate_horiz` still get the below-main-ceiling
+    # soffits. Multi-level ceiling planes (at or above the main ceiling)
+    # now live in `ceiling_planes`, not here.
     intermediate_horiz: List[Plane] = field(default_factory=list)
+    # M5a: every horizontal plane with centroid above `floor_height + 1.0m`
+    # and ≥50 RANSAC inliers. A room with a tray ceiling or stepped
+    # ceiling has multiple entries here. The single `ceiling` field
+    # above is kept as the HIGHEST plane in this set (back-compat for
+    # callers that still expect one ceiling); `ceiling_height` is the
+    # max Z along gravity across the set (unchanged numerically).
+    ceiling_planes: List[Plane] = field(default_factory=list)
+    # M5a: horizontal planes between `floor_height + 0.5m` and
+    # `main_ceiling_height - 0.1m` — architectural soffits / coffers /
+    # HVAC bulkheads / countertops strictly BELOW the main ceiling.
+    # A multi-level ceiling plane (higher than main) does NOT land here;
+    # it goes to `ceiling_planes` with role="raised". A stepped-down
+    # ceiling plane (between floor+1m and main-0.1m) does NOT land here
+    # either; it goes to `ceiling_planes` with role="lower_step".
+    below_ceiling_features: List[Plane] = field(default_factory=list)
 
 
 def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
@@ -120,29 +140,74 @@ def detect_room(merged_pcd, gravity_up=None, voxel_size=0.03,
             result.floor = floor_plane
             result.floor_height = float(floor_h)
 
-            # Ceiling = highest horizontal plane above floor + 1.0m
-            ceil_candidates = [
+            # M5a: ceiling-as-a-set — any horizontal plane above
+            # floor + 1.0 m is a ceiling-region plane. Real rooms often
+            # have multiple (tray ceilings, stepped ceilings, vaulted
+            # ceilings with a flat peak). All of them belong together
+            # as "the ceiling", not as soffits.
+            ceiling_planes = [
                 p for p in floor_candidates[1:]
                 if (p.centroid @ gravity_up) > floor_h + 1.0
             ]
-            ceil_plane = None
-            if ceil_candidates:
-                ceil_plane = max(ceil_candidates, key=lambda p: p.centroid @ gravity_up)
-                result.ceiling = ceil_plane
-                result.ceiling_height = float(ceil_plane.centroid @ gravity_up)
+            result.ceiling_planes = list(ceiling_planes)
 
-            # M4a: surface dropped soffits / coffers / trays so the
-            # floorplan schema can emit them as `secondary_ceiling_features`.
-            # These are horizontal planes strictly above floor+1m but NOT
-            # the highest (which we just picked as the ceiling).
-            if ceil_plane is not None:
-                result.intermediate_horiz = [
-                    p for p in ceil_candidates if p is not ceil_plane
+            # Back-compat: `ceiling` is the single highest plane in the
+            # set; `ceiling_height` is its Z. Wall-band collection +
+            # opening detection still read these, and the highest plane
+            # is the right choice for both (walls extend up to the
+            # highest ceiling point; nothing clips).
+            ceil_plane = None
+            if ceiling_planes:
+                ceil_plane = max(
+                    ceiling_planes,
+                    key=lambda p: p.centroid @ gravity_up,
+                )
+                result.ceiling = ceil_plane
+                result.ceiling_height = float(
+                    ceil_plane.centroid @ gravity_up)
+
+            # M5a: `below_ceiling_features` — horizontal planes strictly
+            # BELOW the main (largest-footprint) ceiling by at least
+            # 10 cm, still above floor + 0.5 m. These are the actual
+            # architectural soffits / coffers / HVAC bulkheads — not
+            # multi-level ceiling planes.
+            #
+            # We need the main-ceiling height here. The floorplan layer
+            # re-computes "main" by XY footprint (the authoritative
+            # definition), but at this point in the pipeline we don't
+            # have point-to-plane XY hulls handy. Inlier count is a
+            # reasonable proxy: the main ceiling usually has the most
+            # inliers of the ceiling_planes set. Downstream (floorplan/
+            # __init__.py) uses the hull-area definition for role
+            # labels — this is only for populating
+            # `below_ceiling_features`, which is then filtered again by
+            # the floorplan layer with its own main-height value.
+            if ceiling_planes:
+                # Proxy "main" by largest inlier count among ceiling planes.
+                main_proxy = max(
+                    ceiling_planes, key=lambda p: p.num_inliers)
+                main_h_proxy = float(main_proxy.centroid @ gravity_up)
+                result.below_ceiling_features = [
+                    p for p in floor_candidates[1:]
+                    if (
+                        (p.centroid @ gravity_up) > floor_h + 0.5
+                        and (p.centroid @ gravity_up) < main_h_proxy - 0.1
+                    )
                 ]
             else:
-                # No ceiling picked — every "above floor+1m" plane is an
-                # intermediate horizontal feature in its own right.
-                result.intermediate_horiz = list(ceil_candidates)
+                # No ceiling picked — nothing to compare against; every
+                # intermediate horizontal plane above floor+0.5m is a
+                # below-ceiling feature in its own right.
+                result.below_ceiling_features = [
+                    p for p in floor_candidates[1:]
+                    if (p.centroid @ gravity_up) > floor_h + 0.5
+                ]
+
+            # M5a back-compat: `intermediate_horiz` is an alias for
+            # `below_ceiling_features`. Legacy callers that read it get
+            # the below-main soffits, NOT the multi-level ceiling
+            # planes (those now live in `ceiling_planes`).
+            result.intermediate_horiz = list(result.below_ceiling_features)
 
     # --- Detect walls from vertical points ---
     vert_indices = np.where(vertical_mask)[0]

@@ -236,8 +236,16 @@ def _compute_per_wall_frame_coverage(walls, wall_labels,
     return out
 
 
-def _build_secondary_features(room, gravity_up, swapped=False):
-    """Serialize `room.intermediate_horiz` into JSON-friendly dicts.
+def _build_secondary_features(room, pts, gravity_up, swapped=False,
+                               main_ceiling_height=None):
+    """Serialize architectural soffits into JSON-friendly dicts.
+
+    M5a: `secondary_ceiling_features` tightens to only planes strictly
+    BELOW the main ceiling. A plane that sits ABOVE main by > 5 cm is
+    a raised ceiling (tray / cathedral peak) and lives in
+    `ceiling_planes` with role="raised"; a plane at the same level as
+    main is still main. Only planes below `main_ceiling_height - 0.1m`
+    (10 cm tolerance) and above `floor + 0.5m` are real soffits.
 
     Each Plane becomes `{height_m, n_inliers, type_hint}`. `height_m`
     is the plane centroid projected onto gravity (Z along gravity_up);
@@ -247,24 +255,123 @@ def _build_secondary_features(room, gravity_up, swapped=False):
     generic "soffit" tag — downstream code can refine the type based
     on hull / spatial extent.
 
-    Returns an empty list when `room` is None or has no intermediate
-    horizontal planes.
+    Returns an empty list when `room` is None, has no below-ceiling
+    planes, or `main_ceiling_height` is None and no below-ceiling
+    features can be derived.
     """
     if room is None:
         return []
-    intermediates = getattr(room, 'intermediate_horiz', None) or []
+    # M5a: read from `below_ceiling_features` (new field). Fall back to
+    # `intermediate_horiz` for callers that populated the old field name
+    # directly.
+    candidates = getattr(room, 'below_ceiling_features', None)
+    if candidates is None:
+        candidates = getattr(room, 'intermediate_horiz', None) or []
     gravity_up = np.asarray(gravity_up, dtype=float)
+    floor_h = float(room.floor_height) if room.floor is not None else None
     out = []
-    for p in intermediates:
+    for p in candidates:
         z = float(p.centroid @ gravity_up)
+        # Apply the M5a tightening: only planes strictly below main−0.1m
+        # are soffits. Planes ≥ main−0.1m (within tolerance of the main
+        # ceiling, or above it) are ceiling-region planes and live in
+        # `ceiling_planes`, not here.
+        if main_ceiling_height is not None and z >= main_ceiling_height - 0.1:
+            continue
+        # Floor guard: soffits sit above floor+0.5m.
+        if floor_h is not None and z <= floor_h + 0.5:
+            continue
         if swapped:
-            z = -z
+            z_emit = -z
+        else:
+            z_emit = z
         out.append({
-            'height_m': round(z, 3),
+            'height_m': round(z_emit, 3),
             'n_inliers': int(p.num_inliers),
             'type_hint': 'soffit',
         })
     return out
+
+
+def _build_ceiling_planes(room, pts, gravity_up, swapped=False):
+    """Serialize `room.ceiling_planes` into JSON-friendly dicts with roles.
+
+    M5a: every horizontal plane above floor + 1.0 m is a ceiling-region
+    plane. The output list has one entry per plane with:
+        {height_m, area_m2, n_inliers, role}
+    where `role` ∈ {"main", "raised", "lower_step"}:
+      - "main": the plane with the LARGEST XY footprint (area_m2).
+                Exactly one plane gets this role. Ties broken by
+                inlier count (more inliers wins).
+      - "raised": height_m > main.height_m + 0.05m (5 cm tolerance).
+      - "lower_step": height_m < main.height_m - 0.05m but still above
+                floor + 1.0m.
+
+    When `swapped` is True (physical ceiling ended up at lower Z after
+    leveling inversion), heights are negated so the emitted value is
+    physically sensible.
+
+    Returns an empty list when `room` is None or has no ceiling planes.
+    """
+    if room is None:
+        return []
+    planes = getattr(room, 'ceiling_planes', None) or []
+    if not planes:
+        return []
+    gravity_up = np.asarray(gravity_up, dtype=float)
+    entries = []
+    for p in planes:
+        # Area = XY convex-hull of inliers (full-resolution pts vs the
+        # plane; same approach as `_select_ceiling_plane`).
+        xy = _plane_inliers_xy(pts, p, distance_thresh=0.15)
+        area = _convex_hull_area(xy)
+        z = float(p.centroid @ gravity_up)
+        entries.append({
+            'height_m': round((-z if swapped else z), 3),
+            'area_m2': round(float(area), 2),
+            'n_inliers': int(p.num_inliers),
+            'role': None,           # filled in below
+            '_z_raw': z,             # private — used for role compare
+        })
+
+    # Pick "main" by largest XY footprint. Ties broken by inlier count.
+    # Guard against all-zero area (degenerate synth inputs): if every
+    # area_m2 is zero, fall back to inlier count as the main pick.
+    areas = [e['area_m2'] for e in entries]
+    if all(a <= 0.0 for a in areas):
+        main_idx = int(max(range(len(entries)),
+                           key=lambda i: entries[i]['n_inliers']))
+    else:
+        main_idx = int(max(
+            range(len(entries)),
+            key=lambda i: (entries[i]['area_m2'], entries[i]['n_inliers']),
+        ))
+    main_z = entries[main_idx]['_z_raw']
+
+    # 5 cm tolerance for the role split.
+    for i, e in enumerate(entries):
+        if i == main_idx:
+            e['role'] = 'main'
+        elif e['_z_raw'] > main_z + 0.05:
+            e['role'] = 'raised'
+        elif e['_z_raw'] < main_z - 0.05:
+            e['role'] = 'lower_step'
+        else:
+            # Within ±5 cm of main but not the largest — treat as a
+            # co-planar sibling. Label 'main' belongs to exactly one
+            # plane (the largest), so this reasonably-sized-but-not-
+            # largest plane is effectively a peer of main. Labeling it
+            # "main" would break the "exactly one main" invariant;
+            # labeling it "lower_step" when it's the same height as
+            # main is wrong. Split by sign of (z - main_z): ≥ → "raised",
+            # < → "lower_step", which keeps the rule monotone in height.
+            e['role'] = (
+                'raised' if e['_z_raw'] >= main_z else 'lower_step')
+
+    # Strip the private scratch field before emission.
+    for e in entries:
+        del e['_z_raw']
+    return entries
 
 
 def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
@@ -293,15 +400,21 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
         verbose:     Print which tier produced the answer.
 
     Returns:
-        (floor_z, ceiling_z, ceiling_plane_or_none, secondary_features).
+        (floor_z, ceiling_z, ceiling_plane_or_none, secondary_features,
+         ceiling_planes).
         The third element is the RANSAC ceiling Plane when Tier 1
         succeeds (so callers can do point-to-plane masking); None for
         Tier 2/3 fallbacks. The fourth element (M4a) is a list of dicts
         describing dropped soffits / coffers / trays / HVAC bulkheads —
-        any horizontal plane between floor+1m and the selected ceiling.
+        any horizontal plane between floor+1m and the main ceiling.
         Each dict has keys `height_m`, `n_inliers`, `type_hint`.
-        Empty list when detect_room doesn't populate `intermediate_horiz`
-        (Tier 2/3 fallbacks or no intermediate surfaces present).
+        Empty list when detect_room doesn't populate
+        `below_ceiling_features` (Tier 2/3 fallbacks or no intermediate
+        surfaces present). The fifth element (M5a) is a list of dicts
+        describing every horizontal ceiling-region plane (height >
+        floor + 1 m, ≥50 RANSAC inliers). Each dict has keys `height_m`,
+        `area_m2`, `n_inliers`, `role` ∈ {"main", "raised",
+        "lower_step"}. Empty list on Tier 2/3 fallbacks.
 
     The Tier 1 path also auto-selects between detect_room's floor- and
     ceiling-labelled planes by XY coverage, so the returned ceiling is
@@ -359,9 +472,24 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
             print(f"[FLOORPLAN] floor/ceiling via RANSAC (Tier 1): "
                   f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}"
                   f"{' (Z-flipped for display — leveling is inverted)' if swapped else ''}")
+        # M5a: build ceiling_planes set (every horizontal plane > floor+1m
+        # with its XY footprint + role label). secondary_features filters
+        # by main-ceiling height (the largest-footprint plane), so build
+        # ceiling_planes first, then use its "main" entry to bound the
+        # secondary list.
+        ceiling_planes = _build_ceiling_planes(room, pts, gravity_up, swapped)
+        main_h = None
+        for e in ceiling_planes:
+            if e.get('role') == 'main':
+                # Convert back to leveled-frame z for comparison. The
+                # `height_m` value has been flipped when `swapped`, so
+                # undo that to get the raw z along gravity that
+                # `_build_secondary_features` compares against.
+                main_h = -e['height_m'] if swapped else e['height_m']
+                break
         secondary = _build_secondary_features(
-            room, gravity_up, swapped)
-        return floor_z, ceiling_z, ceiling_plane, secondary
+            room, pts, gravity_up, swapped, main_ceiling_height=main_h)
+        return floor_z, ceiling_z, ceiling_plane, secondary, ceiling_planes
 
     # ---- Tier 2: floor only — percentile above floor + 1 m ----
     # If RANSAC found a good floor, preserve it. Only the ceiling falls back.
@@ -371,15 +499,18 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
         # soffits etc.) from detect_room's candidate list — even though the
         # primary ceiling came from a percentile fallback. The list is
         # already filtered to >floor+1m by detect_room.
+        # M5a: no ceiling planes were detected (room.ceiling is None),
+        # so ceiling_planes is empty on Tier 2. Below-ceiling features
+        # still surface as soffits using floor+0.5m as the bound.
         secondary = _build_secondary_features(
-            room, gravity_up, swapped=False)
+            room, pts, gravity_up, swapped=False)
         above = z_along[z_along > floor_z + 1.0]
         if above.size >= 50:
             ceiling_z = float(np.percentile(above, 98))
             if verbose:
                 print(f"[FLOORPLAN] ceiling via percentile (Tier 2): "
                       f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}")
-            return floor_z, ceiling_z, None, secondary
+            return floor_z, ceiling_z, None, secondary, []
         # Too few points above floor+1m (pathological scan). Keep the RANSAC
         # floor but use the 99th percentile of the full Z range as ceiling.
         if z_along.size >= 50:
@@ -388,7 +519,7 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
                 if verbose:
                     print(f"[FLOORPLAN] ceiling via 99th-pct fallback (Tier 2b): "
                           f"floor={floor_z:.3f} (RANSAC), ceiling={ceiling_z:.3f}")
-                return floor_z, ceiling_z, None, secondary
+                return floor_z, ceiling_z, None, secondary, []
 
     # ---- Tier 3: histogram fallback (reference-tool parity) ----
     if z_along.size == 0:
@@ -410,8 +541,9 @@ def detect_floor_ceiling_robust(pcd, gravity_up=None, imus=None,
     if verbose:
         print(f"[FLOORPLAN] floor/ceiling via histogram fallback (Tier 3): "
               f"floor={floor_z:.3f}, ceiling={ceiling_z:.3f}")
-    # No detect_room result → no intermediate horizontals to surface.
-    return floor_z, ceiling_z, None, []
+    # No detect_room result → no intermediate horizontals or ceiling
+    # planes to surface.
+    return floor_z, ceiling_z, None, [], []
 
 
 # ============================================================
@@ -698,7 +830,13 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
     # (dropped soffits / coffers / trays / HVAC bulkheads) — surfaced in
     # the metadata as `secondary_ceiling_features`. Empty when none
     # were detected (the common, well-scanned case).
-    floor_z, ceiling_z, ceiling_plane, secondary_ceiling_features = (
+    # M5a: the 5th element is a list of ceiling-region planes (every
+    # horizontal plane above floor+1m), surfaced as `ceiling_planes` at
+    # the metadata root. Each entry has `height_m`, `area_m2`,
+    # `n_inliers`, and `role` ∈ {"main", "raised", "lower_step"}. Empty
+    # on Tier 2/3 fallbacks.
+    (floor_z, ceiling_z, ceiling_plane, secondary_ceiling_features,
+     ceiling_planes_meta) = (
         detect_floor_ceiling_robust(
             pcd, gravity_up=gravity_up, imus=imus, verbose=verbose))
     h = ceiling_z - floor_z
@@ -1163,6 +1301,7 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         time_sync_dropped=time_sync_dropped,
         wall_frames_seen=wall_frames_seen,
         secondary_ceiling_features=secondary_ceiling_features,
+        ceiling_planes=ceiling_planes_meta,
         excluded_walls=excluded_walls_meta)
     write_floorplan_metadata(meta, output_dir, name)
 

@@ -29,7 +29,12 @@ import numpy as np
 # frame-quality %, time-sync p50/p95/p99, per-wall camera coverage),
 # `secondary_ceiling_features` (dropped soffits / coffers / trays) and
 # per-wall `frames_seen_count` + `curved` fields.
-SCHEMA_VERSION = "2.2"
+# Bumped again by M5a with the new top-level `ceiling_planes` array —
+# every horizontal plane above floor+1m is reported as a ceiling-region
+# plane (each entry carries `height_m`, `area_m2`, `n_inliers`, and a
+# `role` label: "main" / "raised" / "lower_step"). `secondary_ceiling_features`
+# tightens to only architectural soffits below the main ceiling.
+SCHEMA_VERSION = "2.3"
 
 
 # M3 opening schema keys (documented here so M3 populates them consistently).
@@ -351,7 +356,8 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               time_sync_dropped=0,
                               wall_frames_seen=None,
                               secondary_ceiling_features=None,
-                              excluded_walls=None) -> dict:
+                              excluded_walls=None,
+                              ceiling_planes=None) -> dict:
     """Assemble the floorplan metadata dict (pre-serialization).
 
     M0a additions (all strict superset — pre-existing keys unchanged):
@@ -400,6 +406,17 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
         soffits / coffers / trays / HVAC bulkheads (any horizontal
         plane between floor+1m and the picked ceiling). Emitted as
         `meta['secondary_ceiling_features']`. None → emits `[]`.
+
+    M5a kwarg:
+
+    ceiling_planes: list of dicts describing EVERY horizontal plane
+        in the ceiling region (height > floor + 1.0 m, ≥50 RANSAC
+        inliers). Each entry has `height_m`, `area_m2`, `n_inliers`,
+        and `role` ∈ {"main", "raised", "lower_step"}. Role is
+        pre-computed by the caller (cloud_slam.floorplan.__init__.py)
+        since it has point-to-plane XY hulls on hand; schema.py stores
+        what it's given. Emitted as `meta['ceiling_planes']`. None →
+        emits `[]`.
     """
     room_category, room_confidence, room_source = _vote_room_category(
         ade_class_counts)
@@ -453,6 +470,14 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
     meta['secondary_ceiling_features'] = (
         list(secondary_ceiling_features) if secondary_ceiling_features
         else [])
+
+    # M5a: ceiling-as-a-set — every horizontal plane above floor+1m.
+    # Role labels ("main" / "raised" / "lower_step") are pre-computed
+    # by the caller (cloud_slam.floorplan.__init__.py) based on XY
+    # footprint; schema.py just stores what it's given. Always emitted
+    # as a list so consumers can unconditionally iterate.
+    meta['ceiling_planes'] = (
+        list(ceiling_planes) if ceiling_planes else [])
 
     # M4b: trajectory-containment filter output. `excluded_walls` is the
     # list of wall dicts that fell outside the buffered SLAM trajectory
