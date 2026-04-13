@@ -66,6 +66,61 @@ def overlay_mask(image_bgr: np.ndarray, mask: np.ndarray, alpha: float) -> np.nd
     return out
 
 
+def solid_mask(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Render the bucket mask as solid colors — no transparency.
+
+    `other` pixels are shown in dark gray so they're visually distinct
+    from unclassified black borders. Classified regions get their full
+    bucket color, which makes adjacent classes crisp and unambiguous.
+    """
+    H, W = mask.shape
+    out = np.full((H, W, 3), 40, dtype=np.uint8)  # dark gray for 'other'
+    for bucket, bgr in BUCKET_COLORS.items():
+        if bgr is None:
+            continue
+        out[mask == bucket] = bgr
+    return out
+
+
+def contour_mode(image_bgr: np.ndarray, mask: np.ndarray, thickness: int = 2) -> np.ndarray:
+    """Draw crisp bucket boundaries as colored lines over the original.
+
+    Keeps the underlying image fully visible (no alpha fill) but outlines
+    every bucket region with a thick colored border. Best for comparing
+    classification edges against physical object edges in the scene.
+    """
+    out = image_bgr.copy()
+    for bucket, bgr in BUCKET_COLORS.items():
+        if bgr is None:
+            continue
+        binary = (mask == bucket).astype(np.uint8)
+        if binary.sum() == 0:
+            continue
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, contours, -1, bgr, thickness, cv2.LINE_AA)
+    return out
+
+
+def compose_sidebyside(left: np.ndarray, right: np.ndarray,
+                       left_label: str = "original",
+                       right_label: str = "mask") -> np.ndarray:
+    """Stack two equal-size frames horizontally with small labels."""
+    H, W = left.shape[:2]
+    out = np.zeros((H, W * 2, 3), dtype=np.uint8)
+    out[:, :W] = left
+    out[:, W:] = right
+    # Divider line
+    out[:, W - 1:W + 1] = 80
+    # Labels
+    for x, text in [(10, left_label), (W + 10, right_label)]:
+        cv2.putText(out, text, (x + 1, H - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, text, (x, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (240, 240, 240), 1, cv2.LINE_AA)
+    return out
+
+
 def draw_legend(image: np.ndarray, counts: dict, total_px: int) -> np.ndarray:
     """Write the legend + per-bucket % in the top-left corner."""
     lines = []
@@ -96,7 +151,15 @@ def main():
     ap.add_argument("--fps", type=float, default=10.0,
                     help="Output video FPS (default: 10)")
     ap.add_argument("--alpha", type=float, default=0.55,
-                    help="Overlay blend alpha 0..1 (default: 0.55)")
+                    help="Overlay blend alpha 0..1, used by --mode blend (default: 0.55)")
+    ap.add_argument("--mode", choices=["sidebyside", "blend", "mask", "contour"],
+                    default="sidebyside",
+                    help="Visualization mode (default: sidebyside):\n"
+                         "  sidebyside = original + solid-color mask side-by-side "
+                         "(crispest, best when classes overlap)\n"
+                         "  blend      = alpha overlay on the original image\n"
+                         "  mask       = pure solid-color mask, original hidden\n"
+                         "  contour    = original + crisp class boundary outlines")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="Stop after N frames (default: 0 = no limit)")
     args = ap.parse_args()
@@ -133,12 +196,15 @@ def main():
         print("[dump] failed to decode first image")
         return 1
     H, W = first.shape[:2]
+    # Side-by-side doubles width.
+    out_W = W * 2 if args.mode == "sidebyside" else W
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(args.out_mp4, fourcc, args.fps, (W, H))
+    writer = cv2.VideoWriter(args.out_mp4, fourcc, args.fps, (out_W, H))
     if not writer.isOpened():
         print(f"[dump] failed to open writer for {args.out_mp4}")
         return 1
-    print(f"[dump] writing {args.out_mp4} @ {args.fps:.1f}fps, size {W}x{H}")
+    print(f"[dump] mode={args.mode}, writing {args.out_mp4} @ "
+          f"{args.fps:.1f}fps, size {out_W}x{H}")
 
     count = 0
     for i, entry in enumerate(images):
@@ -155,11 +221,25 @@ def main():
             out = frame_bgr.copy()
             cv2.putText(out, "Mask2Former: FAILED", (10, H - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            if args.mode == "sidebyside":
+                out = compose_sidebyside(out, out, "original", "MASK FAILED")
         else:
-            out = overlay_mask(frame_bgr, bucket_mask, args.alpha)
             flat = bucket_mask.ravel()
             counts = {b: int((flat == b).sum()) for b in range(5)}
-            out = draw_legend(out, counts, flat.size)
+            if args.mode == "blend":
+                out = overlay_mask(frame_bgr, bucket_mask, args.alpha)
+                out = draw_legend(out, counts, flat.size)
+            elif args.mode == "mask":
+                out = solid_mask(frame_bgr, bucket_mask)
+                out = draw_legend(out, counts, flat.size)
+            elif args.mode == "contour":
+                out = contour_mode(frame_bgr, bucket_mask, thickness=2)
+                out = draw_legend(out, counts, flat.size)
+            else:  # sidebyside
+                mask_panel = solid_mask(frame_bgr, bucket_mask)
+                mask_panel = draw_legend(mask_panel, counts, flat.size)
+                out = compose_sidebyside(frame_bgr, mask_panel,
+                                         "original", "Mask2Former 5-bucket")
 
         writer.write(out)
         count += 1
