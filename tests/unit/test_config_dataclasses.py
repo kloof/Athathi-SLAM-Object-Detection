@@ -28,9 +28,14 @@ def test_stage8_has_8_fields():
     assert len(dataclasses.fields(Stage8Config)) == 8
 
 
-def test_openings_has_15_fields():
+def test_openings_has_19_fields():
+    """M4b added 4 robustness knobs to OpeningsConfig:
+    picture_frame_max_size_m, min_wall_coverage_for_vision,
+    min_density_ratio_for_emit, temporal_vote_min_frames.
+    Bumps the prior M0d count (15) to 19.
+    """
     import dataclasses
-    assert len(dataclasses.fields(OpeningsConfig)) == 15
+    assert len(dataclasses.fields(OpeningsConfig)) == 19
 
 
 def test_m2_has_10_fields():

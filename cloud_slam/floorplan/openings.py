@@ -399,6 +399,58 @@ def _classify_blob_type(blob, grid, config):
     return int(counts.argmax())
 
 
+def _temporal_vote_blob_type(blob, vision_band, res, floor_z,
+                              min_frames):
+    """Vote on a blob's bucket using raw accumulated points across frames.
+
+    M4b: leverages the per-point labels that were already accumulated
+    frame-by-frame in `wall_labels['xyz']` (re-projected into the (t, z)
+    wall frame in `vision_band`). One vote per accumulated point — so a
+    blob whose pixels voted `window` on 5 frames and `glass` on 2 frames
+    gets a `window` majority, naturally breaking the frame-to-frame
+    flicker that `_classify_blob_type` (single-cell majority) exhibits.
+
+    Returns (bucket_id, vote_count). When `vote_count < min_frames`, the
+    caller should treat the result as untrusted and fall back to
+    `_classify_blob_type`.
+
+    blob: dict with t_lo/t_hi/z_lo/z_hi integer cell indices.
+    vision_band: (t_arr, z_arr, bucket_arr) tuple from
+                 `_collect_wall_band_points` — the 0.20 m wider band used
+                 for majority assignment.
+    res: grid cell size in metres.
+    floor_z: world z of the grid's row 0.
+    min_frames: `config.temporal_vote_min_frames`.
+    """
+    t_v, z_v, bucket = vision_band
+    if t_v is None or len(t_v) == 0:
+        return 0, 0
+    t_lo = blob['t_lo']
+    t_hi = blob['t_hi']
+    z_lo = blob['z_lo']
+    z_hi = blob['z_hi']
+    t_start = t_lo * res
+    t_end = (t_hi + 1) * res
+    z_start = floor_z + z_lo * res
+    z_end = floor_z + (z_hi + 1) * res
+    mask = ((t_v >= t_start) & (t_v < t_end)
+            & (z_v >= z_start) & (z_v < z_end))
+    in_blob = np.asarray(bucket, dtype=np.int32)[mask]
+    if in_blob.size == 0:
+        return 0, 0
+    counts = np.bincount(in_blob, minlength=5)
+    # Ignore bucket 0 (other) — mirrors _classify_blob_type.
+    counts[0] = 0
+    if counts.sum() == 0:
+        return 0, int(in_blob.size)
+    winner = int(counts.argmax())
+    # Vote count = total labeled points that fell in the blob rectangle
+    # (any non-zero bucket). Below `min_frames` the caller should fall
+    # back to the cell-level argmax path.
+    vote_count = int(counts.sum())
+    return (winner if vote_count >= min_frames else 0), vote_count
+
+
 def _local_density_ratio(blob, grid, res, along_window_m=1.0):
     """Compute density_ratio = blob mean density / local mean density.
 
@@ -559,8 +611,14 @@ def _make_opening_entry(*, oid, wall_idx, wall_uuid, otype,
                          along_start, along_end, z_bottom, z_top,
                          width_m, height_m, center_xy, transform_4x4,
                          source, is_open, transparent, transom_of,
-                         confidence):
-    """Construct an opening dict with all OPENING_REQUIRED_KEYS."""
+                         confidence, temporal_vote_count=0):
+    """Construct an opening dict with all OPENING_REQUIRED_KEYS.
+
+    M4b: `temporal_vote_count` is the number of accumulated wall_labels
+    points that fell inside the blob region, broken down across all
+    frames. Zero means vision didn't contribute (lidar-only emit, or
+    the cell-level argmax fallback fired).
+    """
     return {
         'id': f'open_{int(oid)}',
         'uuid': _opening_uuid(wall_uuid, along_start, z_bottom),
@@ -581,6 +639,7 @@ def _make_opening_entry(*, oid, wall_idx, wall_uuid, otype,
         'transparent': bool(transparent),
         'transom_of': transom_of,
         'confidence': round(float(confidence), 3),
+        'temporal_vote_count': int(temporal_vote_count),
     }
 
 
@@ -607,14 +666,18 @@ def _link_transoms(emitted):
 def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                       config: Optional[OpeningsConfig] = None,
                       ceiling_z: Optional[float] = None,
-                      floor_z: Optional[float] = None):
+                      floor_z: Optional[float] = None,
+                      verbose: bool = False):
     """Detect doors/windows/glass/passages on a set of refined walls.
 
     Args:
         walls:       list of (p1, p2, angle_deg, length_m) — D_refined walls
                      in world XY.
         walls_meta:  list of per-wall meta dicts (parallel to walls) — may
-                     contain 'type'/'features' keys from M0a.
+                     contain 'type'/'features' keys from M0a. M4b mutates
+                     each entry in-place with `wall_band_coverage_pct`
+                     (float) so the schema can surface per-wall lidar
+                     occupancy fractions downstream.
         merged_pts:  (N, 3) float32/float64 world-frame points.
         wall_labels: dict with 'xyz' (M, 3), 'labels' (M,) per the
                      WallSegmenter 5-bucket remap, or None. When None the
@@ -622,10 +685,12 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
         config:      OpeningsConfig; defaults to OpeningsConfig().
         ceiling_z:   scalar wall-top height (world Z). Required.
         floor_z:     scalar wall-bottom height (world Z). Required.
+        verbose:     Print per-wall coverage percentages (M4b).
 
     Returns:
         list of opening dicts, each with every OPENING_REQUIRED_KEYS key
-        populated.
+        populated. Also populates `temporal_vote_count` (M4b) for every
+        entry — 0 for lidar-only passages.
     """
     if config is None:
         config = OpeningsConfig()
@@ -671,6 +736,7 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                     and walls_meta[wall_idx] is not None)
                 else {})
         wall_uuid = _wall_uuid(p1, p2)
+        wall_length = float(length)
 
         density_band, vision_band = _collect_wall_band_points(
             merged_pts, pts_labels, p1, p2,
@@ -679,87 +745,144 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
             floor_z=floor_z, ceiling_z=ceiling_z)
 
         grid = _rasterize_grid(density_band, vision_band,
-                                length=float(length),
+                                length=wall_length,
                                 floor_z=floor_z, ceiling_z=ceiling_z,
                                 res=res)
         n_t = grid['n_t']
 
+        # --- M4b: per-wall lidar coverage gate -----------------------
+        # Compute the fraction of (t, z) cells that have any lidar point.
+        # Walls with very low coverage either weren't seen by the camera
+        # (vision is unreliable) or the wall geometry is incidental to
+        # the trajectory; either way we trust gap detection (which only
+        # cares about empty regions) but skip vision-blob detection.
+        occ_size = max(int(grid['occupancy'].size), 1)
+        wall_band_coverage_pct = (
+            float(grid['occupancy'].sum()) / float(occ_size))
+        do_vision_blobs = (
+            wall_band_coverage_pct >= config.min_wall_coverage_for_vision)
+        if (walls_meta is not None
+                and wall_idx < len(walls_meta)
+                and walls_meta[wall_idx] is not None):
+            walls_meta[wall_idx]['wall_band_coverage_pct'] = round(
+                wall_band_coverage_pct, 4)
+        if verbose:
+            gate = ("vision+gap" if do_vision_blobs
+                    else "gap-only (low coverage)")
+            print(f"[Openings] wall {wall_idx}: "
+                  f"coverage={wall_band_coverage_pct:.2%} → {gate}")
+
         per_wall = []
 
-        # --- Vision blobs: door bucket ---
-        door_mask = (grid['vision'] == _BUCKET_DOOR)
-        door_blobs = _extract_blob_obbs(door_mask)
-        for (t_lo, t_hi, z_lo, z_hi, support) in door_blobs:
-            if support < config.min_support_vision_cells:
-                continue
-            if _bbox_touches_corner(t_lo, t_hi, n_t, corner_cells):
-                continue
-            (along_s, along_e, z_b, z_t,
-             center_xy, center_z,
-             w_m, h_m) = _bbox_to_world(
-                p1, p2, t_lo, t_hi, z_lo, z_hi, res, floor_z)
-            wrange, hrange = _ranges_for_type(config, 'door')
-            if not (wrange[0] <= w_m <= wrange[1]):
-                continue
-            if not (hrange[0] <= h_m <= hrange[1]):
-                continue
-            bbox_cells = max((t_hi - t_lo + 1) * (z_hi - z_lo + 1), 1)
-            confidence = min(support / bbox_cells, 1.0)
-            per_wall.append({
-                't_lo': t_lo, 't_hi': t_hi, 'z_lo': z_lo, 'z_hi': z_hi,
-                'support': support,
-                'otype': 'door',
-                'source': 'vision+lidar' if pts_labels is not None else 'lidar',
-                'along_start': along_s, 'along_end': along_e,
-                'z_bottom': z_b, 'z_top': z_t,
-                'width_m': w_m, 'height_m': h_m,
-                'center_xy': center_xy, 'center_z': center_z,
-                'confidence': confidence,
-            })
+        # --- Vision blobs: door bucket (gated by coverage) ----------
+        if do_vision_blobs:
+            door_mask = (grid['vision'] == _BUCKET_DOOR)
+            door_blobs = _extract_blob_obbs(door_mask)
+            for (t_lo, t_hi, z_lo, z_hi, support) in door_blobs:
+                if support < config.min_support_vision_cells:
+                    continue
+                if _bbox_touches_corner(t_lo, t_hi, n_t, corner_cells):
+                    continue
+                (along_s, along_e, z_b, z_t,
+                 center_xy, center_z,
+                 w_m, h_m) = _bbox_to_world(
+                    p1, p2, t_lo, t_hi, z_lo, z_hi, res, floor_z)
+                wrange, hrange = _ranges_for_type(config, 'door')
+                if not (wrange[0] <= w_m <= wrange[1]):
+                    continue
+                if not (hrange[0] <= h_m <= hrange[1]):
+                    continue
+                bbox_cells = max((t_hi - t_lo + 1) * (z_hi - z_lo + 1), 1)
+                confidence = min(support / bbox_cells, 1.0)
+                per_wall.append({
+                    't_lo': t_lo, 't_hi': t_hi, 'z_lo': z_lo, 'z_hi': z_hi,
+                    'support': support,
+                    'otype': 'door',
+                    'source': ('vision+lidar' if pts_labels is not None
+                               else 'lidar'),
+                    'along_start': along_s, 'along_end': along_e,
+                    'z_bottom': z_b, 'z_top': z_t,
+                    'width_m': w_m, 'height_m': h_m,
+                    'center_xy': center_xy, 'center_z': center_z,
+                    'confidence': confidence,
+                    'temporal_vote_count': 0,
+                })
 
-        # --- Vision blobs: window/glass combined (bucket 2 or 4) ---
-        win_glass_mask = ((grid['vision'] == _BUCKET_WINDOW)
-                          | (grid['vision'] == _BUCKET_GLASS))
-        wg_blobs = _extract_blob_obbs(win_glass_mask)
-        for (t_lo, t_hi, z_lo, z_hi, support) in wg_blobs:
-            if support < config.min_support_vision_cells:
-                continue
-            if _bbox_touches_corner(t_lo, t_hi, n_t, corner_cells):
-                continue
-            # Classify within the blob.
-            tentative_type = 'window'
-            try:
-                b_class = _classify_blob_type(
-                    {'t_lo': t_lo, 't_hi': t_hi,
-                     'z_lo': z_lo, 'z_hi': z_hi}, grid, config)
-                if b_class == _BUCKET_GLASS:
-                    tentative_type = 'glass'
-            except Exception:
-                pass
-            (along_s, along_e, z_b, z_t,
-             center_xy, center_z,
-             w_m, h_m) = _bbox_to_world(
-                p1, p2, t_lo, t_hi, z_lo, z_hi, res, floor_z)
-            wrange, hrange = _ranges_for_type(config, tentative_type)
-            if not (wrange[0] <= w_m <= wrange[1]):
-                continue
-            if not (hrange[0] <= h_m <= hrange[1]):
-                continue
-            bbox_cells = max((t_hi - t_lo + 1) * (z_hi - z_lo + 1), 1)
-            confidence = min(support / bbox_cells, 1.0)
-            per_wall.append({
-                't_lo': t_lo, 't_hi': t_hi, 'z_lo': z_lo, 'z_hi': z_hi,
-                'support': support,
-                'otype': tentative_type,
-                'source': 'vision+lidar' if pts_labels is not None else 'lidar',
-                'along_start': along_s, 'along_end': along_e,
-                'z_bottom': z_b, 'z_top': z_t,
-                'width_m': w_m, 'height_m': h_m,
-                'center_xy': center_xy, 'center_z': center_z,
-                'confidence': confidence,
-            })
+        # --- Vision blobs: window/glass combined (bucket 2 or 4) ----
+        if do_vision_blobs:
+            win_glass_mask = ((grid['vision'] == _BUCKET_WINDOW)
+                              | (grid['vision'] == _BUCKET_GLASS))
+            wg_blobs = _extract_blob_obbs(win_glass_mask)
+            for (t_lo, t_hi, z_lo, z_hi, support) in wg_blobs:
+                if support < config.min_support_vision_cells:
+                    continue
+                if _bbox_touches_corner(t_lo, t_hi, n_t, corner_cells):
+                    continue
+                # Classify within the blob.
+                # M4b: prefer the temporal majority (votes raw points
+                # across all frames in vision_band) over single-cell
+                # argmax. Falls back to per-cell argmax when the vote
+                # count is below `temporal_vote_min_frames` — keeps tiny
+                # blobs at parity with M3 behavior.
+                blob_dict = {'t_lo': t_lo, 't_hi': t_hi,
+                             'z_lo': z_lo, 'z_hi': z_hi}
+                temporal_class, vote_count = _temporal_vote_blob_type(
+                    blob_dict, vision_band, res, floor_z,
+                    min_frames=config.temporal_vote_min_frames)
+                if temporal_class == 0:
+                    # Fallback: per-cell argmax.
+                    try:
+                        temporal_class = _classify_blob_type(
+                            blob_dict, grid, config)
+                    except Exception:
+                        temporal_class = _BUCKET_WINDOW
+                tentative_type = ('glass' if temporal_class == _BUCKET_GLASS
+                                  else 'window')
+                (along_s, along_e, z_b, z_t,
+                 center_xy, center_z,
+                 w_m, h_m) = _bbox_to_world(
+                    p1, p2, t_lo, t_hi, z_lo, z_hi, res, floor_z)
+                wrange, hrange = _ranges_for_type(config, tentative_type)
+                if not (wrange[0] <= w_m <= wrange[1]):
+                    continue
+                if not (hrange[0] <= h_m <= hrange[1]):
+                    continue
+                # M4b: picture-frame rejection. Small WINDOW-bucket blobs
+                # (≤0.5 m in both dims) that don't sit near a wall edge
+                # are almost always picture frames / wall art labelled
+                # `windowpane` by Mask2Former. Real interior windows are
+                # bigger; transoms/skylights typically touch a corner or
+                # the ceiling band (caught by the edge proximity below).
+                if (tentative_type == 'window'
+                        and w_m < config.picture_frame_max_size_m
+                        and h_m < config.picture_frame_max_size_m):
+                    edge_buf = max(config.corner_reject_m * 2, 0.20)
+                    touches_edge = ((along_s < edge_buf)
+                                    or (along_e > wall_length - edge_buf))
+                    if not touches_edge:
+                        if verbose:
+                            print(f"[Openings] wall {wall_idx} skipped "
+                                  f"picture-frame blob "
+                                  f"({w_m:.2f}x{h_m:.2f} m at "
+                                  f"t={along_s:.2f}-{along_e:.2f})")
+                        continue
+                bbox_cells = max((t_hi - t_lo + 1) * (z_hi - z_lo + 1), 1)
+                confidence = min(support / bbox_cells, 1.0)
+                per_wall.append({
+                    't_lo': t_lo, 't_hi': t_hi, 'z_lo': z_lo, 'z_hi': z_hi,
+                    'support': support,
+                    'otype': tentative_type,
+                    'source': ('vision+lidar' if pts_labels is not None
+                               else 'lidar'),
+                    'along_start': along_s, 'along_end': along_e,
+                    'z_bottom': z_b, 'z_top': z_t,
+                    'width_m': w_m, 'height_m': h_m,
+                    'center_xy': center_xy, 'center_z': center_z,
+                    'confidence': confidence,
+                    'temporal_vote_count': int(vote_count),
+                })
 
-        # --- Passages: empty-cell components ---
+        # --- Passages: empty-cell components (always run) -----------
         gap_comps = _extract_gap_components(
             grid['occupancy'], min_support=config.min_support_gap_cells,
             n_t=grid['n_t'], n_z=grid['n_z'])
@@ -790,6 +913,7 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                 'width_m': w_m, 'height_m': h_m,
                 'center_xy': center_xy, 'center_z': center_z,
                 'confidence': confidence,
+                'temporal_vote_count': 0,
             })
 
         # --- Dedup: vision blobs outrank gap passages on IoU > threshold ---
@@ -815,6 +939,22 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
         for cand in kept:
             ratio = _local_density_ratio(cand, grid, res,
                                           along_window_m=1.0)
+            # M4b density-ratio guard: vision blobs (door / window / glass)
+            # whose local density_ratio is None or below the floor are
+            # phantom regions — likely unscanned area at the wall edge
+            # being mis-interpreted as a closed opening. Passages
+            # deliberately have ratio≈0 and use their own adjacency rule
+            # in `_extract_gap_components`, so they're exempt.
+            if cand['otype'] != 'passage':
+                ratio_is_low = (ratio is None
+                                or (isinstance(ratio, (int, float))
+                                    and ratio < config.min_density_ratio_for_emit))
+                if ratio_is_low:
+                    if verbose:
+                        print(f"[Openings] wall {wall_idx} skipped "
+                              f"phantom blob "
+                              f"({cand['otype']}, ratio={ratio})")
+                    continue
             is_open = None
             transparent = False
             if cand['otype'] == 'door':
@@ -864,7 +1004,10 @@ def _detect_openings(walls, walls_meta, merged_pts, wall_labels, *,
                     p1, p2, cand['center_xy'], cand['center_z']),
                 source=cand['source'],
                 is_open=is_open, transparent=transparent,
-                transom_of=None, confidence=cand['confidence'])
+                transom_of=None, confidence=cand['confidence'],
+                temporal_vote_count=cand.get('temporal_vote_count', 0))
+            entry['density_ratio'] = (round(float(ratio), 4)
+                                      if ratio is not None else None)
             all_openings.append(entry)
             oid_counter += 1
 

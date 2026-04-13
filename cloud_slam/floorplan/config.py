@@ -44,6 +44,34 @@ class OpeningsConfig:
     open_threshold: float = 0.25                     # density_ratio < this → is_open True
     closed_threshold: float = 0.75                   # density_ratio > this → is_open False; between these → None (ambiguous "ajar")
     dedup_iou_threshold: float = 0.3                 # bbox IoU above which a vision blob and a gap component are merged (keep vision)
+    # M4b robustness knobs ------------------------------------------------
+    # Picture-frame rejection: window-bucket blobs smaller than this in
+    # BOTH dimensions are tested for wall-edge proximity — interior ones
+    # are rejected as pictures/wall art, not real windows. Scans of the
+    # 180411 bedroom produced 3 such false-positives at 0.21-0.33m x
+    # 0.30-0.42m; 0.5m is a safe upper bound that still admits small
+    # transoms and basement-window slot lites (which will typically sit
+    # at the ceiling edge and pass the edge-proximity check).
+    picture_frame_max_size_m: float = 0.5
+    # Per-wall lidar-coverage gate: when a wall's occupancy grid has
+    # coverage below this fraction, vision-based opening detection is
+    # skipped (but lidar gap detection still runs, since passages by
+    # definition are empty regions). Catches walls where camera coverage
+    # was poor — vision is less reliable on those anyway.
+    min_wall_coverage_for_vision: float = 0.05
+    # Density-ratio guard: vision blobs whose local density_ratio is None
+    # or below this floor are discarded as phantom regions (likely
+    # unscanned area at the wall edge being mis-interpreted as a
+    # "closed" opening). Applies to doors, windows, and glass — NOT
+    # passages (which deliberately have ratio≈0 and use their own
+    # adjacency rule).
+    min_density_ratio_for_emit: float = 0.15
+    # Glass/window temporal voting: the minimum number of accumulated
+    # wall_labels['xyz'] points (across frames) that must project into a
+    # blob region before we trust the temporal majority over the
+    # single-frame per-cell majority. Below this threshold, fall back to
+    # the existing per-cell argmax.
+    temporal_vote_min_frames: int = 3
 
 
 @dataclass(frozen=True)

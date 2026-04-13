@@ -620,6 +620,7 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                        vision_health=None,
                        time_sync_dts=None,
                        time_sync_dropped=0,
+                       poses=None,
                        verbose=True):
     """Extract a 2D floor plan from an in-memory point cloud.
 
@@ -866,6 +867,106 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
                 or raw_diag.get('solver_used') != 'noop'):
             stage8_diagnostics = raw_diag
 
+    # --- M4b: trajectory-containment polygon filter ---
+    # Build a convex hull of the SLAM trajectory XY + a 1 m buffer. Any
+    # wall whose midpoint falls OUTSIDE that buffered hull is almost
+    # certainly a phantom from an adjacent room seen through an open
+    # doorway — the scanner never physically occupied that region, so
+    # those walls cannot belong to the current room. The 1 m buffer is
+    # deliberately generous: trajectories rarely hug the room perimeter,
+    # so walls ~0.5-1.0 m outside the hull are still legitimate.
+    # Hard-coded (not exposed via config) because the rationale is
+    # geometric (trajectory extent + scanner reach), not per-scan.
+    excluded_walls_meta: list = []
+    # Skip entirely when `poses` wasn't supplied — back-compat with
+    # callers that don't have SLAM trajectory data (e.g. stand-alone
+    # floorplan calls on a pre-recorded PLY). Also skips on static
+    # scanners (fewer than 3 poses).
+    if (poses is not None
+            and hasattr(poses, '__len__') and len(poses) >= 3
+            and len(walls_d_clean) > 0):
+        try:
+            from scipy.spatial import ConvexHull as _ConvexHull
+            from shapely.geometry import (Polygon as _ShPoly,
+                                           Point as _ShPt)
+            pose_arr = np.asarray(
+                [np.asarray(p)[:3, 3] if np.asarray(p).ndim == 2
+                 else np.asarray(p)[:3] for p in poses],
+                dtype=float)
+            if pose_arr.ndim == 2 and pose_arr.shape[0] >= 3:
+                pose_xy = pose_arr[:, :2]
+                try:
+                    hull = _ConvexHull(pose_xy)
+                    hull_pts = pose_xy[hull.vertices]
+                    hull_polygon = _ShPoly(hull_pts).buffer(1.0)
+                except Exception:
+                    hull_polygon = None
+            else:
+                hull_polygon = None
+        except Exception as e:
+            if verbose:
+                print(f"  [trajectory-filter] hull build failed — "
+                      f"{type(e).__name__}: {e}")
+            hull_polygon = None
+
+        if hull_polygon is not None and not hull_polygon.is_empty:
+            try:
+                walls_in_room = []
+                walls_in_meta = []
+                walls_out = []
+                walls_out_meta = []
+                for wi, w in enumerate(walls_d_clean):
+                    p1, p2, _a, _l = w
+                    mid = ((np.asarray(p1, dtype=float)
+                            + np.asarray(p2, dtype=float)) / 2.0)
+                    if hull_polygon.contains(_ShPt(float(mid[0]),
+                                                    float(mid[1]))):
+                        walls_in_room.append(w)
+                        walls_in_meta.append(
+                            walls_d_meta_clean[wi] if wi < len(walls_d_meta_clean)
+                            else {'snapped_to': 'free',
+                                  'residual_m': 0.0, 'confidence': 0.0})
+                    else:
+                        walls_out.append(w)
+                        walls_out_meta.append(
+                            walls_d_meta_clean[wi] if wi < len(walls_d_meta_clean)
+                            else {})
+                if walls_out and len(walls_in_room) >= 3:
+                    # Only apply when at least 3 walls remain — refuse to
+                    # strip the whole room if the trajectory was unusually
+                    # short (e.g. scanner held static in a doorway).
+                    for w_out, m_out in zip(walls_out, walls_out_meta):
+                        p1, p2, a, l = w_out
+                        excluded_walls_meta.append({
+                            'p1': [round(float(p1[0]), 4),
+                                    round(float(p1[1]), 4)],
+                            'p2': [round(float(p2[0]), 4),
+                                    round(float(p2[1]), 4)],
+                            'angle_deg': round(float(a), 1),
+                            'length_m': round(float(l), 3),
+                            'reason': 'outside_trajectory_hull',
+                        })
+                    walls_d_clean = walls_in_room
+                    walls_d_meta_clean = walls_in_meta
+                    # Rebuild polygon from the in-room walls.
+                    try:
+                        corners_in = np.array([w[0] for w in walls_d_clean])
+                        poly_d = build_room_polygon(corners_in)
+                    except Exception:
+                        pass
+                    if verbose:
+                        print(f"  [trajectory-filter] excluded "
+                              f"{len(walls_out)} wall(s) outside "
+                              f"1 m-buffered trajectory hull")
+                elif walls_out and verbose:
+                    print(f"  [trajectory-filter] would exclude "
+                          f"{len(walls_out)} wall(s) but only "
+                          f"{len(walls_in_room)} would remain — skipped")
+            except Exception as e:
+                if verbose:
+                    print(f"  [trajectory-filter] skipped — "
+                          f"{type(e).__name__}: {e}")
+
     # --- Tier 1: per-wall vision type label on D_refined walls ---
     # Runs only when pts_labels was computed above (i.e. vision gave useful
     # signal). Attaches 'type' (the wall's dominant vision bucket) and
@@ -973,7 +1074,8 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         time_sync_dts=time_sync_dts,
         time_sync_dropped=time_sync_dropped,
         wall_frames_seen=wall_frames_seen,
-        secondary_ceiling_features=secondary_ceiling_features)
+        secondary_ceiling_features=secondary_ceiling_features,
+        excluded_walls=excluded_walls_meta)
     write_floorplan_metadata(meta, output_dir, name)
 
     if verbose:

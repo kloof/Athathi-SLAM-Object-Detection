@@ -322,6 +322,16 @@ def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean,
         entry['frames_seen_count'] = int(wall_frames_seen.get(idx, 0))
     else:
         entry['frames_seen_count'] = 0
+    # M4b: per-wall lidar-coverage fraction inside the (t, z) band. The
+    # openings detector writes this into each D_refined meta entry; other
+    # variants (no vision, no detector) default to 1.0 so consumers can
+    # read it unconditionally.
+    if (key == 'D_refined' and idx < len(walls_d_meta_clean)
+            and walls_d_meta_clean[idx] is not None):
+        entry['wall_band_coverage_pct'] = float(
+            walls_d_meta_clean[idx].get('wall_band_coverage_pct', 1.0))
+    else:
+        entry['wall_band_coverage_pct'] = 1.0
     return entry
 
 
@@ -336,7 +346,8 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               time_sync_dts=None,
                               time_sync_dropped=0,
                               wall_frames_seen=None,
-                              secondary_ceiling_features=None) -> dict:
+                              secondary_ceiling_features=None,
+                              excluded_walls=None) -> dict:
     """Assemble the floorplan metadata dict (pre-serialization).
 
     M0a additions (all strict superset — pre-existing keys unchanged):
@@ -438,6 +449,15 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
     meta['secondary_ceiling_features'] = (
         list(secondary_ceiling_features) if secondary_ceiling_features
         else [])
+
+    # M4b: trajectory-containment filter output. `excluded_walls` is the
+    # list of wall dicts that fell outside the buffered SLAM trajectory
+    # convex hull — typically next-room phantoms leaking in through an
+    # open doorway. Always emitted as a list so downstream consumers can
+    # unconditionally iterate. `walls_excluded_phantom` mirrors the count
+    # for quick consumption.
+    meta['excluded_walls'] = list(excluded_walls) if excluded_walls else []
+    meta['walls_excluded_phantom'] = len(meta['excluded_walls'])
 
     # M4a: scan_quality block. Always emitted — the helper fills in
     # nulls/zeros for missing signals so consumers see a total contract.

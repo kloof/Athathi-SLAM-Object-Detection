@@ -293,3 +293,183 @@ def test_passage_single_side_jamb():
         f"expected passage along_end ≥ 2.4, got {p['along_end']:.3f}")
     assert 0.5 < p['width_m'] < 3.0, (
         f"expected 0.5 < width < 3.0, got {p['width_m']:.3f}")
+
+
+# ---------------------------------------------------------------------
+# M4b: picture-frame rejection
+# ---------------------------------------------------------------------
+
+def test_picture_frame_rejected():
+    """A 0.3×0.3 m window-bucket blob in the middle of a 4 m wall should
+    be rejected as a picture frame — interior window-bucket blobs smaller
+    than `picture_frame_max_size_m` in BOTH dims that don't sit near the
+    wall edge are almost always wall art mis-classified as `windowpane`.
+    """
+    walls, meta = _single_wall(length=4.0)
+    wall_pts = _wall_cloud(length=4.0, density=500)
+    # Small picture-frame sized blob centered at t=2.0m, z=1.5m — well
+    # inside the 20 cm edge buffer on a 4 m wall.
+    frame = _sample_rect_on_wall(1.85, 2.15, 1.35, 1.65, density=600)
+    # Remove wall points in that window so the vision bucket actually
+    # wins per-cell majority.
+    mask = ~((wall_pts[:, 0] >= 1.85) & (wall_pts[:, 0] <= 2.15)
+             & (wall_pts[:, 2] >= 1.35) & (wall_pts[:, 2] <= 1.65))
+    wall_pts = wall_pts[mask]
+    xyz = np.concatenate([wall_pts, frame], axis=0)
+    labels = np.concatenate([
+        np.ones(len(wall_pts), dtype=np.uint8),        # wall
+        np.full(len(frame), 2, dtype=np.uint8),        # window bucket
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0)
+    # No window should survive — the frame is rejected by the
+    # picture-frame filter. Any other emission types are fine.
+    windows = [o for o in openings if o['type'] == 'window']
+    assert not windows, (
+        f"picture frame was not rejected: {[o['type'] for o in openings]}")
+
+
+def test_window_at_wall_edge_kept():
+    """A 0.3×0.3 m window-bucket blob near the wall edge IS a real
+    window — the picture-frame rejector only skips INTERIOR small
+    blobs. Edge-touching ones (within 20 cm of either wall end) pass.
+    """
+    walls, meta = _single_wall(length=4.0)
+    wall_pts = _wall_cloud(length=4.0, density=500)
+    # Blob touching the start edge — along_start ~= 0.05, along_end ~= 0.35
+    edge = _sample_rect_on_wall(0.05, 0.35, 1.35, 1.65, density=600)
+    mask = ~((wall_pts[:, 0] >= 0.05) & (wall_pts[:, 0] <= 0.35)
+             & (wall_pts[:, 2] >= 1.35) & (wall_pts[:, 2] <= 1.65))
+    wall_pts = wall_pts[mask]
+    xyz = np.concatenate([wall_pts, edge], axis=0)
+    labels = np.concatenate([
+        np.ones(len(wall_pts), dtype=np.uint8),
+        np.full(len(edge), 2, dtype=np.uint8),
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    # Custom config that widens the corner_reject window so the blob
+    # touching the edge isn't rejected by the corner filter — that's a
+    # separate concern from the picture-frame rejector.
+    from cloud_slam.floorplan.config import OpeningsConfig
+    cfg = OpeningsConfig(corner_reject_m=0.02)
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, config=cfg,
+        ceiling_z=2.5, floor_z=0.0)
+    windows = [o for o in openings if o['type'] == 'window']
+    assert windows, (
+        f"edge-touching window wrongly rejected: "
+        f"{[o['type'] for o in openings]}")
+
+
+# ---------------------------------------------------------------------
+# M4b: per-wall lidar-coverage gate
+# ---------------------------------------------------------------------
+
+def test_low_coverage_wall_skips_vision():
+    """A wall whose lidar occupancy is below `min_wall_coverage_for_vision`
+    should skip vision-blob detection — vision is unreliable on walls
+    the camera barely covered. Gap detection still runs (passages by
+    definition are empty regions).
+    """
+    from cloud_slam.floorplan.config import OpeningsConfig
+    walls, meta = _single_wall(length=4.0)
+    # Sparse scene: a thin horizontal line plus a small window-labeled
+    # rectangle — total occupancy deliberately under the default 5%
+    # threshold. Both elements are sparse (low density) so the blob
+    # still lands at low support.
+    sparse = _sample_rect_on_wall(0.0, 4.0, 1.20, 1.22, density=150)
+    blob = _sample_rect_on_wall(1.80, 2.20, 1.40, 1.55, density=150)
+    xyz = np.concatenate([sparse, blob], axis=0)
+    labels = np.concatenate([
+        np.ones(len(sparse), dtype=np.uint8),
+        np.full(len(blob), 2, dtype=np.uint8),    # window bucket
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    # Raise the coverage threshold well above this scene's actual
+    # coverage so the gate reliably fires regardless of exact point
+    # counts — this isolates the gate behavior from coverage-tuning
+    # noise in the synthetic scene.
+    cfg = OpeningsConfig(min_wall_coverage_for_vision=0.90,
+                         min_support_vision_cells=5)
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, config=cfg,
+        ceiling_z=2.5, floor_z=0.0)
+    # No vision-sourced opening should emit when coverage is below
+    # threshold.
+    vision = [o for o in openings if o.get('source') == 'vision+lidar']
+    assert not vision, (
+        f"low-coverage wall still emitted vision openings: "
+        f"{[(o['type'], o['source']) for o in openings]}")
+    # The per-wall meta should have wall_band_coverage_pct stamped.
+    assert 'wall_band_coverage_pct' in meta[0]
+    assert meta[0]['wall_band_coverage_pct'] < 0.90
+
+
+# ---------------------------------------------------------------------
+# M4b: density-ratio guard
+# ---------------------------------------------------------------------
+
+def test_phantom_density_rejected():
+    """A vision blob whose local density_ratio falls below
+    `min_density_ratio_for_emit` (or is None) is a phantom region —
+    unscanned wall area being mis-interpreted as a closed opening. The
+    detector must drop it before emission. Passages are exempt (they
+    deliberately have ratio≈0 and use their own adjacency rule).
+    """
+    walls, meta = _single_wall(length=4.0)
+    # Scene: door-bucket blob in an area with NO nearby wall lidar. The
+    # local neighborhood has zero density → ratio is None or very
+    # small → guard fires.
+    # Build a sparse wall only in the FAR end of the wall so the door
+    # blob at t=[1.5, 2.4] has no neighbors within ±1 m.
+    wall_far = _sample_rect_on_wall(3.3, 4.0, 0.0, 2.5, density=500)
+    door = _sample_rect_on_wall(1.5, 2.4, 0.0, 2.05, density=500)
+    xyz = np.concatenate([wall_far, door], axis=0)
+    labels = np.concatenate([
+        np.ones(len(wall_far), dtype=np.uint8),
+        np.full(len(door), 3, dtype=np.uint8),   # door bucket
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0)
+    for o in openings:
+        # Either the opening has a density_ratio ≥ 0.15, or it's a
+        # passage (gap-detected, which doesn't use the guard).
+        dr = o.get('density_ratio')
+        assert (dr is None and o['type'] == 'passage') or \
+               (dr is not None and dr >= 0.15) or \
+               o['type'] == 'passage', (
+            f"opening {o['type']} emitted with density_ratio={dr}")
+
+
+# ---------------------------------------------------------------------
+# M4b: temporal_vote_count populated on vision blobs
+# ---------------------------------------------------------------------
+
+def test_temporal_vote_count_populated():
+    """Every vision-emitted opening must carry a `temporal_vote_count`
+    ≥ 0 (0 for lidar-only passages, the accumulated point count
+    otherwise). Doors and windows should have positive vote counts
+    when labeled points fell in the blob.
+    """
+    walls, meta = _single_wall(length=4.0)
+    wall_pts = _wall_cloud(length=4.0, density=400)
+    door_pts = _sample_rect_on_wall(1.5, 2.4, 0.0, 2.05, density=500)
+    xyz = np.concatenate([wall_pts, door_pts], axis=0)
+    labels = np.concatenate([
+        np.ones(len(wall_pts), dtype=np.uint8),
+        np.full(len(door_pts), 3, dtype=np.uint8),
+    ])
+    wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
+    openings = _detect_openings(
+        walls=walls, walls_meta=meta, merged_pts=xyz,
+        wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0)
+    for o in openings:
+        assert 'temporal_vote_count' in o, (
+            f"opening missing temporal_vote_count: {o}")
+        assert o['temporal_vote_count'] >= 0

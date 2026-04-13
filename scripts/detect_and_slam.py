@@ -160,6 +160,18 @@ def main():
         wall_segmenter=wall_segmenter,
     )
 
+    # M4b: extract pose translations as an (N, 3) array up front. The
+    # subsequent R_level / R_align / RANSAC-leveler transforms rotate
+    # `merged` in place but leave `poses` (a list of 4x4 T_world_lidar)
+    # pointing at the raw SLAM frame. We need the pose XY to match the
+    # FINAL leveled-aligned frame of `merged` so the floorplan
+    # trajectory-containment filter compares apples to apples.
+    if poses is not None and len(poses) > 0:
+        _pose_xyz = np.asarray(
+            [np.asarray(p)[:3, 3] for p in poses], dtype=np.float64)
+    else:
+        _pose_xyz = np.zeros((0, 3), dtype=np.float64)
+
     t_total = time.time() - t0
 
     # --- M0c: per-scan calibration verification (must run BEFORE leveling) ---
@@ -315,6 +327,8 @@ def main():
                 wall_labels=wall_labels,
                 objects=objects,
             )
+            if _pose_xyz.shape[0] > 0:
+                _pose_xyz = _pose_xyz @ R_level.T
 
     # Align room to axes: detect wall direction on the LEVELED cloud
     from cloud_slam.room_structure import detect_room
@@ -339,6 +353,8 @@ def main():
                     wall_labels=wall_labels,
                     objects=objects,
                 )
+                if _pose_xyz.shape[0] > 0:
+                    _pose_xyz = _pose_xyz @ R_align.T
 
             # Re-snap object quaternions to the leveled+aligned Manhattan directions.
             # NOTE: yaw-snap is a *quaternion-only* operation that rebuilds each
@@ -412,6 +428,8 @@ def main():
             wall_labels=wall_labels,
             objects=objects,
         )
+        if _pose_xyz.shape[0] > 0:
+            _pose_xyz = (_pose_xyz @ R_level.T) + shift_vec
     except Exception as e:
         print(f"[WARNING] level.py post-process failed: {e}")
 
@@ -461,6 +479,12 @@ def main():
                          if wall_segmenter is not None else None)
         time_sync_dts = stats.get('time_sync_dts')
         time_sync_dropped = int(stats.get('time_sync_dropped', 0) or 0)
+        # M4b: forward SLAM trajectory poses so the floorplan stage can
+        # drop next-room "phantom" walls outside the buffered hull of the
+        # scanner's path. `_pose_xyz` was extracted from `poses` before
+        # leveling and rotated in lockstep with every transform applied
+        # to `merged` above — so its XY frame matches the final leveled
+        # + aligned cloud the floorplan stage operates on.
         _variants, fp_meta = generate_floorplan(
             merged,
             fp_out_dir,
@@ -472,6 +496,7 @@ def main():
             vision_health=vision_health,
             time_sync_dts=time_sync_dts,
             time_sync_dropped=time_sync_dropped,
+            poses=_pose_xyz,
             verbose=False,
         )
         v = fp_meta['variants']
