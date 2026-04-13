@@ -128,3 +128,22 @@ def test_rotation_and_translation_compose_for_lines():
     apply_transform_to_buffers(R, t, lines=lines)
     np.testing.assert_allclose(lines['start'][0], [10.0, 21.0, 30.0], atol=1e-9)
     np.testing.assert_allclose(lines['end'][0], [9.0, 20.0, 30.0], atol=1e-9)
+
+
+def test_per_frame_xyz_transformed():
+    """M4a addition: per_frame_xyz must rotate with merged + wall_labels."""
+    R = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=float)
+    t = np.array([10.0, 0.0, 0.0])
+    wall_labels = {
+        'xyz': np.array([[1.0, 0.0, 0.0]]),
+        'per_frame_xyz': [
+            np.array([[1.0, 0.0, 0.0]]),
+            np.array([[0.0, 1.0, 0.0]]),
+        ]
+    }
+    apply_transform_to_buffers(R, t, wall_labels=wall_labels)
+    np.testing.assert_allclose(wall_labels['xyz'][0], [10.0, 1.0, 0.0])
+    # First chunk: (1, 0, 0) -> (0, 1, 0) + (10, 0, 0) = (10, 1, 0)
+    np.testing.assert_allclose(wall_labels['per_frame_xyz'][0][0], [10.0, 1.0, 0.0])
+    # Second chunk: (0, 1, 0) -> (-1, 0, 0) + (10, 0, 0) = (9, 0, 0)
+    np.testing.assert_allclose(wall_labels['per_frame_xyz'][1][0], [9.0, 0.0, 0.0])

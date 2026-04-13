@@ -47,6 +47,10 @@ def apply_transform_to_buffers(
                      dtype is preserved by casting the intermediate to
                      float64 and back to the original dtype (current
                      pipeline uses float32 for wall_labels['xyz']).
+                     If a 'per_frame_xyz' key is present (M4a — list of
+                     per-frame (N_i, 3) chunks used by the per-wall
+                     camera-coverage counter), each chunk is rotated in
+                     lockstep so coverage is measured in a single frame.
         objects: optional iterable of dicts with 'center' (3-vec list/array)
                  and optional 'orientation.quaternion' (xyzw 4-vec). Updated
                  in place. Translation does not affect orientation.
@@ -75,6 +79,24 @@ def apply_transform_to_buffers(
             if t is not None:
                 rotated = rotated + np.asarray(t, dtype=np.float64)
             wall_labels['xyz'] = rotated.astype(orig_dtype)
+
+        # M4a: per-frame chunks must rotate in lockstep with merged +
+        # wall_labels['xyz'] so _compute_per_wall_frame_coverage measures
+        # distances within a single (leveled + axis-aligned) frame.
+        pfx = wall_labels.get('per_frame_xyz')
+        if pfx is not None:
+            transformed = []
+            for chunk in pfx:
+                if chunk is None or len(chunk) == 0:
+                    transformed.append(chunk)
+                    continue
+                chunk_arr = np.asarray(chunk, dtype=np.float64)
+                orig_chunk_dtype = chunk.dtype if hasattr(chunk, 'dtype') else np.float64
+                rotated_chunk = chunk_arr @ R.T
+                if t is not None:
+                    rotated_chunk = rotated_chunk + np.asarray(t, dtype=np.float64)
+                transformed.append(rotated_chunk.astype(orig_chunk_dtype))
+            wall_labels['per_frame_xyz'] = transformed
 
     if objects is not None:
         t_arr = None if t is None else np.asarray(t, dtype=np.float64)
