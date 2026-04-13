@@ -241,23 +241,55 @@ def test_opening_schema_keys_complete():
 # ---------------------------------------------------------------------
 
 def test_passage_single_side_jamb():
-    """A loft-style passage where one vertical edge is flush with a
-    stub-wall should still emit a passage (single-side-jamb rule)."""
+    """A loft-style passage with a stub wall on one vertical side
+    should be detected via the single-side-jamb rule.
+
+    Geometry (all on the y=0 wall of length 4.0 m, grid res 0.03 m):
+      - Left solid block:  t=[0.0, 1.2], z=[0.0, 2.5]  (dense wall)
+      - Stub-wall jamb:    t=[2.5, 2.6], z=[0.0, 2.5]  (dense vertical
+        column, ~33 cells tall — exceeds the 30-cell single-side threshold)
+      - Right open region: t=[2.6, 4.0], z=[0.0, 2.5]  (NO points — open)
+      - Passage gap:       t=[1.2, 2.5], z=[0.0, 2.5]  (NO points)
+
+    With a baseline floor-ceiling band on t=[0, 4] the passage + the
+    open-right region coalesce into one connected empty component. To
+    guarantee the passage lands fully inside the corner buffer (t ∈
+    [0.12, 3.88]), we include a dense floor baseline that fences the
+    component bottom and a dense ceiling baseline that fences the top,
+    while leaving the wall interior open on the right past the stub.
+
+    The stub column provides ≥30 adjacent cells along the passage's
+    right vertical edge, satisfying the single-side-jamb rule even
+    though perimeter-adjacent fraction would otherwise be low.
+    """
     walls, meta = _single_wall(length=4.0)
-    # Solid wall block on the left half only: t=[0, 2.0], z=[0, 2.5].
-    left_wall = _sample_rect_on_wall(0.0, 2.0, 0.0, 2.5, density=600)
-    # Right half t=[2.0, 4.0] is an open passage, no points.
-    xyz = left_wall
+    # Dense left block (the main wall up to the passage).
+    left_wall = _sample_rect_on_wall(0.0, 1.2, 0.0, 2.5, density=500)
+    # Stub-wall vertical column at t=[2.5, 2.6] — ~33 grid cells tall,
+    # sitting entirely inside the 4m wall (t ∈ [0.12, 3.88] corner window).
+    stub_wall = _sample_rect_on_wall(2.5, 2.6, 0.0, 2.5, density=700)
+    # Floor + ceiling baselines so the empty region is bounded above
+    # and below (otherwise a single baseline-less cell would still
+    # connect the passage to unrelated empty space).
+    floor_line = _sample_rect_on_wall(2.6, 4.0, 0.0, 0.03, density=500)
+    ceiling_line = _sample_rect_on_wall(2.6, 4.0, 2.47, 2.5, density=500)
+    xyz = np.concatenate(
+        [left_wall, stub_wall, floor_line, ceiling_line], axis=0)
     labels = np.ones(len(xyz), dtype=np.uint8)   # bucket 1 = wall
     wall_labels = {'xyz': xyz.astype(np.float32), 'labels': labels}
     openings = _detect_openings(
         walls=walls, walls_meta=meta, merged_pts=xyz,
         wall_labels=wall_labels, ceiling_z=2.5, floor_z=0.0)
     passages = [o for o in openings if o['type'] == 'passage']
-    # The empty half spans t=[2.0, 4.0] but the far right touches the
-    # wall end (within corner_reject_m) — the detector reject for corner
-    # artifacts would trim it. Accept either: zero (corner-trimmed) or
-    # exactly one passage landing entirely inside the wall.
-    if passages:
-        p = passages[0]
-        assert p['along_start'] >= 1.8  # near the stub-wall boundary
+    # Non-conditional assertion: this scene MUST produce at least one
+    # passage; the gap is entirely inside the corner buffer and the stub
+    # column supplies the single-side jamb.
+    assert len(passages) >= 1, (
+        f"expected ≥1 passage, got 0 / {[o['type'] for o in openings]}")
+    p = passages[0]
+    assert 1.0 < p['along_start'] < 1.4, (
+        f"expected passage along_start ≈ 1.2, got {p['along_start']:.3f}")
+    assert p['along_end'] >= 2.4, (
+        f"expected passage along_end ≥ 2.4, got {p['along_end']:.3f}")
+    assert 0.5 < p['width_m'] < 3.0, (
+        f"expected 0.5 < width < 3.0, got {p['width_m']:.3f}")

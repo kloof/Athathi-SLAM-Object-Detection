@@ -403,8 +403,28 @@ def _local_density_ratio(blob, grid, res, along_window_m=1.0):
     """Compute density_ratio = blob mean density / local mean density.
 
     Local window: ±along_window_m along t, full wall height in z.
-    Excludes the blob itself and cells whose vision bucket is 'other'
-    (the remap already folds radiator/cabinet/fireplace/picture into 0).
+    Excludes the blob itself plus an approximate clutter mask.
+
+    Clutter exclusion (Approach B — spec H/25):
+        The spec calls for excluding radiator/cabinet/fireplace/picture
+        cells from the denominator, but the current 5-bucket vision remap
+        folds all of those ADE20K classes into bucket 0 ("other"). We
+        therefore can't identify them directly from the grid's vision
+        layer.
+
+        Instead we use a density-based heuristic: within the local
+        window (excluding the blob), drop the densest 10% of cells.
+        Wall-mounted clutter (radiators, cabinets, fireplaces,
+        picture frames) typically returns well above the bare-wall
+        density baseline, so the 90th-percentile cap brings the
+        denominator back toward the true wall density.
+
+        Limitation: this is a defensible proxy, not a class-based
+        filter. If the window contains ≤10 cells after blob removal
+        we skip the cap (percentile on a tiny sample would be noisy).
+        A future cleanup could extend wall_segmenter.py to expose the
+        underlying ADE20K classes and restore the spec's literal
+        class-based exclusion.
     """
     t_lo, t_hi = blob['t_lo'], blob['t_hi']
     z_lo, z_hi = blob['z_lo'], blob['z_hi']
@@ -420,16 +440,19 @@ def _local_density_ratio(blob, grid, res, along_window_m=1.0):
     t_end = min(n_t, t_hi + 1 + win_cells)
     win_mask = np.zeros((n_t, n_z), dtype=bool)
     win_mask[t_start:t_end, :] = True
-    # Exclude blob + clutter (other-bucket) cells — keep wall-like classes
-    # and unlabeled-background cells.
-    clutter_mask = np.zeros_like(win_mask)
-    # Vision==0 are "no vote". We still include those in the denominator
-    # (they're most of the wall), but any cells with wall-like bucket
-    # that happen to be inside the blob window AND outside the blob stay
-    # in. The exclusion list (radiator etc.) was remapped to bucket 0,
-    # which we KEEP in denominator to avoid a near-empty denominator.
-    # So the only exclusion is the blob itself.
-    denom_mask = win_mask & ~blob_mask & ~clutter_mask
+
+    base_mask = win_mask & ~blob_mask
+
+    # Approximate clutter exclusion: drop the densest 10% of cells in the
+    # window (see docstring — proxy for radiator/cabinet/fireplace/picture).
+    if int(base_mask.sum()) > 10:
+        densities_in_window = grid['density'][base_mask]
+        cap = float(np.percentile(densities_in_window, 90))
+        clutter_mask = (grid['density'] > cap) & base_mask
+        denom_mask = base_mask & ~clutter_mask
+    else:
+        denom_mask = base_mask
+
     denom = grid['density'][denom_mask]
     local_density = float(denom.mean()) if denom.size > 0 else 0.0
     if local_density <= 1e-9:
