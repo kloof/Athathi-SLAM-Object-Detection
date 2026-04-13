@@ -24,3 +24,37 @@ def test_opening_required_keys_has_18():
 
 def test_opening_types_has_4():
     assert OPENING_TYPES == frozenset({"door", "window", "glass", "passage"})
+
+
+def test_vote_room_category_empty():
+    from cloud_slam.floorplan.schema import _vote_room_category
+    assert _vote_room_category({}) == ("unknown", 0.0, "unavailable")
+    assert _vote_room_category(None) == ("unknown", 0.0, "unavailable")
+
+
+def test_vote_room_category_clean_win():
+    from cloud_slam.floorplan.schema import _vote_room_category
+    cat, conf, src = _vote_room_category({7: 1000, 23: 50})  # bed dominates
+    assert cat == "bedroom"
+    assert conf > 0.9
+    assert src == "ade20k_vote"
+
+
+def test_vote_room_category_below_threshold():
+    from cloud_slam.floorplan.schema import _vote_room_category
+    # 5 equally-weighted signatures each get 20% — below 40% threshold
+    counts = {7: 100, 23: 100, 37: 100, 50: 100, 65: 100}
+    cat, conf, src = _vote_room_category(counts)
+    assert cat == "unknown"
+    assert conf <= 0.4
+    assert src == "ade20k_vote"
+
+
+def test_wall_uuid_determinism():
+    from cloud_slam.floorplan.schema import _wall_uuid
+    # Same geometry → same UUID
+    assert _wall_uuid([0.0, 0.0], [1.0, 1.0]) == _wall_uuid([0.0, 0.0], [1.0, 1.0])
+    # Different geometry → different UUID
+    assert _wall_uuid([0.0, 0.0], [1.0, 1.0]) != _wall_uuid([0.0, 0.0], [1.0, 2.0])
+    # 32 hex chars
+    assert len(_wall_uuid([0.0, 0.0], [1.0, 1.0])) == 32

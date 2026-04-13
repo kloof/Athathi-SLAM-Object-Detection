@@ -1,4 +1,4 @@
-"""Validates the SCHEMA_VERSION constant introduced in M0d (will be bumped by later milestones)."""
+"""Validates the SCHEMA_VERSION constant introduced as 2.0 baseline in M0a (will be bumped by later milestones)."""
 from cloud_slam.floorplan import SCHEMA_VERSION
 
 

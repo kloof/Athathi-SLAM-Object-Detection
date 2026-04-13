@@ -47,19 +47,21 @@ _DEFAULT_WALL_THICKNESS_M = 0.1
 # --- ADE20K → room-category vote table (M0a room classifier) ---
 #
 # Signature object classes in ADE20K-150 that disambiguate interior spaces.
-# Majority vote across the whole scan; winner must exceed a 0.4 fraction
-# of the total signature-class votes or we emit "unknown". Ignores all
+# Majority vote across the whole scan; the winner's share must strictly
+# exceed `_ROOM_MIN_CONFIDENCE` or we emit "unknown". Ignores all
 # background clutter (floor, wall, cabinet etc.) — only the signatures
-# listed here contribute.
+# listed here contribute. Returns "unknown" when the winner's share does
+# not exceed this fraction (strictly greater than is required).
 _ADE_ROOM_SIGNATURES = {
     # bedroom
     7:   "bedroom",      # bed
     # livingroom
     23:  "livingroom",   # sofa
-    31:  "livingroom",   # armchair (ADE20K "armchair")
+    30:  "livingroom",   # armchair (ADE20K "armchair")
     # kitchen
     50:  "kitchen",      # refrigerator
-    71:  "kitchen",      # stove/oven
+    71:  "kitchen",      # stove
+    118: "kitchen",      # oven
     124: "kitchen",      # microwave
     # bathroom
     37:  "bathroom",     # bathtub
@@ -68,10 +70,12 @@ _ADE_ROOM_SIGNATURES = {
     15:  "diningroom",   # table / dining_table
 }
 
+# Returns "unknown" when the winner's share does not exceed this
+# fraction (strictly greater than is required).
 _ROOM_MIN_CONFIDENCE = 0.4
 
 
-def _wall_uuid(p1, p2):
+def _wall_uuid(p1, p2) -> str:
     """Deterministic MD5-hex UUID for a wall's geometry.
 
     Rounding to 4 decimals (0.1 mm) before hashing ensures two runs on
@@ -83,15 +87,16 @@ def _wall_uuid(p1, p2):
     return hashlib.md5(s.encode()).hexdigest()
 
 
-def _vote_room_category(ade_class_counts):
+def _vote_room_category(ade_class_counts) -> tuple[str, float, str]:
     """Aggregate ADE20K class histogram → (category, confidence, source).
 
     ade_class_counts: dict[int, int] — ADE20K class id → total pixel count
                       across the scan. Only the signature classes in
                       `_ADE_ROOM_SIGNATURES` are considered.
 
-    Returns ("unknown", 0.0, "ade20k_vote") when no signature class crosses
-    the `_ROOM_MIN_CONFIDENCE` fraction; returns
+    Returns ("unknown", 0.0, "ade20k_vote") when no signature class
+    strictly exceeds the `_ROOM_MIN_CONFIDENCE` fraction (i.e. equality at
+    the threshold is treated as "unknown"); returns
     ("unknown", 0.0, "unavailable") when ade_class_counts is None/empty.
     """
     if not ade_class_counts:
@@ -109,12 +114,12 @@ def _vote_room_category(ade_class_counts):
 
     winner, winner_votes = category_votes.most_common(1)[0]
     confidence = winner_votes / total
-    if confidence < _ROOM_MIN_CONFIDENCE:
+    if confidence <= _ROOM_MIN_CONFIDENCE:
         return "unknown", float(round(confidence, 3)), "ade20k_vote"
     return winner, float(round(confidence, 3)), "ade20k_vote"
 
 
-def _build_calibration_block(calibration_info):
+def _build_calibration_block(calibration_info) -> dict:
     """Build the `calibration` root block.
 
     calibration_info: optional dict with keys
@@ -184,8 +189,14 @@ def _build_variant_wall_entry(idx, wall_tuple, key, walls_d_meta_clean,
         if 'features' in m:
             entry['features'] = m['features']
     elif key == 'D_refined':
-        # Fell back to A_natural — meta is None
+        # Fell back to A_natural — meta is None. Populate the same set of
+        # numeric keys with neutral values so downstream consumers can
+        # iterate D_refined entries without checking for missing keys.
+        # `type` / `features` remain absent (fallback has no vision info).
         entry['snapped_to'] = 'fallback_a'
+        entry['residual_m'] = 0.0
+        entry['confidence'] = 0.0
+        entry['length_m_data_extent'] = entry['length_m']
     return entry
 
 
@@ -193,7 +204,7 @@ def build_floorplan_metadata(*, n_raw, pts, floor_z, ceiling_z, h, n_removed,
                               corner_coords_real, variants, walls_d_meta_clean,
                               vision_stats, elapsed,
                               calibration_info=None,
-                              ade_class_counts=None):
+                              ade_class_counts=None) -> dict:
     """Assemble the floorplan metadata dict (pre-serialization).
 
     M0a additions (all strict superset — pre-existing keys unchanged):

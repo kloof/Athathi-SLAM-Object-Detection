@@ -185,6 +185,16 @@ class WallSegmenter:
         """
         return dict(self._ade_class_counts)
 
+    def reset_ade_class_counts(self) -> None:
+        """Clear the accumulated ADE20K per-class counts.
+
+        Call between scans if reusing a WallSegmenter instance across
+        multiple scan pipelines (e.g., in a long-running service). The
+        CLI does not need to call this — each `detect_and_slam.py`
+        invocation creates a fresh segmenter.
+        """
+        self._ade_class_counts.clear()
+
     # ------------------------------------------------------------------
     # ADE20K → 5-bucket remap
     # ------------------------------------------------------------------
