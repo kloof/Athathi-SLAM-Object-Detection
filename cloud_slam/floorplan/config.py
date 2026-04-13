@@ -23,7 +23,7 @@ class Stage8Config:
     weight_clamp_ratio: float = 10.0                 # cap the max-over-min corner-weight ratio to prevent a single weak corner absorbing all of Δ
     adjacent_snap_reject_deg: float = 10.0           # reject snap if two adjacent walls' snapped directions are within this angle (degenerate)
     kkt_cond_threshold: float = 1e10                 # condition number above which the KKT system is considered ill-conditioned; falls back to SLSQP
-    max_demotions: int = 20                          # upper bound on demotion cascade iterations (safety)
+    max_demotions: int = 20                          # upper bound on demotion cascade iterations (safety). Most floorplans have 4-12 walls; 20 is ~1.5-2x that upper bound — deliberate headroom, not a hot-tuned knob.
 
 
 @dataclass(frozen=True)

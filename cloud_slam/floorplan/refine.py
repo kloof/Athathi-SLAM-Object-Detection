@@ -1276,7 +1276,9 @@ def _stage8_solve_kkt(walls, meta, corners, delta, weights, cond_threshold):
             # Stage 5 / Stage 7 must not rotate the snap.
             perp = _stage8_snap_perp(walls[i])     # (2,)
             row = np.zeros(2 * n, dtype=np.float64)
-            # Coefficients of c_{i+1} minus c_i projected on perp.
+            # Snap constraint: (c_{i+1} - c_i) · n_i = 0. Fixes DIRECTION
+            # of the wall, NOT its offset — classical Compass Rule
+            # convention. See docstring "Formulation note" above.
             row[2 * i:2 * i + 2] = -perp
             row[2 * ((i + 1) % n):2 * ((i + 1) % n) + 2] = perp
             A_rows.append(row)
@@ -1444,6 +1446,25 @@ def _stage8_polygon_closure(walls, meta, *, config=None,
     lengths. We substitute inverse-confidence weighting — this is no
     longer the classical technique but a principled variant for
     sparse-lidar floorplans where some walls have weaker support.
+
+    Formulation note — what "wall direction fixed" means:
+
+      Each snapped wall adds ONE equality row `(c_{i+1} - c_i) · n_i = 0`,
+      where n_i is the perpendicular to the wall's snapped direction. This
+      fixes the wall's DIRECTION but leaves the wall free to translate
+      perpendicular to itself. A 4-wall Manhattan rectangle therefore has
+      4 DoF (width, height, x-offset, y-offset), not zero.
+
+      This matches the classical Compass Rule / Bowditch adjustment in
+      surveying: wall azimuths are preserved while endpoints shift to
+      distribute closure error. It is also the only formulation in which
+      Stage 8 does useful work on Manhattan-heavy polygons — fixing wall
+      offsets too would make every Manhattan input rank-deficient and
+      force cascade-to-fallback.
+
+      Polygon closure is enforced implicitly by expressing each wall as
+      (c_i, c_{i+1 mod N}) — the ring telescopes so Σ (c_{i+1} - c_i) = 0
+      automatically.
 
     Args:
         walls: list of (p1, p2, angle_deg, length_m) tuples (the

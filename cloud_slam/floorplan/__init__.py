@@ -705,6 +705,16 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         # Always compute diagnostics internally — they're <100 floats and
         # the orchestrator decides whether to surface them. This also keeps
         # the no-op / non-no-op dispatch below a pure metadata decision.
+        #
+        # IMPORTANT behavioral fact (M1a): walls_d_clean is ALWAYS a closed
+        # polygon in the current pipeline because it comes from
+        # extract_walls(poly_d), where poly_d is a Shapely Polygon that
+        # closes its ring automatically. |Δ| is therefore below the no-op
+        # threshold on every real input today, and Stage 8 short-circuits
+        # to a no-op by construction. The solver becomes non-trivial only
+        # when M2 (DeepLSD line anchors) supplies endpoint-drifted walls
+        # that do NOT close perfectly — we wire the solver in now so that
+        # work is ready, and keep --no-stage8 as a regression escape hatch.
         walls_d_clean, raw_diag = _stage8_polygon_closure(
             walls_d_clean, walls_d_meta_clean,
             config=Stage8Config(),
