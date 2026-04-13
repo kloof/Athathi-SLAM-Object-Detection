@@ -1,4 +1,8 @@
-"""Validates the SCHEMA_VERSION constant introduced as 2.0 baseline in M0a (will be bumped by later milestones)."""
+"""Validates the SCHEMA_VERSION constant.
+
+M0a introduced the 2.0 baseline; M3 bumped to 2.1 when D_refined.openings
+(doors / windows / glass / passages) joined the per-variant walls list.
+"""
 from cloud_slam.floorplan import SCHEMA_VERSION
 
 
@@ -14,5 +18,7 @@ def test_schema_version_is_2_0_or_higher():
     )
 
 
-def test_schema_version_is_2_0():
-    assert SCHEMA_VERSION == "2.0"
+def test_schema_version_is_2_1():
+    """M3 bumped the schema version to 2.1 — the JSON now emits
+    D_refined.openings alongside D_refined.walls."""
+    assert SCHEMA_VERSION == "2.1"
