@@ -4,10 +4,10 @@ Runs WallSegmenter (the same Mask2Former wall-typing head used by the
 main pipeline) on every image from an MCAP scan, overlays the 5-bucket
 color map on the original frame, and writes an MP4.
 
-5-bucket colors:
+5-bucket colors (matches cloud_slam.wall_segmenter.BUCKET_NAMES order):
     wall   = blue      (bucket 1)
-    door   = yellow    (bucket 2)
-    window = cyan      (bucket 3)
+    window = cyan      (bucket 2)
+    door   = yellow    (bucket 3)
     glass  = magenta   (bucket 4)
     other  = transparent (bucket 0 — shows original pixels through)
 
@@ -28,19 +28,26 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cloud_slam.mcap_reader import read_mcap
+from cloud_slam.wall_segmenter import BUCKET_NAMES as _SEG_BUCKET_NAMES
 from cloud_slam.wall_segmenter import WallSegmenter
 
 
-# Bucket → BGR (cv2 uses BGR order).
+# Mirror the segmenter's canonical ordering verbatim. Importing the
+# tuple directly from wall_segmenter means the legend can never drift
+# from what the pipeline actually produces — any future change to the
+# bucket order over there propagates here automatically.
+BUCKET_NAMES = dict(enumerate(_SEG_BUCKET_NAMES))
+# Expected: {0: 'other', 1: 'wall', 2: 'window', 3: 'door', 4: 'glass'}
+
+# Bucket → BGR (cv2 uses BGR order). Keyed by the integer bucket id so
+# the color-to-name association comes from the BUCKET_NAMES dict above.
 BUCKET_COLORS = {
     0: None,                 # 'other' — transparent, keep original
-    1: (200, 70, 40),        # 'wall' — blue
-    2: (40, 200, 240),       # 'door' — yellow
-    3: (220, 220, 40),       # 'window' — cyan
-    4: (200, 60, 200),       # 'glass' — magenta
+    1: (200, 70, 40),        # 'wall'   — blue
+    2: (220, 220, 40),       # 'window' — cyan
+    3: (40, 200, 240),       # 'door'   — yellow
+    4: (200, 60, 200),       # 'glass'  — magenta
 }
-
-BUCKET_NAMES = {0: 'other', 1: 'wall', 2: 'door', 3: 'window', 4: 'glass'}
 
 
 def overlay_mask(image_bgr: np.ndarray, mask: np.ndarray, alpha: float) -> np.ndarray:
