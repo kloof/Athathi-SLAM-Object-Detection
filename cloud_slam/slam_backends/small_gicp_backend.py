@@ -50,11 +50,23 @@ class SmallGICPBackend:
         self.registration_type = registration_type
 
     def _voxel_down(self, xyz: np.ndarray, voxel: float) -> np.ndarray:
+        """Voxel-downsample keeping the MOST RECENT point per voxel.
+
+        Reversing the input before np.unique makes np.unique's
+        "first-occurrence-in-sort" behavior pick the highest original
+        index (= most-recently-inserted) for each voxel. Preserving the
+        returned index order keeps the rolling-map eviction policy
+        temporal: the tail of the array is the newest observations.
+        """
         if len(xyz) == 0:
             return xyz
-        keys = np.floor(xyz / voxel).astype(np.int64)
+        reversed_xyz = xyz[::-1]
+        keys = np.floor(reversed_xyz / voxel).astype(np.int64)
         _, first_idx = np.unique(keys, axis=0, return_index=True)
-        return xyz[np.sort(first_idx)]
+        # Recover original indices, then sort ascending so the array
+        # remains temporally ordered (oldest first, newest last).
+        original_idx = len(xyz) - 1 - first_idx
+        return xyz[np.sort(original_idx)]
 
     def run(self,
             clouds: list[tuple[float, np.ndarray, np.ndarray]],

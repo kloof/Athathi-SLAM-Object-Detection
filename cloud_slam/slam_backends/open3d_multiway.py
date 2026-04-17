@@ -101,7 +101,14 @@ class Open3DMultiwayBackend:
         pose_graph.nodes.append(
             o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
 
-        # Odometry edges (source=i-1, target=i).
+        # Odometry edges. register_icp returns T mapping source→target
+        # (i.e. T_target_from_source); Open3D's PoseGraphEdge expects its
+        # `transformation` in the same convention. Here source=pcds[i],
+        # target=pcds[i-1], so T_rel = T_(i-1)_from_i — the node IDs must
+        # match that direction (source_node_id=i, target_node_id=i-1).
+        # World pose accumulation uses T_rel directly: poses[i] =
+        # poses[i-1] @ T_rel since poses[i-1] = T_world_from_(i-1) and
+        # T_rel = T_(i-1)_from_i, giving T_world_from_i.
         for i in range(1, n):
             T_rel, info, fitness = _register_pair(
                 pcds[i], pcds[i - 1], self.voxel)
@@ -111,8 +118,8 @@ class Open3DMultiwayBackend:
                 o3d.pipelines.registration.PoseGraphNode(T_world))
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    source_node_id=i - 1,
-                    target_node_id=i,
+                    source_node_id=i,
+                    target_node_id=i - 1,
                     transformation=T_rel,
                     information=info,
                     uncertain=False))
@@ -127,10 +134,13 @@ class Open3DMultiwayBackend:
                     pcds[src], pcds[tgt], self.voxel, T_init=T_init)
                 if fitness < self.loop_min_fitness:
                     continue
+                # _register_pair(pcds[src], pcds[tgt]) returns
+                # T_tgt_from_src (maps src→tgt), so source_node_id=src
+                # and target_node_id=tgt.
                 pose_graph.edges.append(
                     o3d.pipelines.registration.PoseGraphEdge(
-                        source_node_id=tgt,
-                        target_node_id=src,
+                        source_node_id=src,
+                        target_node_id=tgt,
                         transformation=T_rel,
                         information=info,
                         uncertain=True))
