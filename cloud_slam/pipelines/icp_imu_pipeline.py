@@ -36,7 +36,8 @@ def register_scan_to_map(scan, map_cloud, T_init, voxel_size=0.1):
     return result.transformation, result.fitness > 0.1
 
 
-def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callback=None):
+def run(clouds, imus, voxel_size=0.005, images=None, calib=None,
+        per_frame_callback=None, deskew=True):
     """
     Process point cloud frames with ICP + IMU.
 
@@ -48,6 +49,8 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
         calib: dict from colorizer.load_calibration() or None
         per_frame_callback: optional callable(frame_idx, stamp, xyz, pose, image)
             Called after each frame's pose is computed. image may be None.
+        deskew: if True (default), undo intra-scan rotation via IMU gyro
+            before ICP and accumulation. Disable for A/B testing.
 
     Returns:
         merged: Open3D PointCloud (with colors if images+calib provided)
@@ -56,8 +59,9 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
     """
     t0 = time.time()
 
-    imu_times = np.array([t for t, _, _ in imus])
-    imu_gyro = np.array([g for _, g, _ in imus])
+    imu_times = np.array([t for t, _, _ in imus]) if imus else np.array([])
+    imu_gyro = np.array([g for _, g, _ in imus]) if imus else np.zeros((0, 3))
+    has_imu = len(imu_times) > 0
 
     # Build image timestamp index for color projection or callback
     need_images = images is not None and calib is not None and len(images) > 0
@@ -66,7 +70,7 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
         import cv2
         image_timestamps = np.array([t for t, _, _ in images]) if images else np.array([])
     if do_color:
-        from cloud_slam.colorizer import colorize_cloud, match_nearest_image
+        from cloud_slam.colorizer import colorize_cloud_per_point, match_nearest_image
         color_match_count = 0
 
     merged = o3d.geometry.PointCloud()
@@ -78,24 +82,44 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
     map_update_interval = 5
 
     for i, (stamp, xyz, timestamps) in enumerate(clouds):
-        scan = o3d.geometry.PointCloud()
-        scan.points = o3d.utility.Vector3dVector(xyz)
+        # Per-point absolute timestamps for per-point colorization / deskew.
+        point_timestamps_abs = stamp + np.asarray(timestamps, dtype=np.float64) \
+            if len(timestamps) else np.array([])
 
-        # Decode camera image if needed for color or callback
+        # Per-point colorization BEFORE deskew — colors are per-index and
+        # survive the rotation applied by deskew_scan.
+        if do_color and len(point_timestamps_abs) > 0:
+            colors = colorize_cloud_per_point(
+                xyz, point_timestamps_abs, images, image_timestamps, calib)
+            colored_mask = np.any(colors != np.array([0.5, 0.5, 0.5]), axis=1)
+            if colored_mask.any():
+                color_match_count += 1
+        else:
+            colors = None
+
+        # Deskew: rotate every point back to scan-end reference using
+        # IMU gyro integration. Pure rotation, so colors stay valid.
+        xyz_proc = xyz
+        if deskew and has_imu and len(timestamps) > 0:
+            from cloud_slam.deskew import deskew_scan
+            xyz_proc = deskew_scan(xyz, timestamps, stamp,
+                                   imu_times, imu_gyro, reference="end")
+
+        scan = o3d.geometry.PointCloud()
+        scan.points = o3d.utility.Vector3dVector(xyz_proc)
+        if colors is not None:
+            scan.colors = o3d.utility.Vector3dVector(colors)
+
+        # Decode nearest image for per_frame_callback only (scan coloring
+        # is per-point above; the callback still expects one image).
         decoded_image = None
-        if (do_color or per_frame_callback) and len(image_timestamps) > 0:
+        if per_frame_callback is not None and len(image_timestamps) > 0:
             from cloud_slam.colorizer import match_nearest_image
             img_idx = match_nearest_image(stamp, image_timestamps)
             if img_idx is not None:
                 _, compressed_bytes, _ = images[img_idx]
                 img_arr = np.frombuffer(compressed_bytes, dtype=np.uint8)
                 decoded_image = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
-
-        # Colorize from camera if available
-        if do_color and decoded_image is not None:
-            colors = colorize_cloud(xyz, decoded_image, calib)
-            scan.colors = o3d.utility.Vector3dVector(colors)
-            color_match_count += 1
 
         if len(scan.points) < 10:
             poses.append(T_current.copy())

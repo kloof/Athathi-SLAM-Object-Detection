@@ -5,6 +5,9 @@ Projects camera images onto lidar point clouds using calibrated
 extrinsics (lidar→camera) and intrinsics to produce colored point clouds.
 """
 
+from typing import List, Tuple
+
+import cv2
 import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
@@ -116,5 +119,79 @@ def colorize_cloud(xyz, image, calib, default_color=(128, 128, 128)):
     idx_front = np.where(in_front)[0]
     idx_visible = idx_front[in_bounds]
     colors[idx_visible] = rgb
+
+    return colors
+
+
+def _match_nearest_image_vectorized(point_timestamps_abs, image_timestamps,
+                                    max_dt):
+    """Vectorized version of match_nearest_image returning -1 for no match."""
+    if len(image_timestamps) == 0 or len(point_timestamps_abs) == 0:
+        return np.full(len(point_timestamps_abs), -1, dtype=np.int64)
+
+    right = np.searchsorted(image_timestamps, point_timestamps_abs)
+    left = right - 1
+    n_imgs = len(image_timestamps)
+
+    # Candidate distances (inf where out of range).
+    dt_left = np.where(left >= 0,
+                       np.abs(point_timestamps_abs
+                              - image_timestamps[np.clip(left, 0, n_imgs - 1)]),
+                       np.inf)
+    dt_right = np.where(right < n_imgs,
+                        np.abs(image_timestamps[np.clip(right, 0, n_imgs - 1)]
+                               - point_timestamps_abs),
+                        np.inf)
+
+    use_left = dt_left <= dt_right
+    idx = np.where(use_left, left, right).astype(np.int64)
+    dt = np.where(use_left, dt_left, dt_right)
+    idx[dt > max_dt] = -1
+    return idx
+
+
+def colorize_cloud_per_point(xyz: np.ndarray,
+                             point_timestamps_abs: np.ndarray,
+                             images: List[Tuple[float, bytes, str]],
+                             image_timestamps: np.ndarray,
+                             calib: dict,
+                             max_dt: float = 0.15,
+                             default_color=(128, 128, 128)) -> np.ndarray:
+    """Per-point camera colorization.
+
+    For each point, find the image nearest to its absolute timestamp,
+    then project the point onto that image. Groups points by image index
+    so each unique image is decoded only once per scan.
+    """
+    N = len(xyz)
+    default_rgb = np.array(default_color, dtype=np.float64) / 255.0
+    colors = np.tile(default_rgb, (N, 1))
+
+    if N == 0:
+        return colors
+    if not images or len(image_timestamps) == 0:
+        return colors
+
+    target_idx = _match_nearest_image_vectorized(
+        np.asarray(point_timestamps_abs, dtype=np.float64),
+        np.asarray(image_timestamps, dtype=np.float64),
+        max_dt,
+    )
+
+    unique_idx = np.unique(target_idx)
+    for img_idx in unique_idx:
+        if img_idx < 0:
+            continue
+        mask = target_idx == img_idx
+        if not mask.any():
+            continue
+        _, compressed_bytes, _ = images[int(img_idx)]
+        img_arr = np.frombuffer(compressed_bytes, dtype=np.uint8)
+        decoded = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+        if decoded is None:
+            continue
+        sub_colors = colorize_cloud(xyz[mask], decoded, calib,
+                                    default_color=default_color)
+        colors[mask] = sub_colors
 
     return colors
