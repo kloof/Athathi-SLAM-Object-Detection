@@ -110,25 +110,33 @@ def _accumulate(
         if len(xyz) == 0:
             continue
 
-        xyz_f = np.asarray(xyz, dtype=np.float64)
+        xyz_raw = np.asarray(xyz, dtype=np.float64)
 
-        if deskew and len(imu_times) > 0 and len(time_offsets) > 0:
-            xyz_f = deskew_scan(xyz_f, time_offsets, stamp,
-                                imu_times, imu_gyros)
-
+        # Colorize BEFORE deskew — each point is projected from its raw
+        # capture-time position into the image captured nearest to that
+        # time. Deskew rotates xyz but colors are per-index so they
+        # survive the rotation. Reversing this order projects deskewed
+        # positions into cameras that never saw that orientation.
         if colorize and images and calib and len(image_timestamps) > 0:
             if len(time_offsets) > 0:
                 point_timestamps_abs = stamp + np.asarray(
                     time_offsets, dtype=np.float64)
             else:
                 point_timestamps_abs = np.full(
-                    len(xyz_f), stamp, dtype=np.float64)
+                    len(xyz_raw), stamp, dtype=np.float64)
             colors = colorize_cloud_per_point(
-                xyz_f, point_timestamps_abs, images, image_timestamps, calib)
+                xyz_raw, point_timestamps_abs, images, image_timestamps,
+                calib)
             has_color = _is_colorized(colors)
         else:
-            colors = np.tile(DEFAULT_GRAY, (len(xyz_f), 1))
-            has_color = np.zeros(len(xyz_f), dtype=bool)
+            colors = np.tile(DEFAULT_GRAY, (len(xyz_raw), 1))
+            has_color = np.zeros(len(xyz_raw), dtype=bool)
+
+        if deskew and len(imu_times) > 0 and len(time_offsets) > 0:
+            xyz_f = deskew_scan(xyz_raw, time_offsets, stamp,
+                                imu_times, imu_gyros)
+        else:
+            xyz_f = xyz_raw
 
         T = poses[i]
         xyz_world = xyz_f @ T[:3, :3].T + T[:3, 3]

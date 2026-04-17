@@ -29,6 +29,7 @@ import open3d as o3d
 
 from cloud_slam.mcap_reader import read_mcap
 from cloud_slam.slam_backends import BACKENDS, get_backend
+from cloud_slam.slam_backends.metrics import compute_all, cross_section_png
 from cloud_slam.slam_backends.post_process import (build_map,
                                                    write_trajectory_csv)
 
@@ -95,10 +96,15 @@ def main() -> int:
 
     ply_path = outdir / "colored_map.ply"
     traj_path = outdir / "trajectory.csv"
+    slice_path = outdir / "floor_plus_1m_slice.png"
     metrics_path = outdir / "metrics.json"
 
     o3d.io.write_point_cloud(str(ply_path), pcd, write_ascii=False)
     write_trajectory_csv(result.poses, clouds, str(traj_path))
+
+    print(f"  Computing accuracy metrics…")
+    metric_block = compute_all(pcd, result.poses)
+    cross_section_png(pcd, str(slice_path))
 
     metrics = {
         "backend": result.backend_name,
@@ -110,6 +116,7 @@ def main() -> int:
         "backend_runtime_s": round(result.runtime_s, 2),
         "voxel_size_m": args.voxel_size,
         **stats,
+        **metric_block,
         **result.extra,
     }
     metrics_path.write_text(json.dumps(metrics, indent=2))
@@ -117,10 +124,14 @@ def main() -> int:
     print(f"\nWrote:")
     print(f"  {ply_path}  ({stats['post_final_points']:,} points)")
     print(f"  {traj_path}")
+    print(f"  {slice_path}")
     print(f"  {metrics_path}")
     print(f"\nBackend: {result.backend_name}")
     print(f"Runtime (backend only): {result.runtime_s:.1f}s")
     print(f"Colorized fraction: {stats['colorized_fraction']:.1%}")
+    print(f"Wall RMSE: {metric_block.get('wall_rmse_m')}")
+    print(f"Floor RMSE: {metric_block.get('floor_rmse_m')}")
+    print(f"Color/uncolored spread: {metric_block.get('color_uncolored_spread_m')}")
     print(f"Bounding box (m): {stats['bounding_box_m']}")
     return 0
 

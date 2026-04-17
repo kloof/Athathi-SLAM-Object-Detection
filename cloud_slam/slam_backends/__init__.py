@@ -29,3 +29,6 @@ def get_backend(name: str) -> Backend:
 
 # Import modules for their @register side-effects.
 from cloud_slam.slam_backends import baseline  # noqa: E402, F401
+from cloud_slam.slam_backends import kiss_icp_backend  # noqa: E402, F401
+from cloud_slam.slam_backends import open3d_multiway  # noqa: E402, F401
+from cloud_slam.slam_backends import small_gicp_backend  # noqa: E402, F401
