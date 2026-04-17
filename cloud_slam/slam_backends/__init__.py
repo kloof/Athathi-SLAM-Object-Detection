@@ -32,3 +32,15 @@ from cloud_slam.slam_backends import baseline  # noqa: E402, F401
 from cloud_slam.slam_backends import kiss_icp_backend  # noqa: E402, F401
 from cloud_slam.slam_backends import open3d_multiway  # noqa: E402, F401
 from cloud_slam.slam_backends import small_gicp_backend  # noqa: E402, F401
+
+# ROS2-based backends — only register if rclpy imports (so the harness
+# still works in a plain Python env without a ROS2 install sourced).
+try:
+    import rclpy  # noqa: F401
+    _HAS_RCLPY = True
+except ImportError:
+    _HAS_RCLPY = False
+if _HAS_RCLPY:
+    from cloud_slam.slam_backends import fast_lio2  # noqa: E402, F401
+    from cloud_slam.slam_backends import point_lio  # noqa: E402, F401
+    from cloud_slam.slam_backends import dlio  # noqa: E402, F401

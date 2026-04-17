@@ -256,6 +256,15 @@ def cross_section_png(pcd: o3d.geometry.PointCloud,
     w = max(int(np.ceil((x1 - x0) / pixel_size)), 16)
     h = max(int(np.ceil((y1 - y0) / pixel_size)), 16)
 
+    # Safety cap: if SLAM diverged and the map is kilometers wide, don't
+    # allocate a 100 GB image. Fall back to fitting into a 4000x4000 tile.
+    max_side = 4000
+    if w > max_side or h > max_side:
+        scale = max(w, h) / max_side
+        pixel_size = pixel_size * scale
+        w = max(int(np.ceil((x1 - x0) / pixel_size)), 16)
+        h = max(int(np.ceil((y1 - y0) / pixel_size)), 16)
+
     img = np.ones((h, w, 3), dtype=np.uint8) * 255
     xs = np.clip(((slab[:, 0] - x0) / pixel_size).astype(int), 0, w - 1)
     ys = np.clip(((slab[:, 1] - y0) / pixel_size).astype(int), 0, h - 1)

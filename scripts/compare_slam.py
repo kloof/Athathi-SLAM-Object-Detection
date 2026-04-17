@@ -82,7 +82,12 @@ def main() -> int:
 
     print(f"[3/4] Running backend: {args.backend}")
     backend = get_backend(args.backend)
-    result = backend.run(clouds, imus)
+    import inspect
+    sig = inspect.signature(backend.run)
+    kwargs = {}
+    if "rosbag_path" in sig.parameters:
+        kwargs["rosbag_path"] = str(rosbag)
+    result = backend.run(clouds, imus, **kwargs)
     print(f"  {len(result.poses)} poses, runtime {result.runtime_s:.1f}s")
 
     print(f"[4/4] Post-processing (colorize, voxel-reduce, level)")
