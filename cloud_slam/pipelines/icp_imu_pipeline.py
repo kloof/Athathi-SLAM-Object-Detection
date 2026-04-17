@@ -123,8 +123,15 @@ def run(clouds, imus, voxel_size=0.005, images=None, calib=None, per_frame_callb
             else:
                 T_current = T_guess
 
-        # Transform scan to world frame and accumulate
+        # Transform scan to world frame and accumulate. If colorization is
+        # enabled we must pad every scan with a default color — Open3D's
+        # PointCloud += silently drops ALL colors when one side has colors
+        # and the other does not. A single un-color-matched frame late in
+        # the scan would wipe out the accumulated colored map.
         scan_world = o3d.geometry.PointCloud(scan)
+        if do_color and not scan_world.has_colors():
+            scan_world.colors = o3d.utility.Vector3dVector(
+                np.full((len(scan_world.points), 3), 0.5, dtype=np.float64))
         scan_world.transform(T_current)
         merged += scan_world
 

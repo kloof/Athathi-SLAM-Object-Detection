@@ -15,3 +15,7 @@ data/scan_002/
 *.pt
 *.ts
 *.onnx
+
+# Vendored SpatialLM clone (build locally via third_party/setup_spatiallm.sh)
+third_party/SpatialLM/
+third_party/boxer/
