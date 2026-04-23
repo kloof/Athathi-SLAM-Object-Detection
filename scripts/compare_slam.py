@@ -52,8 +52,11 @@ def main() -> int:
         description="Run one SLAM backend and emit a colored-PLY bundle")
     p.add_argument("rosbag", help="Directory or file with MCAP rosbag")
     p.add_argument("output", help="Output directory")
-    p.add_argument("calibration", nargs="?", default=None,
-                   help="Directory with camera_intrinsics.yaml + extrinsics")
+    # Default calibration dir = repo-vendored calibration/ (Apr 2026 brio charuco fit)
+    default_calib = str((Path(__file__).resolve().parent.parent / "calibration"))
+    p.add_argument("calibration", nargs="?", default=default_calib,
+                   help=f"Directory with intrinsics.yaml + extrinsics.yaml "
+                        f"(default: vendored {default_calib})")
     p.add_argument("--backend", required=True,
                    choices=sorted(BACKENDS),
                    help="Backend name to run")

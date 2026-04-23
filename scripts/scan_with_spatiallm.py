@@ -29,7 +29,11 @@ def main() -> int:
         description="SLAM + SpatialLM1.1 iterative scene refinement")
     parser.add_argument("rosbag", help="Path to rosbag directory or .mcap file")
     parser.add_argument("output", help="Output directory")
-    parser.add_argument("calibration", help="Path to calibration directory")
+    _default_calib = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "calibration")
+    parser.add_argument("calibration", nargs="?", default=_default_calib,
+                        help=f"Path to calibration directory (default: "
+                             f"vendored {_default_calib})")
     parser.add_argument("--categories", type=str, default=None,
                         help="Comma-separated SpatialLM object categories "
                              "(default: all categories)")

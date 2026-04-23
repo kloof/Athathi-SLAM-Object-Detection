@@ -1,0 +1,54 @@
+camera_name: logitech_brio
+image_width: 1280
+image_height: 720
+camera_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 757.0277896833525
+  - 0.0
+  - 628.3847460734615
+  - 0.0
+  - 757.727129460088
+  - 355.765693537038
+  - 0.0
+  - 0.0
+  - 1.0
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data:
+  - 0.2034845584144341
+  - -0.4550053883955955
+  - 0.0002630150581629048
+  - -0.0013351749424867583
+  - 0.24492526203569281
+projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+  - 757.0277896833525
+  - 0.0
+  - 628.3847460734615
+  - 0.0
+  - 0.0
+  - 757.727129460088
+  - 355.765693537038
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+rms_reprojection_error_px: 0.3265753472685341
+residual_median_px: 0.2023082673549652
+residual_p90_px: 0.4985298842191696
+method: charuco_ips_monitor_6bags_6per_cell
+calibration_date: '2026-04-20'
+n_frames: 50
+board:
+  dictionary: 5X5_100
+  squares_x: 11
+  squares_y: 7
+  square_length_mm: 47.0
+  marker_length_mm: 35.25

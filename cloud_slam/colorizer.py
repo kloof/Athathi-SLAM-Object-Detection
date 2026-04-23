@@ -38,12 +38,22 @@ def load_calibration(intrinsics_path, extrinsics_path):
     # Quaternion: YAML has (w,x,y,z), scipy wants (x,y,z,w)
     q = ext['rotation']
     quat = [q['x'], q['y'], q['z'], q['w']]
-    R = Rotation.from_quat(quat).as_matrix()
-    t = np.array([ext['translation']['x'], ext['translation']['y'], ext['translation']['z']])
+    # YAML convention: parent=lidar, child=camera_optical_frame — so (R, t) describe
+    # the camera pose IN the lidar frame (R_lc, t_lc). projection.py uses the stored
+    # matrix directly as "lidar -> camera" (p_cam = R @ p_lidar + t), so we must
+    # invert here:
+    #     R_cl = R_lc.T         t_cl = -R_cl @ t_lc
+    # Cherry-picked from commit 6d81934 (calibration/extrinsic-refinement branch)
+    # which first caught this direction flip (same bug that made the YOLOE boxes
+    # oversized in the old pipeline).
+    R_lc = Rotation.from_quat(quat).as_matrix()
+    t_lc = np.array([ext['translation']['x'], ext['translation']['y'], ext['translation']['z']])
+    R_cl = R_lc.T
+    t_cl = -R_cl @ t_lc
 
     T_lidar_cam = np.eye(4)
-    T_lidar_cam[:3, :3] = R
-    T_lidar_cam[:3, 3] = t
+    T_lidar_cam[:3, :3] = R_cl
+    T_lidar_cam[:3, 3] = t_cl
 
     return {
         'K': K,
