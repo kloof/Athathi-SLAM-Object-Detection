@@ -101,7 +101,10 @@ image = (
         "'open3d>=0.18.0,<0.19' 'addict>=2.4.0,<3' "
         "'nvidia-cudnn-cu12' 'nvidia-nccl-cu12'",
         # Sonata encoder deps — mirrors third_party/setup_spatiallm.sh.
-        "pip install ninja psutil timm",
+        # `wheel` + `packaging` are needed by flash-attn's setup.py under
+        # `--no-build-isolation` (local setup gets them for free from the
+        # venv; Modal's add_python Python doesn't pre-seed wheel).
+        "pip install wheel packaging ninja psutil timm",
         # flash-attn is the slow step (~15 min compile against torch 2.4.1+cu124).
         # MAX_JOBS=2 caps compile parallelism; flash-attn's per-job RSS can peak
         # ~10-14 GB and Modal builders are not guaranteed to have headroom for
