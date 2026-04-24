@@ -53,40 +53,39 @@ image = (
         "PATH": "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "CUDA_HOME": "/usr/local/cuda",
     })
-    # Bootstrap: virtualenv only. huggingface-cli must be installed INTO
-    # the SpatialLM venv later so /opt/spatiallm_env/bin/huggingface-cli
-    # actually exists (the HF download + build-time probe call it by path).
-    .pip_install("virtualenv")
-    .run_commands("virtualenv /opt/spatiallm_env")
-    # Copy SpatialLM source into the image, then run the poetry-driven
-    # install (torch 2.4.1+cu124, transformers, etc.) inside the venv.
+    # NOTE: we deliberately do NOT create a venv.
+    #
+    # The local setup_spatiallm.sh uses a venv because the dev machine has
+    # other Python environments to isolate from. A Modal container is
+    # already isolated — a venv only adds a second interpreter path that
+    # Modal's function body doesn't use, causing `import transformers` to
+    # ImportError when the function runs under Modal's `add_python` Python
+    # while the deps were installed into the venv's python.
+    #
+    # Install everything into the single Python that Modal's runtime uses.
+    # `pip`, `python`, `python3` all resolve to Modal's add_python=3.10.
+    .pip_install("poetry<2.0", "huggingface_hub[cli]")
+    # Copy SpatialLM source into the image, then run poetry against its
+    # pyproject.toml. `virtualenvs.create false` + `--local` makes poetry
+    # install directly into the caller's Python (Modal's), not a nested venv.
     .add_local_dir(
         "third_party/SpatialLM",
         remote_path="/opt/spatiallm",
         copy=True,
     )
     .run_commands(
-        # Pin poetry <2 — poetry 2.x changed supplemental-source resolution
-        # and may skip the pytorch cu124 index during lock-less install,
-        # causing "could not find torch 2.4.1+cu124". 1.x is what the local
-        # setup_spatiallm.sh was validated on.
-        "/opt/spatiallm_env/bin/pip install 'poetry<2.0'",
-        "/opt/spatiallm_env/bin/pip install 'huggingface_hub[cli]'",
-        # poetry reads /opt/spatiallm/pyproject.toml; `virtualenvs.create
-        # false` forces it to install into the active venv
-        # (/opt/spatiallm_env) instead of a nested one.
-        "cd /opt/spatiallm && /opt/spatiallm_env/bin/python -m poetry config virtualenvs.create false --local && /opt/spatiallm_env/bin/python -m poetry install --no-interaction",
+        "cd /opt/spatiallm && python -m poetry config virtualenvs.create false --local && python -m poetry install --no-interaction",
         # Sonata encoder deps — mirrors third_party/setup_spatiallm.sh.
-        "/opt/spatiallm_env/bin/pip install ninja psutil timm",
+        "pip install ninja psutil timm",
         # flash-attn is the slow step (~15 min compile against torch 2.4.1+cu124).
         # MAX_JOBS=2 caps compile parallelism; flash-attn's per-job RSS can peak
         # ~10-14 GB and Modal builders are not guaranteed to have headroom for
         # the default (MAX_JOBS=nproc). OOM here would fail the image build.
-        "MAX_JOBS=2 /opt/spatiallm_env/bin/pip install flash-attn --no-build-isolation",
-        "/opt/spatiallm_env/bin/pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.0+cu124.html",
+        "MAX_JOBS=2 pip install flash-attn --no-build-isolation",
+        "pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.0+cu124.html",
         # spconv-cu120 is binary-compatible with cu124 at runtime — this is
         # what the local working setup uses (see setup_spatiallm.sh).
-        "/opt/spatiallm_env/bin/pip install spconv-cu120",
+        "pip install spconv-cu120",
     )
     # Bring the main repo in AFTER the heavy SpatialLM layer so edits to
     # cloud_slam/ do not bust flash-attn's cache.
@@ -110,12 +109,10 @@ image = (
         remote_path="/root/cloud_slam_icp/requirements.txt",
         copy=True,
     )
-    # Install main-repo deps INTO the SpatialLM venv. One venv for
-    # everything — when infer.py spawns SpatialLM via subprocess with
-    # SPATIALLM_PY pointed at this interpreter, both sides use the same
-    # transformers / torch build.
+    # Main-repo deps into the same Python. Any overlap with SpatialLM's
+    # poetry install will be idempotent or upgrade-in-place.
     .run_commands(
-        "/opt/spatiallm_env/bin/pip install -r /root/cloud_slam_icp/requirements.txt",
+        "pip install -r /root/cloud_slam_icp/requirements.txt",
     )
     # Pre-download HuggingFace weights into the image's baked-in cache.
     # HF_HOME must be set BEFORE the download so the files land where
@@ -124,8 +121,8 @@ image = (
     .env({"HF_HOME": "/root/.cache/hf"})
     .run_commands(
         "mkdir -p /root/.cache/hf",
-        "/opt/spatiallm_env/bin/huggingface-cli download manycore-research/SpatialLM1.1-Qwen-0.5B",
-        "/opt/spatiallm_env/bin/huggingface-cli download manycore-research/SpatialLM1.1-Llama-1B",
+        "huggingface-cli download manycore-research/SpatialLM1.1-Qwen-0.5B",
+        "huggingface-cli download manycore-research/SpatialLM1.1-Llama-1B",
         # Build-time verification probe — layer 1 of the three-layer
         # model-cache verification (see spec §Model-cache verification).
         # Runs offline (HF_HUB_OFFLINE=1, local_files_only=True); if either
@@ -142,12 +139,19 @@ image = (
             "print('cache verified')\n"
             "PY"
         ),
-        "HF_HUB_OFFLINE=1 /opt/spatiallm_env/bin/python /tmp/verify_cache.py",
+        "HF_HUB_OFFLINE=1 python /tmp/verify_cache.py",
+    )
+    # Capture the resolved python path at a stable absolute location so
+    # cloud_slam/spatiallm_pipeline/infer.py can launch SpatialLM via
+    # subprocess without depending on PATH inheritance. `ln -sf $(which
+    # python3) ...` resolves the Modal-provided python at build time.
+    .run_commands(
+        "ln -sf $(which python3) /usr/local/bin/cloud_slam_python",
     )
     .env(
         {
             "SPATIALLM_DIR": "/opt/spatiallm",
-            "SPATIALLM_PY": "/opt/spatiallm_env/bin/python",
+            "SPATIALLM_PY": "/usr/local/bin/cloud_slam_python",
             "SPATIALLM_CODE_TEMPLATE": "/opt/spatiallm/code_template.txt",
             "PYTHONPATH": "/root/cloud_slam_icp",
             "HF_HUB_OFFLINE": "1",
@@ -237,3 +241,46 @@ def verify_image() -> dict:
     out["cuda"] = torch.cuda.is_available()
     out["device"] = torch.cuda.get_device_name(0) if out["cuda"] else None
     return out
+
+
+# ---------------------------------------------------------------------------
+# pipeline_runner — background Modal Function (M4)
+# ---------------------------------------------------------------------------
+#
+# The submit endpoint (M5) calls `pipeline_runner.spawn(job_id)`. All real
+# logic lives in `modal_app/pipeline_runner.py::run` to keep this file
+# scanning-friendly and to keep the heavy cloud_slam import graph off the
+# top-level module (it would otherwise load on every ASGI cold-start).
+#
+# Knobs:
+# - `gpu="H100"` — SpatialLM-Llama decode is memory-bandwidth-bound at
+#   batch=1; H100 at 3350 GB/s wins ~5× over the local 4070 Ti. See spec
+#   §"Decisions locked in" for the L4/A10G rejection rationale.
+# - `cpu=8.0, memory=32768` — KISS-ICP is CPU-bound, SLAM stage needs
+#   headroom for Open3D point-cloud ops.
+# - `retries=0` — hard cost-safety rail (spec §"Cost safety" row 2). A
+#   flaky run fails once; Modal must not silently double-bill us.
+# - `timeout=3600` — outer cap. Inner subprocess timeout is 3300 s so we
+#   always raise `TimeoutExpired` first and log a clean pipeline_timeout.
+# - `max_containers=2` — caps simultaneous H100 spend (spec §"Cost safety"
+#   row 5; spec section §"Decisions locked in" mentions a 4-container
+#   plan — 2 is the deliberately tighter M4 default, easy to raise later).
+@app.function(
+    image=image,
+    gpu="H100",
+    cpu=8.0,
+    memory=32768,
+    volumes={"/jobs": volume},
+    retries=0,
+    timeout=3600,
+    max_containers=2,
+)
+def pipeline_runner(job_id: str) -> None:
+    """Background runner invoked by the submit endpoint (M5) via `.spawn`.
+
+    Lazy-imports `modal_app.pipeline_runner.run` so the heavy cloud_slam
+    + SpatialLM module graph stays off the top level of `app.py`.
+    """
+    from modal_app.pipeline_runner import run
+
+    run(volume=volume, job_id=job_id)
