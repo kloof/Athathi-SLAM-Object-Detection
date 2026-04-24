@@ -256,8 +256,16 @@ def verify_image() -> dict:
     # offline loadability.
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoTokenizer
 
+    # AutoConfig intentionally omitted: SpatialLM's checkpoints declare a
+    # custom model_type (`spatiallm_qwen`, `spatiallm_llama`) that the
+    # vanilla transformers CONFIG_MAPPING doesn't know about until
+    # `import spatiallm` registers it. That import pulls torch + spconv +
+    # flash-attn — heavy for a smoke test. Tokenizer load is sufficient
+    # proof that the cache files are present and offline-loadable. The
+    # real pipeline (SpatialLM's own inference.py) does the custom-arch
+    # registration on its own code path.
     out: dict[str, object] = {}
     for name, repo in [
         ("qwen", "manycore-research/SpatialLM1.1-Qwen-0.5B"),
@@ -265,7 +273,6 @@ def verify_image() -> dict:
     ]:
         try:
             AutoTokenizer.from_pretrained(repo, local_files_only=True)
-            AutoConfig.from_pretrained(repo, local_files_only=True)
             out[name] = "ok"
         except Exception as e:  # pragma: no cover — runs in Modal container
             out[name] = f"failed: {type(e).__name__}: {e}"

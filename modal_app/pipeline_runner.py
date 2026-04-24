@@ -260,14 +260,19 @@ def verify_cache_or_die() -> None:
 
     # transformers is a heavy import (~1 s cold); keep it inside this
     # function so unit tests that mock this function never pay for it.
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoTokenizer
 
+    # Only the tokenizer is probed offline. SpatialLM declares a custom
+    # model_type (`spatiallm_qwen`, `spatiallm_llama`) that standard
+    # transformers doesn't register until `import spatiallm` runs — and
+    # that import pulls heavyweight torch + spconv + flash-attn. For a
+    # cache-presence check the tokenizer is sufficient; actual model
+    # loading happens later inside SpatialLM's own inference.py.
     for repo in (
         "manycore-research/SpatialLM1.1-Qwen-0.5B",
         "manycore-research/SpatialLM1.1-Llama-1B",
     ):
         AutoTokenizer.from_pretrained(repo, local_files_only=True)
-        AutoConfig.from_pretrained(repo, local_files_only=True)
 
 
 # ---------------------------------------------------------------------------
