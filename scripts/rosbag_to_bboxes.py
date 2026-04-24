@@ -97,11 +97,12 @@ def main(argv=None):
     parser.add_argument("--llama-seed-base", type=int, default=0,
                          help="First seed for Llama passes. Seeds used: "
                               "[base, base+1, ..., base+passes-1]. Default 0.")
-    parser.add_argument("--beam-size", type=int, default=1,
-                         help="If >1, use deterministic beam search for "
-                              "Llama + Qwen (one pass explores N hypotheses), "
-                              "overrides --llama-passes to 1. Default 1 "
-                              "(sampling).")
+    parser.add_argument("--beam-size", type=int, default=4,
+                         help="Beam-search width for Llama + Qwen. Default 4 "
+                              "(deterministic one-shot; empirically cleaner "
+                              "than multi-pass sampling, 2.6x faster, single "
+                              "sectional sofa not split). Set to 1 to fall "
+                              "back to sampling + --llama-passes consensus.")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
