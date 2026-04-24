@@ -19,3 +19,14 @@ data/scan_002/
 # Vendored SpatialLM clone (build locally via third_party/setup_spatiallm.sh)
 third_party/SpatialLM/
 third_party/boxer/
+third_party/DPVO/
+third_party/MASt3R-SLAM/
+third_party/Video-Depth-Anything/
+third_party_codetr/
+
+# Virtualenvs
+.venv/
+.venv-*/
+
+# Downloaded model checkpoints
+checkpoints/
