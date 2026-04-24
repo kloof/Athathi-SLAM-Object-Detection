@@ -12,14 +12,16 @@ Tuned defaults:
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
 
 
-SPATIALLM_DIR = Path("/home/klof/cloud_slam_icp/third_party/SpatialLM")
-SPATIALLM_PY = Path("/home/klof/spatiallm_env/bin/python")
-CODE_TEMPLATE = SPATIALLM_DIR / "code_template.txt"
+_REPO = Path(__file__).resolve().parents[2]
+SPATIALLM_DIR = Path(os.getenv("SPATIALLM_DIR", _REPO / "third_party" / "SpatialLM"))
+SPATIALLM_PY = Path(os.getenv("SPATIALLM_PY", Path.home() / "spatiallm_env" / "bin" / "python"))
+CODE_TEMPLATE = Path(os.getenv("SPATIALLM_CODE_TEMPLATE", SPATIALLM_DIR / "code_template.txt"))
 
 MODEL_QWEN = "manycore-research/SpatialLM1.1-Qwen-0.5B"
 MODEL_LLAMA = "manycore-research/SpatialLM1.1-Llama-1B"
