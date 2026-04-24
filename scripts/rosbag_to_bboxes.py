@@ -118,6 +118,15 @@ def main(argv=None):
                          help="Skip stage 8 (per-bbox JPG crops). Stages "
                               "0-7 are unaffected; use to reproduce the "
                               "pre-stage-8 behaviour exactly.")
+    parser.add_argument("--parallel-infer", action="store_true",
+                         help="Run Qwen and Llama SpatialLM passes in parallel "
+                              "(two subprocesses, both subsequent processes "
+                              "share the same GPU). On an H100 (80 GB) the two "
+                              "models co-resident cost ~6 GB VRAM combined so "
+                              "there's plenty of headroom; on the local 4070 Ti "
+                              "(12 GB) this will OOM, so the default is OFF. "
+                              "Only applies to the beam-search single-shot "
+                              "path; ignored with --beam-size 1 + --llama-passes>1.")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
@@ -177,47 +186,87 @@ def main(argv=None):
     use_beam = args.beam_size > 1
     qwen_detect = "all" if args.skip_llama else "arch"
     llama_detect = "object"  # Llama only needs to supply bboxes
-    if use_beam:
-        _stage(f"[5/7] SpatialLM inference (Qwen; BEAM n={args.beam_size}; "
-               f"det={qwen_detect})")
-    else:
-        _stage(f"[5/7] SpatialLM inference (Qwen; temp={args.temperature} "
-               f"topk={args.top_k}; det={qwen_detect})")
-    layout_qwen = run_spatiallm(
-        sl_input_ply, output / "layout_qwen.txt",
-        model=MODEL_QWEN, detect_type=qwen_detect,
-        temperature=args.temperature, top_k=args.top_k,
-        repetition_penalty=args.llama_rep_penalty,
-        num_beams=args.beam_size,
-    )
 
-    llama_layouts: list = []
-    if args.skip_llama:
-        llama_layouts = [layout_qwen]
-    elif use_beam or args.llama_passes <= 1:
-        mode = f"BEAM n={args.beam_size}" if use_beam else "same sampling"
-        _stage(f"[5/7] SpatialLM inference (Llama; {mode}; det={llama_detect})")
-        llama_layouts = [run_spatiallm(
-            sl_input_ply, output / "layout_llama.txt",
-            model=MODEL_LLAMA, detect_type=llama_detect,
-            temperature=args.temperature, top_k=args.top_k,
-            repetition_penalty=args.llama_rep_penalty,
-            seed=args.llama_seed_base,
-            num_beams=args.beam_size,
-        )]
+    # When --parallel-infer is set AND we're on the beam-search single-shot
+    # path (and not skip-llama), run Qwen + Llama concurrently in two
+    # subprocesses on the same GPU. CUDA lets both processes submit kernels
+    # and the scheduler interleaves them — at batch=1 decode on small
+    # models, neither saturates the H100's SMs so wall clock drops from
+    # T(qwen)+T(llama) to ~max(T(qwen),T(llama)).
+    parallel_ok = args.parallel_infer and not args.skip_llama and (use_beam or args.llama_passes <= 1)
+
+    if parallel_ok:
+        from concurrent.futures import ThreadPoolExecutor
+        _stage(f"[5/7] SpatialLM inference (Qwen+Llama in PARALLEL; "
+               f"BEAM n={args.beam_size}; qwen_det={qwen_detect}; "
+               f"llama_det={llama_detect})")
+
+        def _run_qwen():
+            return run_spatiallm(
+                sl_input_ply, output / "layout_qwen.txt",
+                model=MODEL_QWEN, detect_type=qwen_detect,
+                temperature=args.temperature, top_k=args.top_k,
+                repetition_penalty=args.llama_rep_penalty,
+                num_beams=args.beam_size,
+            )
+
+        def _run_llama():
+            return run_spatiallm(
+                sl_input_ply, output / "layout_llama.txt",
+                model=MODEL_LLAMA, detect_type=llama_detect,
+                temperature=args.temperature, top_k=args.top_k,
+                repetition_penalty=args.llama_rep_penalty,
+                seed=args.llama_seed_base,
+                num_beams=args.beam_size,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_qwen = ex.submit(_run_qwen)
+            fut_llama = ex.submit(_run_llama)
+            layout_qwen = fut_qwen.result()
+            llama_layouts: list = [fut_llama.result()]
     else:
-        _stage(f"[5/7] SpatialLM inference (Llama x{args.llama_passes} "
-               f"passes, shared load; rep_pen={args.llama_rep_penalty}; "
-               f"det={llama_detect})")
-        seeds = list(range(args.llama_seed_base,
-                           args.llama_seed_base + args.llama_passes))
-        llama_layouts = run_spatiallm_multi_seed(
-            sl_input_ply, output, seeds,
-            output_stem="layout_llama",
-            model=MODEL_LLAMA, detect_type=llama_detect,
+        if use_beam:
+            _stage(f"[5/7] SpatialLM inference (Qwen; BEAM n={args.beam_size}; "
+                   f"det={qwen_detect})")
+        else:
+            _stage(f"[5/7] SpatialLM inference (Qwen; temp={args.temperature} "
+                   f"topk={args.top_k}; det={qwen_detect})")
+        layout_qwen = run_spatiallm(
+            sl_input_ply, output / "layout_qwen.txt",
+            model=MODEL_QWEN, detect_type=qwen_detect,
             temperature=args.temperature, top_k=args.top_k,
             repetition_penalty=args.llama_rep_penalty,
+            num_beams=args.beam_size,
         )
+
+        llama_layouts: list = []
+        if args.skip_llama:
+            llama_layouts = [layout_qwen]
+        elif use_beam or args.llama_passes <= 1:
+            mode = f"BEAM n={args.beam_size}" if use_beam else "same sampling"
+            _stage(f"[5/7] SpatialLM inference (Llama; {mode}; det={llama_detect})")
+            llama_layouts = [run_spatiallm(
+                sl_input_ply, output / "layout_llama.txt",
+                model=MODEL_LLAMA, detect_type=llama_detect,
+                temperature=args.temperature, top_k=args.top_k,
+                repetition_penalty=args.llama_rep_penalty,
+                seed=args.llama_seed_base,
+                num_beams=args.beam_size,
+            )]
+        else:
+            _stage(f"[5/7] SpatialLM inference (Llama x{args.llama_passes} "
+                   f"passes, shared load; rep_pen={args.llama_rep_penalty}; "
+                   f"det={llama_detect})")
+            seeds = list(range(args.llama_seed_base,
+                               args.llama_seed_base + args.llama_passes))
+            llama_layouts = run_spatiallm_multi_seed(
+                sl_input_ply, output, seeds,
+                output_stem="layout_llama",
+                model=MODEL_LLAMA, detect_type=llama_detect,
+                temperature=args.temperature, top_k=args.top_k,
+                repetition_penalty=args.llama_rep_penalty,
+            )
 
     # 6. merge
     _stage("[6/7] Merge layouts")
