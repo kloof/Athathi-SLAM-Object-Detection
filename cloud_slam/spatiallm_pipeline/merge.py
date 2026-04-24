@@ -9,6 +9,7 @@ Also provides a same-class proximity deduplicator for bboxes.
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from pathlib import Path
@@ -83,6 +84,59 @@ def parse_layout(layout_txt: Path | str) -> dict:
                 v = [float(x) for x in m.group(2).split(",")]
                 bboxes.append((cls, v))
     return dict(walls=walls, doors=doors, windows=windows, bboxes=bboxes)
+
+
+def load_bbox_confidences(layout_txt: Path | str) -> dict[int, float]:
+    """Read the sidecar .conf.json next to a layout txt; empty dict if missing.
+
+    Sidecar produced by the patched SpatialLM inference.py. Keys are bbox
+    ids (int) matching the bbox_N=... identifiers in the layout text;
+    values are mean token log-probabilities (negative; closer to 0 = more
+    confident).
+    """
+    layout_txt = Path(layout_txt)
+    # layout_foo.txt -> layout_foo.conf.json
+    conf_path = layout_txt.with_suffix("").parent / (
+        layout_txt.with_suffix("").name + ".conf.json"
+    )
+    if not conf_path.is_file():
+        return {}
+    try:
+        raw = json.loads(conf_path.read_text())
+        return {int(k): float(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def filter_bboxes_by_confidence(
+    layout_txt: Path | str,
+    min_logprob: float,
+    *,
+    verbose: bool = True,
+) -> list[tuple[str, list[float]]]:
+    """Return layout bboxes whose sidecar confidence >= min_logprob.
+
+    Bboxes without a sidecar entry are kept unchanged (fail-open — so this
+    degrades gracefully on older layout files without confidences).
+    """
+    parsed = parse_layout(layout_txt)
+    confs = load_bbox_confidences(layout_txt)
+    if not confs:
+        return parsed["bboxes"]
+
+    kept = []
+    dropped_count = 0
+    for bbox_id, (cls, v) in enumerate(parsed["bboxes"]):
+        c = confs.get(bbox_id)
+        if c is None or c >= min_logprob:
+            kept.append((cls, v))
+        else:
+            dropped_count += 1
+    if verbose and dropped_count:
+        print(f"[conf-filter] {Path(layout_txt).name}: dropped "
+              f"{dropped_count}/{len(parsed['bboxes'])} bboxes below "
+              f"min_logprob={min_logprob}")
+    return kept
 
 
 def dedup_bboxes(bboxes: Sequence[tuple[str, list[float]]],
@@ -221,6 +275,7 @@ def consensus_bboxes(
     min_votes: int = 2,
     overlap_iou_thresh: float = 0.15,
     overlap_yaw_tol_deg: float = 15.0,
+    min_bbox_confidence: float | None = None,
     verbose: bool = True,
 ) -> list[tuple[str, list[float]]]:
     """Merge bboxes across N layout files, keep those seen in >=min_votes.
@@ -234,8 +289,12 @@ def consensus_bboxes(
     # Build one deduped set per layout (vote count == number of layouts agreeing).
     per_layout = []
     for p in layouts:
-        parsed = parse_layout(p)
-        per_layout.append(dedup_bboxes(parsed["bboxes"], radius_m=0.15))
+        if min_bbox_confidence is not None:
+            raw = filter_bboxes_by_confidence(p, min_bbox_confidence,
+                                              verbose=verbose)
+        else:
+            raw = parse_layout(p)["bboxes"]
+        per_layout.append(dedup_bboxes(raw, radius_m=0.15))
 
     # Cluster across layouts. Each cluster = same class + overlapping centers.
     # Use single-pass greedy: for each (cls, box) pick existing cluster if
@@ -312,16 +371,25 @@ def merge_layouts(
     out_txt: Path | str,
     *,
     dedup_radius_m: float = 0.20,
+    min_bbox_confidence: float | None = None,
     verbose: bool = True,
 ) -> Path:
     """Combine walls/doors/windows from `structure_layout` and bboxes
-    from `objects_layout`, dedup bboxes, write unified layout file."""
+    from `objects_layout`, dedup bboxes, write unified layout file.
+
+    When `min_bbox_confidence` is set, bboxes with a sidecar confidence
+    below that threshold (mean token log-prob) are dropped before dedup.
+    """
     s = parse_layout(structure_layout)
-    o = parse_layout(objects_layout)
-    bboxes = dedup_bboxes(o["bboxes"], radius_m=dedup_radius_m)
+    if min_bbox_confidence is not None:
+        raw_bboxes = filter_bboxes_by_confidence(
+            objects_layout, min_bbox_confidence, verbose=verbose)
+    else:
+        raw_bboxes = parse_layout(objects_layout)["bboxes"]
+    bboxes = dedup_bboxes(raw_bboxes, radius_m=dedup_radius_m)
     if verbose:
         print(f"[merge] struct: {len(s['walls'])}w {len(s['doors'])}d "
-              f"{len(s['windows'])}win  | objects: {len(o['bboxes'])} raw "
+              f"{len(s['windows'])}win  | objects: {len(raw_bboxes)} raw "
               f"-> {len(bboxes)} deduped")
 
     out_lines = []
@@ -528,15 +596,21 @@ def merge_layouts_consensus(
     *,
     consensus_radius_m: float = 0.30,
     min_votes: int = 2,
+    min_bbox_confidence: float | None = None,
     verbose: bool = True,
 ) -> Path:
     """Same output shape as merge_layouts, but bboxes come from a consensus
-    over N Llama passes (kept only when seen in >= min_votes passes)."""
+    over N Llama passes (kept only when seen in >= min_votes passes).
+
+    `min_bbox_confidence` applies a per-bbox confidence threshold on each
+    pass before voting (uses the .conf.json sidecar).
+    """
     s = parse_layout(structure_layout)
     bboxes = consensus_bboxes(
         objects_layouts,
         radius_m=consensus_radius_m,
         min_votes=min_votes,
+        min_bbox_confidence=min_bbox_confidence,
         verbose=verbose,
     )
     if verbose:

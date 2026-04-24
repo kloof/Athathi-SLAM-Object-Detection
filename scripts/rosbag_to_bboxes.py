@@ -103,6 +103,11 @@ def main(argv=None):
                               "than multi-pass sampling, 2.6x faster, single "
                               "sectional sofa not split). Set to 1 to fall "
                               "back to sampling + --llama-passes consensus.")
+    parser.add_argument("--min-bbox-confidence", type=float, default=None,
+                         help="Drop bboxes whose mean token log-prob is below "
+                              "this value (requires inference.py patch v2+). "
+                              "Typical values: -1.5 (mild), -1.0 (strict), "
+                              "-0.5 (very strict). None disables the filter.")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
@@ -197,10 +202,12 @@ def main(argv=None):
         layout_merged = merge_layouts_consensus(
             layout_qwen, llama_layouts, output / "layout_merged.txt",
             min_votes=args.llama_min_votes,
+            min_bbox_confidence=args.min_bbox_confidence,
         )
     else:
         layout_merged = merge_layouts(
-            layout_qwen, llama_layouts[0], output / "layout_merged.txt"
+            layout_qwen, llama_layouts[0], output / "layout_merged.txt",
+            min_bbox_confidence=args.min_bbox_confidence,
         )
 
     # 7. embed

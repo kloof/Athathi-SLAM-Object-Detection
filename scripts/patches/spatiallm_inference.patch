@@ -1,5 +1,5 @@
 diff --git a/inference.py b/inference.py
-index bd1b661..48a5692 100644
+index bd1b661..65f659b 100644
 --- a/inference.py
 +++ b/inference.py
 @@ -62,6 +62,7 @@ def generate_layout(
@@ -10,7 +10,7 @@ index bd1b661..48a5692 100644
  ):
      if seed >= 0:
          set_seed(seed)
-@@ -91,32 +92,58 @@ def generate_layout(
+@@ -91,34 +92,93 @@ def generate_layout(
      )
      input_ids = input_ids.to(model.device)
  
@@ -22,57 +22,63 @@ index bd1b661..48a5692 100644
 +    # tasks. It also can't be streamed meaningfully, so we switch to a
 +    # direct generate() call in that mode.
 +    use_beam = num_beams > 1
++    prompt_len = input_ids.shape[1]
  
 -    generate_kwargs = dict(
--        {"input_ids": input_ids, "point_clouds": point_cloud},
++    common_kwargs = dict(
+         {"input_ids": input_ids, "point_clouds": point_cloud},
 -        streamer=streamer,
--        max_new_tokens=max_new_tokens,
+         max_new_tokens=max_new_tokens,
 -        do_sample=True,
--        use_cache=True,
+         use_cache=True,
 -        temperature=temperature,
 -        top_p=top_p,
 -        top_k=top_k,
 -        num_beams=num_beams,
--    )
--    t = Thread(target=model.generate, kwargs=generate_kwargs)
--    t.start()
++        repetition_penalty=repetition_penalty,
++        return_dict_in_generate=True,
++        output_scores=True,
++    )
++
 +    if use_beam:
 +        generate_kwargs = dict(
-+            {"input_ids": input_ids, "point_clouds": point_cloud},
-+            max_new_tokens=max_new_tokens,
++            common_kwargs,
 +            do_sample=False,
-+            use_cache=True,
 +            num_beams=num_beams,
-+            repetition_penalty=repetition_penalty,
 +            early_stopping=True,
 +        )
 +        print(f"Generating layout (beam search, num_beams={num_beams})...\n")
-+        output_ids = model.generate(**generate_kwargs)
-+        # output_ids shape: (1, total_len) — strip the prompt prefix
-+        prompt_len = input_ids.shape[1]
-+        gen_ids = output_ids[0][prompt_len:]
++        outputs = model.generate(**generate_kwargs)
++        gen_ids = outputs.sequences[0][prompt_len:]
 +        layout_str = tokenizer.decode(gen_ids, skip_special_tokens=True)
 +        print(layout_str)
 +        print("\nDone!")
 +    else:
-+        streamer = TextIteratorStreamer(
-+            tokenizer, timeout=20.0, skip_prompt=True, skip_special_tokens=True
-+        )
-+
 +        generate_kwargs = dict(
-+            {"input_ids": input_ids, "point_clouds": point_cloud},
-+            streamer=streamer,
-+            max_new_tokens=max_new_tokens,
++            common_kwargs,
 +            do_sample=True,
-+            use_cache=True,
 +            temperature=temperature,
 +            top_p=top_p,
 +            top_k=top_k,
 +            num_beams=num_beams,
-+            repetition_penalty=repetition_penalty,
 +        )
-+        t = Thread(target=model.generate, kwargs=generate_kwargs)
-+        t.start()
++        print("Generating layout (sampling)...\n")
++        outputs = model.generate(**generate_kwargs)
++        gen_ids = outputs.sequences[0][prompt_len:]
++        layout_str = tokenizer.decode(gen_ids, skip_special_tokens=True)
++        print(layout_str)
++        print("\nDone!")
++
++    # Per-token log-probabilities of the SELECTED sequence (handles beam
++    # indices transparently). transition_scores: (1, generated_len).
++    beam_indices = getattr(outputs, "beam_indices", None)
++    transition_scores = model.compute_transition_scores(
++        outputs.sequences, outputs.scores, beam_indices,
++        normalize_logits=True,
+     )
+-    t = Thread(target=model.generate, kwargs=generate_kwargs)
+-    t.start()
++    per_token_logprobs = transition_scores[0].detach().cpu().numpy()
  
 -    print("Generating layout...\n")
 -    generate_texts = []
@@ -80,19 +86,44 @@ index bd1b661..48a5692 100644
 -        generate_texts.append(text)
 -        print(text, end="", flush=True)
 -    print("\nDone!")
-+        print("Generating layout...\n")
-+        generate_texts = []
-+        for text in streamer:
-+            generate_texts.append(text)
-+            print(text, end="", flush=True)
-+        print("\nDone!")
-+        layout_str = "".join(generate_texts)
++    # Map each generated token to its character span in the decoded text.
++    import numpy as np
++    token_char_ranges: list[tuple[int, int]] = []
++    cum_len = 0
++    prev_decoded = ""
++    for i in range(len(gen_ids)):
++        cur_decoded = tokenizer.decode(gen_ids[: i + 1], skip_special_tokens=True)
++        token_char_ranges.append((len(prev_decoded), len(cur_decoded)))
++        prev_decoded = cur_decoded
++
++    # For each bbox_N=Bbox(...) line, compute mean log-prob of its tokens.
++    import re as _re
++    bbox_confidences: dict[int, float] = {}
++    for m in _re.finditer(
++        r"bbox_(\d+)=Bbox\([^)]*\)", layout_str
++    ):
++        bbox_id = int(m.group(1))
++        c_start, c_end = m.start(), m.end()
++        token_idxs = [
++            i for i, (ts, te) in enumerate(token_char_ranges)
++            if ts < c_end and te > c_start
++        ]
++        if token_idxs:
++            lp = per_token_logprobs[token_idxs]
++            # Guard against inf/NaN (can happen at pad/early-stop positions)
++            lp = lp[np.isfinite(lp)]
++            if lp.size:
++                bbox_confidences[bbox_id] = float(np.mean(lp))
  
 -    layout_str = "".join(generate_texts)
      layout = Layout(layout_str)
      layout.undiscretize_and_unnormalize(num_bins=model.config.point_config["num_bins"])
++    # Stash confidences on the layout object so the caller can write them out.
++    layout._bbox_confidences = bbox_confidences  # type: ignore[attr-defined]
      return layout
-@@ -270,8 +297,29 @@ if __name__ == "__main__":
+ 
+ 
+@@ -270,8 +330,29 @@ if __name__ == "__main__":
          default=-1,
          help="The seed to use during inference, negative value means no seed",
      )
@@ -122,7 +153,7 @@ index bd1b661..48a5692 100644
      # load the model
      tokenizer = AutoTokenizer.from_pretrained(args.model_path)
      model = AutoModelForCausalLM.from_pretrained(
-@@ -304,29 +352,49 @@ if __name__ == "__main__":
+@@ -304,29 +385,59 @@ if __name__ == "__main__":
          # preprocess the point cloud to tensor features
          input_pcd = preprocess_point_cloud(points, colors, grid_size, num_bins)
  
@@ -142,6 +173,16 @@ index bd1b661..48a5692 100644
 -        )
 -        layout.translate(min_extent)
 -        pred_language_string = layout.to_language_string()
+-
+-        # check if the output path is a file or directory
+-        if os.path.splitext(args.output)[-1]:
+-            with open(args.output, "w") as f:
+-                f.write(pred_language_string)
+-        else:
+-            output_filename = os.path.basename(point_cloud_file).replace(".ply", ".txt")
+-            os.makedirs(args.output, exist_ok=True)
+-            with open(os.path.join(args.output, output_filename), "w") as f:
+-                f.write(pred_language_string)
 +        # Decide seed schedule: --seeds wins, else single pass with --seed.
 +        effective_seeds = seed_list if seed_list is not None else [args.seed]
 +
@@ -162,19 +203,12 @@ index bd1b661..48a5692 100644
 +            )
 +            layout.translate(min_extent)
 +            pred_language_string = layout.to_language_string()
- 
--        # check if the output path is a file or directory
--        if os.path.splitext(args.output)[-1]:
--            with open(args.output, "w") as f:
--                f.write(pred_language_string)
--        else:
--            output_filename = os.path.basename(point_cloud_file).replace(".ply", ".txt")
--            os.makedirs(args.output, exist_ok=True)
--            with open(os.path.join(args.output, output_filename), "w") as f:
--                f.write(pred_language_string)
++
 +            # Output path resolution:
 +            #  - Multi-seed mode writes <stem>_seed<N>.txt regardless of -o kind
 +            #  - Single-seed mode preserves existing file-or-directory behavior
++            import json as _json
++            bbox_conf = getattr(layout, "_bbox_confidences", {})
 +            if len(effective_seeds) > 1:
 +                base, ext = os.path.splitext(args.output)
 +                if not ext:
@@ -186,14 +220,22 @@ index bd1b661..48a5692 100644
 +                    out_path = f"{base}_seed{seed}{ext}"
 +                with open(out_path, "w") as f:
 +                    f.write(pred_language_string)
++                # sidecar JSON with per-bbox confidences (mean token logprob)
++                with open(out_path.replace(".txt", ".conf.json"), "w") as f:
++                    _json.dump({str(k): v for k, v in bbox_conf.items()}, f, indent=2)
 +                print(f"\n[inference] wrote pass {pass_idx+1}/"
 +                      f"{len(effective_seeds)} (seed={seed}) -> {out_path}")
 +            else:
 +                if os.path.splitext(args.output)[-1]:
 +                    with open(args.output, "w") as f:
 +                        f.write(pred_language_string)
++                    with open(args.output.rsplit(".", 1)[0] + ".conf.json", "w") as f:
++                        _json.dump({str(k): v for k, v in bbox_conf.items()}, f, indent=2)
 +                else:
 +                    output_filename = os.path.basename(point_cloud_file).replace(".ply", ".txt")
 +                    os.makedirs(args.output, exist_ok=True)
-+                    with open(os.path.join(args.output, output_filename), "w") as f:
++                    out_path = os.path.join(args.output, output_filename)
++                    with open(out_path, "w") as f:
 +                        f.write(pred_language_string)
++                    with open(out_path.replace(".txt", ".conf.json"), "w") as f:
++                        _json.dump({str(k): v for k, v in bbox_conf.items()}, f, indent=2)
