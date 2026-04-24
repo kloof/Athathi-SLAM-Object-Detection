@@ -231,6 +231,43 @@ Python without further glue. If a future refactor switches to `env=...`
 in those `subprocess.run` calls, it must explicitly forward `HF_HOME`,
 `SPATIALLM_DIR`, `SPATIALLM_PY`, `CODE_TEMPLATE`.
 
+### Model-cache verification (three layers)
+
+HuggingFace downloads can silently half-complete (disconnected mid-stream,
+partial `.safetensors`, wrong `HF_HOME` between build and runtime). A green
+image build is not proof the weights are actually usable. We verify at
+three layers:
+
+1. **Build-time probe.** In the *same* `run_commands(...)` block that runs
+   `huggingface-cli download`, immediately do an offline probe:
+   ```bash
+   HF_HUB_OFFLINE=1 /opt/spatiallm_env/bin/python -c \
+     "from transformers import AutoTokenizer, AutoConfig; \
+      for m in ['manycore-research/SpatialLM1.1-Qwen-0.5B', \
+                'manycore-research/SpatialLM1.1-Llama-1B']: \
+          AutoTokenizer.from_pretrained(m, local_files_only=True); \
+          AutoConfig.from_pretrained(m,    local_files_only=True); \
+      print('cache verified')"
+   ```
+   If the shell exits non-zero, Modal aborts the image build. No deploy.
+
+2. **Runtime startup probe.** `pipeline_runner` calls
+   `verify_cache_or_die()` as its first step, *before* setting
+   `status=queued`. Same `local_files_only=True` load. This catches any
+   corruption that sneaked through layer 1 (e.g. cache directory mounted
+   differently in the function container vs the image build).
+
+3. **External health endpoint + manual verify function.**
+   - `GET /health` returns `{status, image_built_at, weights: {qwen: "verified"|"missing", llama: "..."}, uptime_s}` on the ASGI container (no GPU).
+   - `modal run modal_app/app.py::verify_image` spins up one H100 runner container, runs the full load probe + a tiny 10-point dummy inference, and returns green/red. ~$0.01 smoke test to run after every fresh deploy.
+
+After a fresh `modal deploy`, the required ritual before submitting a real bag:
+```bash
+modal deploy modal_app/app.py
+curl https://.../health               # must return weights: all verified
+modal run modal_app/app.py::verify_image  # green = OK to use
+```
+
 ## Volume layout
 
 ```
@@ -283,7 +320,7 @@ enforcement point in code.
 | 8 | Zstd decompression bomb | decompress into a size-capped writer (10 GiB ceiling); abort and delete on overflow | decode helper in runner |
 | 9 | DELETE /jobs/{id} doesn't actually cancel the function call | submit stores the `FunctionCall` object ID on the volume; DELETE loads it and invokes `FunctionCall.from_id(...).cancel()` before removing the dir | `modal_app/app.py::cancel` |
 | 10 | Multiple image versions / orphaned deploys | single-named app (`cloud-slam-icp`). Re-deploys replace the previous version atomically. | `modal_app/app.py` |
-| 11 | Deploy-time model-weight download baked into image (2 GB) fails halfway and bloats image | pre-download step uses `huggingface-cli download --local-dir` with hash verification; build fails loud if hash mismatches | image build stage |
+| 11 | Deploy-time model-weight download baked into image (2 GB) fails halfway and bloats image | post-download `HF_HUB_OFFLINE=1 python -c AutoTokenizer+AutoConfig.from_pretrained(..., local_files_only=True)` — build fails if weights aren't actually loadable. Plus runtime startup probe, plus `GET /health`, plus `modal run …::verify_image`. See §Model-cache verification. | image build + runtime |
 
 Operational check before any request is accepted:
 

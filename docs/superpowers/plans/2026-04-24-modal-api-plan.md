@@ -75,11 +75,23 @@ CODE_TEMPLATE = Path(os.getenv("SPATIALLM_CODE_TEMPLATE", SPATIALLM_DIR / "code_
 - `modal_app/app.py` — `modal.App("cloud-slam-icp")`, Image builder, Volume, Secret.
 - `modal_app/README.md` — curl usage.
 
-**Image build steps:** exactly as listed in spec §"Modal image build".
+**Image build steps:** exactly as listed in spec §"Modal image build",
+INCLUDING the offline-load verification probe at the end of the same
+`run_commands(...)` block that did the `huggingface-cli download`. Without
+the probe, a silent partial download will produce a green image that fails
+on first real run.
+
+**Verification functions added in this milestone:**
+- `@app.function(...) def verify_image()` — manual preflight smoke; loads
+  both models in offline mode + runs a trivial inference. Returns dict.
+- FastAPI `GET /health` (added in M5, but shape decided here): returns
+  `{status, image_built_at, weights: {qwen, llama}, uptime_s}`.
 
 **Acceptance:**
-- `modal build modal_app/app.py` succeeds (canonical preflight; `deploy --dry-run` is not a documented flag).
-- No Function logic yet — just the image + App object.
+- `modal build modal_app/app.py` succeeds. If the weight-cache probe
+  fails, the build fails loudly and we fix the download step before M4.
+- `modal run modal_app/app.py::verify_image` returns `{"qwen": "ok", "llama": "ok"}`.
+- No heavy Function logic yet — just the image, `verify_image`, App object.
 
 **Commit message:** `feat(modal): app skeleton with prebuilt SpatialLM image`
 
@@ -96,8 +108,9 @@ the flash-attn build step (must pin CUDA version).
 - Touches Volume at `/jobs/<id>/`.
 
 **Logic:**
+0. **`verify_cache_or_die()`** — offline `from_pretrained(..., local_files_only=True)` for both models; if either is missing or corrupt, write `error.json` with `error.type="image_cache_broken"` and abort. This guards against the case where a deploy succeeded but the HF cache was partially populated.
 1. Read `input.mcap[.zst|.tar|.tar.zst]` from `/jobs/<id>/`.
-2. Decode path by suffix: stream-unzstd if `.zst`; extract first `*.mcap` if tar.
+2. Decode path by suffix: stream-unzstd if `.zst` (with 10 GiB decompressed cap); extract first `*.mcap` if tar.
 3. Validate MCAP magic bytes on the resolved file; raise with error JSON on fail.
 4. Write `status.json` atomically (tmp → rename) for each stage transition
    using an in-Python context manager `stage(name)`. **Immediately call
