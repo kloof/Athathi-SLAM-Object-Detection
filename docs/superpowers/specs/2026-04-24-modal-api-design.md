@@ -16,7 +16,7 @@ best-view images. Async execution with HTTP polling.
 |---|---|
 | Upload | Direct `POST /jobs` (binary body, up to 4 GiB). No S3, no presigned URLs. Accepts `.mcap`, `.mcap.zst`, `.tar`, or `.tar.zst` (the tar forms carry a ROS2 `rosbag2` directory; server extracts and picks the first `*.mcap` inside). |
 | Execution | Async — submit spawns a background Modal Function; client polls. Recommended polling interval 2–5 s; endpoints emit `Retry-After: 3` while status ≠ `done`/`failed`. |
-| Compute | `gpu="A10G"`, `cpu=8`, `memory=32768` MiB (SLAM is CPU-bound; SpatialLM is GPU-bound; one container runs both). `max_containers=4` caps concurrent GPU spend. |
+| Compute | `gpu="H100"`, `cpu=8`, `memory=32768` MiB (SLAM is CPU-bound; SpatialLM is GPU-bound; one container runs both). `max_containers=4` caps concurrent GPU spend. H100 picked over L4/A10G because the local dev machine is a 4070 Ti (504 GB/s bw, ~160 TFLOPS FP16) — L4 is actually *slower* than local, A10G is a wash, and SpatialLM-Llama at batch=1 is memory-bandwidth-bound. H100 at 3350 GB/s gives ~5× faster LLM decode; Modal auto-upgrades to H200 when available at no cost. |
 | Volume consistency | Runner calls `volume.commit()` after every `status.json`/`result.json` write; endpoints call `volume.reload()` at the top of every `GET /jobs/{id}` to see cross-container writes. This is Modal's canonical footgun — without it the polling UX silently serves stale state. |
 | Orchestration | Monolith — one Modal function wraps `scripts/rosbag_to_bboxes.py` unchanged. |
 | Storage | Modal Volume `slam-jobs` mounted at `/jobs` in the container. |
@@ -50,7 +50,7 @@ Each is a reasonable v2+ extension; none block v1.
           │                                           │ .spawn()
           │    ┌──────────────────────────────────────▼───────────────┐
           │    │ run_pipeline (background Modal Function)             │
-          │    │  cpu=8, memory=32G, gpu="A10G", timeout=3600         │
+          │    │  cpu=8, memory=32G, gpu="H100", timeout=3600         │
           │    │  max_containers=4                                    │
           │    │  1. decode .zst / untar if needed                    │
           │    │  2. subprocess: python rosbag_to_bboxes.py \         │
@@ -281,7 +281,7 @@ A sweeper Modal function (`@app.function(schedule=modal.Period(days=1))`) delete
 ## Cost model
 
 - Image build: one-time ~20 min of CI-class compute (~$0.30).
-- Per pipeline run: 10 min × (A10G $1.10/hr + 8 vCPU $0.14/hr + 32 GB $0.10/hr) ≈ **$0.22 per rosbag**.
+- Per pipeline run: ~6 min on H100 (vs ~10 min on 4070 Ti local) × (H100 ~$3.95/hr + 8 vCPU + 32 GB) ≈ **$0.50–0.75 per rosbag**. A10G at ~$0.22/run is cheaper but no speed win over local.
 - Volume storage: $0.20/GB-month; a typical job dir is ~3 GB → ~$0.02 for a 7-day retention window.
 - No keep-warm cost; cold start (~30 s) is negligible on a 10-min job.
 
@@ -289,5 +289,5 @@ A sweeper Modal function (`@app.function(schedule=modal.Period(days=1))`) delete
 
 - **Upload size cap** — Modal web endpoints allow up to **4 GiB** request bodies (confirmed from current Modal docs). Covers our compressed bags.
 - **CPU cores** — KISS-ICP is CPU-only and multi-threaded. `cpu=8` gives real headroom; prior memory on "multi-core scales well" applies.
-- **GPU** — SpatialLM Qwen-0.5B + Llama-1B together fit in ~6 GB VRAM; A10G's 24 GB is plenty, with margin for larger scans.
+- **GPU** — SpatialLM Qwen-0.5B + Llama-1B fit in ~6 GB VRAM, so all tiers are size-sufficient. Choice is driven by **memory bandwidth** (the actual bottleneck for batch=1 LLM decode), not VRAM. H100 @ 3350 GB/s wins ~5× over the local 4070 Ti; L4 is slower than local so rejected; A10G is roughly equivalent so only worthwhile if H100 quota is unavailable.
 - **JSON delivery** — inline in the polling response once `done`, AND persisted as `result.json` on the volume so it survives and can be re-fetched later during retention.
