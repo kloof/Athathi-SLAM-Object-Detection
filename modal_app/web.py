@@ -467,7 +467,11 @@ def build_web_app(
         job_id: str = FPath(..., pattern=JOB_ID_PATTERN),
         idx: int = FPath(...),
     ) -> Response:
-        await _safe_reload(volume)
+        # No volume.reload() here: images are written once by the runner
+        # before `status=done` is committed. If the polling endpoint has
+        # already seen the `done` state, the other container has already
+        # synced; reloading again before every large-file GET adds minutes
+        # of latency for zero correctness benefit.
         job_dir = _jobs_root() / job_id
         if not job_dir.is_dir():
             raise HTTPException(status_code=404, detail="job not found")
@@ -518,7 +522,9 @@ def build_web_app(
         job_id: str = FPath(..., pattern=JOB_ID_PATTERN),
         name: str = FPath(...),
     ) -> Response:
-        await _safe_reload(volume)
+        # No volume.reload() — static artifacts don't change after the
+        # runner writes them. Reload on every GET made 100 MB PLY
+        # downloads take 10+ minutes.
         rel = _ARTIFACT_WHITELIST.get(name)
         if rel is None:
             # Do NOT return 403 — we must not leak existence info.

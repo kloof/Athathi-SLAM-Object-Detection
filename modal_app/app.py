@@ -326,6 +326,11 @@ def verify_image() -> dict:
     retries=0,
     timeout=3600,
     max_containers=2,
+    # Scale to zero 60 s after the container last returned. Default is
+    # longer (minutes) to amortize cold-start churn for repeat work, but
+    # we'd rather pay ~30 s of cold-start on the next job than idle H100
+    # minutes. A rosbag run is 5-10 min of compute — cold start is noise.
+    scaledown_window=60,
 )
 def pipeline_runner(job_id: str) -> None:
     """Background runner invoked by the submit endpoint (M5) via `.spawn`.
