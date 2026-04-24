@@ -114,6 +114,10 @@ def main(argv=None):
     parser.add_argument("--min-window-confidence", type=float, default=None,
                          help="Drop Qwen windows below this mean token "
                               "log-prob (e.g. -0.5).")
+    parser.add_argument("--skip-best-views", action="store_true",
+                         help="Skip stage 8 (per-bbox JPG crops). Stages "
+                              "0-7 are unaffected; use to reproduce the "
+                              "pre-stage-8 behaviour exactly.")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
@@ -225,6 +229,21 @@ def main(argv=None):
     final_ply = embed_bboxes_in_ply(
         sl_input_ply, layout_merged, output / "scene_with_boxes.ply"
     )
+
+    # 8. best-view-per-bbox (additive; failures must not destroy 0-7 output)
+    if not args.skip_best_views:
+        _stage("[8/8] Best-view-per-bbox crops")
+        try:
+            from cloud_slam.spatiallm_pipeline.best_views import run_best_views
+            manifest = run_best_views(output, args.rosbag)
+            kept = sum(1 for e in manifest.get("entries", [])
+                       if "image_path" in e)
+            total = len(manifest.get("entries", []))
+            print(f"[best_views] {kept}/{total} bboxes cropped -> "
+                  f"{output / 'best_views' / 'best_views.json'}")
+        except Exception as exc:
+            # Non-fatal: upstream artifacts are already on disk.
+            print(f"[best_views] WARNING: stage 8 failed: {exc}")
 
     print(f"\n{'='*72}")
     print(f"DONE. Final deliverables in {output}:")
