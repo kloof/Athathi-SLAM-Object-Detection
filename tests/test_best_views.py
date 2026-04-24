@@ -276,3 +276,134 @@ def test_never_visible_bbox_is_skipped(tmp_path: Path):
     # No JPG should have been written
     jpgs = list((out / "best_views").glob("*.jpg"))
     assert jpgs == []
+
+
+# ---------------------------------------------------------------------------
+# 8. Camera-inside-bbox filter — frame with camera inside must be rejected
+# ---------------------------------------------------------------------------
+
+def test_camera_inside_bbox_filter():
+    """Direct unit test of _camera_inside_bbox for axis-aligned and
+    yaw-rotated boxes, including the buffer."""
+    # Axis-aligned 2x2x2 box at origin
+    assert bv._camera_inside_bbox(
+        np.array([0.0, 0.0, 0.0]), 0, 0, 0, 0.0, 2, 2, 2, 0.05) is True
+    # Just outside the box on X
+    assert bv._camera_inside_bbox(
+        np.array([1.1, 0.0, 0.0]), 0, 0, 0, 0.0, 2, 2, 2, 0.05) is False
+    # Within the buffer: 2x2x2 + 0.05 buffer -> half-extent 1.05 on every axis
+    assert bv._camera_inside_bbox(
+        np.array([1.04, 0.0, 0.0]), 0, 0, 0, 0.0, 2, 2, 2, 0.05) is True
+
+    # Yaw-rotated 45 deg around Z: box diagonal now points along world +X.
+    # A point at (1.0, 0.0, 0.0) in world is at local (cos45+sin45·0,
+    # -sin45·0+cos45·0)·1 = ~(0.707, -0.707) -> still inside a 2x2 footprint.
+    yaw = np.pi / 4
+    assert bv._camera_inside_bbox(
+        np.array([1.0, 0.0, 0.0]), 0, 0, 0, yaw, 2, 2, 2, 0.0) is True
+    # After 45 deg rotation, the corner of the 2x2 box sits at world x ≈ sqrt(2).
+    # A point at (1.5, 0.0, 0.0) should be outside (local x ≈ 1.06, just past 1).
+    assert bv._camera_inside_bbox(
+        np.array([1.5, 0.0, 0.0]), 0, 0, 0, yaw, 2, 2, 2, 0.0) is False
+
+
+def test_scoring_rejects_camera_inside_bbox():
+    """Two candidate frames for the same bbox:
+       - Frame A: camera inside the bbox (should be rejected outright).
+       - Frame B: camera 3 m in front of the bbox (should win).
+    The previous scoring picked A because the projected AABB was huge.
+    """
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        out = td / "run"
+        slam = out / "slam"
+        slam.mkdir(parents=True)
+
+        # Bbox at (0,0,0), size 2x2x2.
+        (out / "layout_merged.txt").write_text(
+            "bbox_0=Bbox(sofa,0.0,0.0,0.0,0.0,2.0,2.0,2.0)\n"
+        )
+
+        # Trajectory with two poses:
+        #   A: camera inside the bbox at (0.0, 0.0, 0.0).
+        #   B: camera 3 m along world -Y, looking along world +Y toward bbox.
+        # Quaternion convention: (qw, qx, qy, qz). A 90-deg rotation around
+        # world X brings camera +Z (looking axis) to align with world +Y.
+        # That matches our "cam looking toward world origin from world -Y".
+        import math
+        q_w = math.cos(math.pi / 4)
+        q_x = math.sin(math.pi / 4)
+        (slam / "trajectory.csv").write_text(
+            "timestamp,x,y,z,qw,qx,qy,qz\n"
+            f"1.000000,0.0,0.0,0.0,{q_w},{q_x},0.0,0.0\n"
+            f"2.000000,0.0,-3.0,0.0,{q_w},{q_x},0.0,0.0\n"
+        )
+
+        (slam / "frames_index.json").write_text(json.dumps({
+            "mcap_path": str(td / "nonexistent.mcap"),
+            "topic": "/camera/image_raw/compressed",
+            # Two frames: one at A (t=1.0s), one at B (t=2.0s).
+            "frames": [
+                {"t_ns": 1_000_000_000},
+                {"t_ns": 2_000_000_000},
+            ],
+            "level_rotation": np.eye(3).tolist(),
+            "level_z_shift_m": 0.0,
+            "manhattan_yaw_deg": 0.0,
+        }))
+
+        calib_dir = td / "calibration"
+        calib_dir.mkdir()
+        (calib_dir / "intrinsics.yaml").write_text(
+            "image_width: 1280\n"
+            "image_height: 720\n"
+            "camera_matrix:\n"
+            "  data: [900.0, 0.0, 640.0, 0.0, 900.0, 360.0, 0.0, 0.0, 1.0]\n"
+            "distortion_coefficients:\n"
+            "  data: [0.0, 0.0, 0.0, 0.0, 0.0]\n"
+        )
+        (calib_dir / "extrinsics.yaml").write_text(
+            "rotation:\n  w: 1.0\n  x: 0.0\n  y: 0.0\n  z: 0.0\n"
+            "translation:\n  x: 0.0\n  y: 0.0\n  z: 0.0\n"
+        )
+
+        # Monkey-patch read_frames_by_time_ns to supply a synthetic JPEG
+        # only for frame B (t_ns = 2_000_000_000). If the scorer asks for
+        # frame A, the test fails because frame A should have been
+        # filtered out before decode.
+        asked = []
+        def fake_reader(mcap_path, topic, t_ns_list, **kw):
+            asked.extend(list(t_ns_list))
+            # Always return a 1280x720 white JPEG for whatever was asked
+            buf = np.full((720, 1280, 3), 255, dtype=np.uint8)
+            ok, enc = cv2.imencode(".jpg", buf)
+            assert ok
+            return [(int(t), bytes(enc), "jpeg") for t in t_ns_list]
+
+        import cloud_slam.mcap_reader as mr
+        orig = mr.read_frames_by_time_ns
+        mr.read_frames_by_time_ns = fake_reader
+        try:
+            manifest = bv.run_best_views(
+                output_dir=out,
+                mcap_path=td / "nonexistent.mcap",
+                calibration_dir=calib_dir,
+                verbose=False,
+            )
+        finally:
+            mr.read_frames_by_time_ns = orig
+
+        assert len(manifest["entries"]) == 1
+        e = manifest["entries"][0]
+        # Frame A (inside) must never have been asked for.
+        assert 1_000_000_000 not in asked, (
+            "Frame A (camera inside bbox) was sent to the decoder — the "
+            "inside-bbox filter is not being applied."
+        )
+        # Either frame B wins or the entry is skipped (e.g. blank-image
+        # sharpness rank), but in no case should A be the winner.
+        if "frame_timestamp_ns" in e:
+            assert e["frame_timestamp_ns"] != 1_000_000_000

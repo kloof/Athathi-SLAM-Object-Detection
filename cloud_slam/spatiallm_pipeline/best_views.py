@@ -50,6 +50,11 @@ CANDIDATE_TOPK = 30   # prefilter pool size per bbox (cheap -> expensive)
 OCCLUSION_RADIUS_M = 0.05
 OCCLUSION_DEPTH_MARGIN_M = 0.10
 CROP_PAD_FRAC = 0.10   # 10% of AABB width/height each side
+# Reject candidates where the camera sits inside (or essentially on) the
+# bbox: the projected AABB fills the frame and the scoring collapses into
+# "object is everywhere" instead of "object is a subject". Buffer is a
+# few cm so frames right on the bbox surface are also filtered.
+CAMERA_INSIDE_BBOX_BUFFER_M = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +223,31 @@ def _bbox_corners_world(cx: float, cy: float, cz: float,
                    [0.0, 0.0, 1.0]])
     world = (Rz @ local.T).T + np.array([cx, cy, cz])
     return world
+
+
+def _camera_inside_bbox(cam_world: np.ndarray,
+                        cx: float, cy: float, cz: float, yaw: float,
+                        sx: float, sy: float, sz: float,
+                        buffer_m: float) -> bool:
+    """True if the camera position sits inside the yaw-rotated bbox
+    (expanded on every side by ``buffer_m``). Used to filter frames
+    where the camera is inside the object being viewed — those frames
+    have huge projected-AABB area that erroneously dominates scoring.
+    """
+    c, s = np.cos(yaw), np.sin(yaw)
+    # R_world_local has columns = bbox local axes expressed in world;
+    # the inverse (R_local_world) rotates a world delta back into the
+    # bbox local frame. For a yaw-only rotation that's the transpose.
+    dx = cam_world[0] - cx
+    dy = cam_world[1] - cy
+    dz = cam_world[2] - cz
+    lx =  c * dx + s * dy
+    ly = -s * dx + c * dy
+    lz = dz
+    hx = 0.5 * sx + buffer_m
+    hy = 0.5 * sy + buffer_m
+    hz = 0.5 * sz + buffer_m
+    return bool((abs(lx) <= hx) and (abs(ly) <= hy) and (abs(lz) <= hz))
 
 
 def _aabb_intersects_image(pixels_valid: np.ndarray,
@@ -510,6 +540,12 @@ def run_best_views(output_dir: Path,
         cheap = []  # list of (frame_idx, score, aabb, area, centering, cam_z)
         for fi, (t_ns, T_wc, T_cw) in enumerate(camera_poses):
             if T_cw is None:
+                continue
+            # Reject frames where the camera sits inside this bbox (the
+            # "standing inside the sofa" failure mode — projected AABB
+            # balloons and scoring picks it as the best view).
+            if _camera_inside_bbox(T_wc[:3, 3], cx, cy, cz, yaw, sx, sy, sz,
+                                   CAMERA_INSIDE_BBOX_BUFFER_M):
                 continue
             # center must be in front of cam
             center_cam = T_cw[:3, :3] @ center + T_cw[:3, 3]
