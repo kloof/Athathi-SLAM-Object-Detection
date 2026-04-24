@@ -427,9 +427,21 @@ def run_best_views(output_dir: Path,
     if verbose:
         print(f"[best_views] {len(traj_times)} trajectory poses")
 
-    frames_index_path = output_dir / "slam" / "frames_index.json"
-    if not frames_index_path.is_file():
-        raise FileNotFoundError(f"Missing {frames_index_path} (stage 0 hook)")
+    # Production path (via rosbag_to_bboxes.py): output_dir/slam/frames_index.json
+    # Standalone compare_slam.py path: output_dir/frames_index.json
+    frames_index_candidates = [
+        output_dir / "slam" / "frames_index.json",
+        output_dir / "frames_index.json",
+    ]
+    frames_index_path = next(
+        (p for p in frames_index_candidates if p.is_file()), None
+    )
+    if frames_index_path is None:
+        raise FileNotFoundError(
+            "Missing frames_index.json — looked in "
+            f"{frames_index_candidates[0]} and {frames_index_candidates[1]} "
+            "(stage 0 hook)"
+        )
     idx = json.loads(frames_index_path.read_text())
     camera_frame_times = [int(f["t_ns"]) for f in idx.get("frames", [])]
     topic = idx.get("topic", "/camera/image_raw/compressed")
