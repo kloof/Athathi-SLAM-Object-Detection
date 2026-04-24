@@ -1,52 +1,97 @@
 # Cloud SLAM ICP — Project Context
 
 ## What this is
-LiDAR SLAM + camera color projection + YOLOE-26L 3D object detection with RoomPlan-style refinement.
+End-to-end pipeline: indoor rosbag → KISS-ICP LiDAR SLAM with camera-projected
+color → SpatialLM 1.1 scene parse → 3D point cloud with wireframe bounding
+boxes + 2D floorplan.
 
-**Hardware**: Unitree L2 lidar (360°, ~2000 pts/frame) + Logitech Brio camera (1280x720, 10fps) + IMU.  
-**Test data**: `/mnt/c/Users/klof/Desktop/SLAM_test/scan_20260411_121711/`
+**Hardware**: Unitree L2 lidar (360°, ~2000 pts/scan) + Logitech Brio camera
+(1280x720, 30 fps) + IMU. Tested on RTX 4070 Ti (12 GB) under WSL2.
 
-## Current branch: `feature/yoloe-3d-detection`
+## Production entry point
 
-## Architecture
-```
-MCAP → ICP+IMU SLAM → per-frame YOLOE detect+track (BoT-SORT) → frustum extraction → 
-point accumulation per object → room structure detection (RANSAC) → Manhattan alignment → 
-size priors + Bayesian refinement → floor/wall snapping → output PLY + JSON
-```
-
-## CRITICAL BUG (current priority)
-**Bounding boxes are massively oversized** — spanning the entire room instead of individual objects.
-
-Root cause: accumulated point clouds per object contain 500-8000 points including walls, floor, ceiling.
-The frustum extraction captures too much background, and nothing removes it before OBB fitting.
-
-### The fix needed (in `cloud_slam/box_refiner.py`):
-1. **Remove structural surface points** (floor/wall/ceiling) from each object's accumulated cloud BEFORE DBSCAN and OBB fitting. Use the already-detected room planes from `room_structure.py`.
-2. **Tighten DBSCAN eps** from 0.10 to 0.05m
-3. **Hard-clamp OBB dimensions** to class size prior maximums
-
-### Key data:
-- Object [79] bed: 8494 pts accumulated, dims 2.55x2.21x1.03 (should be ~2.0x1.5x0.55)
-- Object [12] shelf: 5715 pts, dims 1.91x1.04x1.04 (should be ~0.8x0.4x1.5)
-- Object [19] chair: 589 pts, dims 0.63x0.55x0.74 (close to correct)
-
-## Test command
 ```bash
-python3 scripts/detect_and_slam.py "/mnt/c/Users/klof/Desktop/SLAM_test/scan_20260411_121711/rosbag" /tmp/detect_test "/mnt/c/Users/klof/Desktop/SLAM_test/scan_20260411_121711/calibration"
+python3 scripts/rosbag_to_bboxes.py \
+  /path/to/rosbag /path/to/output
+# uses vendored calibration/ by default; override with --calibration
 ```
-Then copy outputs: `cp /tmp/detect_test/*.ply /tmp/detect_test/*.json "/mnt/c/Users/klof/Desktop/SLAM_test/scan_20260411_121711/"`
 
-## Key files
-- `cloud_slam/box_refiner.py` — **FIX HERE** — orchestrates refinement pipeline
-- `cloud_slam/room_structure.py` — RANSAC floor/wall/ceiling detection (working)
-- `cloud_slam/manhattan.py` — Manhattan frame + wall-aligned OBB (working)
-- `cloud_slam/size_priors.py` — per-class dimension priors (working)
-- `cloud_slam/frustum.py` — frustum extraction + gravity estimation
-- `cloud_slam/tracker_3d.py` — point accumulation + Kalman tracking
-- `cloud_slam/detector.py` — YOLOE-26L wrapper
-- `cloud_slam/pipelines/detect_pipeline.py` — combines SLAM + detection
-- `scripts/detect_and_slam.py` — CLI entry point (does gravity leveling + room axis alignment)
+Tuned defaults (empirically validated): beam=4 single-shot, voxel 2.5 cm,
+temp 0.3, top_k 3. If `--beam-size 1` is passed, falls back to 3 Llama
+passes with rep_penalty 1.20 and ≥2 consensus votes.
 
-## Gravity note
-The Unitree L2 IMU reports gravity as `[3.95, 9.35, -0.04]` — the sensor is tilted ~70° from vertical. The `estimate_gravity()` function handles this with a sign check. The output script levels the scan (gravity→Z) and aligns walls to axes.
+Optional 2D floorplan PNG (separate step):
+
+```bash
+python3 scripts/draw_floorplan.py <output>/layout_merged.txt
+```
+
+## Pipeline stages (emitted artifacts)
+
+```
+0. SLAM           KISS-ICP + colorize + gravity-level
+                    -> slam/colored_map.ply, trajectory.csv, metrics.json
+1. Crop           RANSAC floorplan + polygon crop
+                    -> colored_map_cropped.ply, floorplan/*.{png,json}
+2. Manhattan      yaw-align walls to X/Y
+                    -> colored_map_manhattan.ply
+3. Voxel          colored-priority 2.5 cm downsample
+                    -> voxel.ply
+4. Interpolate    KNN color propagation for gray points
+                    -> spatiallm_input.ply
+5. Infer          Qwen-0.5B (structure) + Llama-1B (objects)
+                    -> layout_qwen.txt, layout_llama.txt
+6. Merge          walls/doors/windows (Qwen) + dedup'd bboxes (Llama)
+                    -> layout_merged.txt
+7. Embed          wireframe bboxes as edge points in the cloud
+                    -> scene_with_boxes.ply
+```
+
+## Repository layout
+
+### Live modules (`cloud_slam/`)
+- `spatiallm_pipeline/` — package implementing stages 1–7
+  - `crop.py`, `manhattan.py`, `voxel.py`, `interpolate.py`,
+    `infer.py`, `merge.py`, `embed.py`
+- `slam_backends/` — stage 0
+  - `kiss_icp_backend.py` (production), `baseline.py` (Open3D ICP+IMU fallback)
+  - `post_process.py`, `metrics.py`, `base.py`
+- `pipelines/icp_imu_pipeline.py` — ICP+IMU engine used by `baseline` backend
+- `floorplan.py` — RANSAC wall/floor/ceiling detection + refinement
+- `room_structure.py`, `frustum.py`, `projection.py` — floorplan helpers
+- `colorizer.py`, `deskew.py`, `level.py` — LiDAR post-processing
+- `mcap_reader.py` — rosbag I/O
+
+### Scripts (`scripts/`)
+- `rosbag_to_bboxes.py` — production end-to-end entry
+- `compare_slam.py` — SLAM-only runner (any backend), used as a subprocess
+- `draw_floorplan.py` — render `layout_merged.txt` as a 2D PNG
+
+### Tests (`tests/`)
+- `test_deskew.py`, `test_colorize_per_point.py` (11 tests, all pass)
+
+### Third-party (not in git)
+- `third_party/SpatialLM/` — cloned locally via `third_party/setup_spatiallm.sh`
+- `third_party/setup_spatiallm.sh` — sets up `~/spatiallm_env` venv
+
+## Calibration
+
+Vendored under `calibration/` (intrinsics.yaml + extrinsics.yaml). This is
+the authoritative source — do **not** pass scan-bundled calibration paths
+(scans carry stale auto-copied YAMLs).
+
+## Coordinate frames
+- L2 IMU reports proper acceleration with gravity pointing UP (body frame).
+- Raw SLAM world is Y-up (L2 mount tilt). Stage 0 `post_process` applies
+  gravity-leveling so the emitted `colored_map.ply` is Z-up.
+- `frame_poses.json` (when emitted) is already camera pose —
+  `T_cam_in_lidar` is composed in.
+
+## Test data
+
+Canonical rosbag + expected outputs live at:
+`/mnt/c/Users/klof/Desktop/SLAM_test/charuco_calib/TEST_SCAN/`
+(1 sectional sofa, 5–6 tables, 8 dining chairs, several mirrors + doors).
+
+Output inspection convention: copy artifacts to the Windows-side scan dir
+so the user can open them in CloudCompare.
