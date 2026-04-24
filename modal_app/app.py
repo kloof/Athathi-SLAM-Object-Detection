@@ -284,3 +284,49 @@ def pipeline_runner(job_id: str) -> None:
     from modal_app.pipeline_runner import run
 
     run(volume=volume, job_id=job_id)
+
+
+# ---------------------------------------------------------------------------
+# web — FastAPI ASGI endpoints (M5)
+# ---------------------------------------------------------------------------
+#
+# Endpoints: POST /jobs, GET /jobs/{id}, GET /jobs/{id}/image/{idx},
+# GET /jobs/{id}/artifact/{name}, DELETE /jobs/{id}, GET /health.
+# All routing + logic lives in modal_app.web.build_web_app so it's
+# testable without a Modal container (see tests/test_web.py).
+#
+# Knobs:
+# - `timeout=900` — 15-min wall cap per request. Uploads stream; the
+#   cap is mostly for runaway handlers, not body I/O.
+# - `max_containers=4` — cap warm ASGI containers independently of the
+#   heavier pipeline_runner's `max_containers=2`.
+# - `@modal.concurrent(max_inputs=50)` — lets one ASGI worker handle
+#   many in-flight polling GETs concurrently; POST /jobs is the only
+#   write-heavy path and it's still serialized per-container by the
+#   streaming body read.
+# - `api_key_secret_value` reads from env because the Secret
+#   `slam-api-key` stores the key under `API_KEY` by Modal convention.
+#   If the secret is not yet populated, `os.environ.get("API_KEY")`
+#   returns None and the endpoint code treats every request as "no
+#   auth configured yet" — accepts any non-empty X-API-Key header.
+#   See modal_app/web.py module docstring for the full rule.
+@app.function(
+    image=image,
+    volumes={"/jobs": volume},
+    secrets=[api_key_secret],
+    retries=0,
+    timeout=900,
+    max_containers=4,
+)
+@modal.concurrent(max_inputs=50)
+@modal.asgi_app()
+def web():
+    import os
+
+    from modal_app.web import build_web_app
+
+    return build_web_app(
+        volume=volume,
+        runner_fn=pipeline_runner,
+        api_key_secret_value=os.environ.get("API_KEY"),
+    )
