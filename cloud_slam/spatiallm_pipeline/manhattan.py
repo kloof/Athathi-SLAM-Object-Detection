@@ -57,4 +57,40 @@ def yaw_align_by_walls(
         pts = np.asarray(pcd.points)
         print(f"[manhattan] post-rotate bbox range "
               f"{(pts.max(0) - pts.min(0)).round(2)}  wrote {out_ply}")
+
+    # Stage 8 hook: record the applied yaw alongside the leveling transform
+    # in slam/frames_index.json. The file is written by stage 0; if it's
+    # absent (standalone manhattan run), skip with a warning. No
+    # cloud-processing behavior changes.
+    applied_yaw_deg = float(-rot_deg)
+    _augment_frames_index(out_ply, applied_yaw_deg, verbose=verbose)
+
     return out_ply, -rot_deg
+
+
+def _augment_frames_index(out_ply: Path,
+                          manhattan_yaw_deg: float,
+                          *,
+                          verbose: bool = True) -> None:
+    """Append manhattan_yaw_deg to <output>/slam/frames_index.json.
+
+    out_ply sits at <output>/colored_map_manhattan.ply, so slam/ is its
+    sibling directory. Best-effort: if the file is missing (e.g. stage 0
+    emitter was skipped on an older output), log and move on.
+    """
+    output_dir = Path(out_ply).resolve().parent
+    frames_index = output_dir / "slam" / "frames_index.json"
+    if not frames_index.is_file():
+        if verbose:
+            print(f"[manhattan] {frames_index} not found; skipping "
+                  "manhattan_yaw_deg augmentation (stage 8 will use 0.0)")
+        return
+    try:
+        payload = json.loads(frames_index.read_text())
+        payload["manhattan_yaw_deg"] = float(manhattan_yaw_deg)
+        frames_index.write_text(json.dumps(payload, indent=2))
+        if verbose:
+            print(f"[manhattan] frames_index.json: "
+                  f"manhattan_yaw_deg={manhattan_yaw_deg:+.3f}")
+    except Exception as exc:
+        print(f"[manhattan] failed to augment frames_index.json: {exc}")
