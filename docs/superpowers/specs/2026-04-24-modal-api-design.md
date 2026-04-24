@@ -266,6 +266,34 @@ A sweeper Modal function (`@app.function(schedule=modal.Period(days=1))`) delete
 - **Modal function timeout (>1 h)** → status=`failed`, error.type=`timeout`.
 - **Upload >4 GiB** → Modal's ingress may close the connection rather than returning a clean 413. The submit endpoint catches `ClientDisconnect`/`LimitOverrunError` and maps to a JSON 413 where it can, but clients should also respect the 4 GiB ceiling themselves.
 
+## Cost safety (don't burn credits)
+
+These are hard rails, not aspirations — every one has a specific
+enforcement point in code.
+
+| # | Risk | Safeguard | Enforcement |
+|---|---|---|---|
+| 1 | Pipeline hangs → 1 h of H100 | outer function `timeout=3600`, inner `subprocess.run(..., timeout=3300)` (55 min) — inner fires first so we always get a clean `TimeoutExpired` and log it | `modal_app/pipeline_runner.py` |
+| 2 | Modal auto-retries → 2× billing | `@app.function(retries=0)` on the runner and the submit function | `modal_app/app.py` |
+| 3 | On-demand image build (flash-attn ~20 min) during first request | deploy builds the image during `modal deploy`; requests never trigger layer builds. Runner asserts `SPATIALLM_PY.is_file()` at start and fails fast if env is broken. | `modal_app/app.py` + M3 acceptance |
+| 4 | Bad input reaches GPU | validation runs **in the submit endpoint** (cheap ASGI container, no GPU): check extension whitelist, decompress-probe the first 64 KB, check MCAP magic. Only after all checks pass does submit call `runner.spawn(job_id)`. | `modal_app/app.py::submit` |
+| 5 | Runaway concurrency spawning many H100s | runner declared with `max_containers=2`; request rate limit on submit at 1 req/sec/key | `modal_app/app.py` |
+| 6 | Client retries POST on transient 500 → we do the work twice | `X-Idempotency-Key` header (client-generated UUID). If an existing job with that key is found, return the existing `job_id` instead of starting a new run. Key→job_id map stored at `/jobs/_idempotency/<hash>` on the volume, 24 h TTL. | `modal_app/app.py::submit` |
+| 7 | Failed job gives no useful info → user re-runs paying again | `error.json` captures: last 4 KB of subprocess stderr, Python traceback, last known `status` value, container hostname, wall-time elapsed. One paid run is enough to debug. | `modal_app/pipeline_runner.py` |
+| 8 | Zstd decompression bomb | decompress into a size-capped writer (10 GiB ceiling); abort and delete on overflow | decode helper in runner |
+| 9 | DELETE /jobs/{id} doesn't actually cancel the function call | submit stores the `FunctionCall` object ID on the volume; DELETE loads it and invokes `FunctionCall.from_id(...).cancel()` before removing the dir | `modal_app/app.py::cancel` |
+| 10 | Multiple image versions / orphaned deploys | single-named app (`cloud-slam-icp`). Re-deploys replace the previous version atomically. | `modal_app/app.py` |
+| 11 | Deploy-time model-weight download baked into image (2 GB) fails halfway and bloats image | pre-download step uses `huggingface-cli download --local-dir` with hash verification; build fails loud if hash mismatches | image build stage |
+
+Operational check before any request is accepted:
+
+```
+$ modal deploy modal_app/app.py        # builds + deploys; 15-25 min first time
+$ modal app list | grep cloud-slam-icp # confirms deploy succeeded
+```
+
+If those two commands haven't run successfully, there's nothing to POST to.
+
 ## Security
 
 - API key comes from Modal Secret `slam-api-key`. Never committed to git.
