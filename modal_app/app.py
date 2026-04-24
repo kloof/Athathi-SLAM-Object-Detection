@@ -64,17 +64,42 @@ image = (
     #
     # Install everything into the single Python that Modal's runtime uses.
     # `pip`, `python`, `python3` all resolve to Modal's add_python=3.10.
-    .pip_install("poetry<2.0", "huggingface_hub[cli]")
-    # Copy SpatialLM source into the image, then run poetry against its
-    # pyproject.toml. `virtualenvs.create false` + `--local` makes poetry
-    # install directly into the caller's Python (Modal's), not a nested venv.
+    #
+    # We do NOT use `poetry install` on SpatialLM's pyproject.toml. First
+    # attempt tried to — poetry 1.x completed the actual installs
+    # successfully (torch 2.4.1+cu124, transformers, etc. all landed) but
+    # then crashed in its post-install reporter (poetry-core API skew:
+    # `'ProjectPackage' object has no attribute 'readme_content'` →
+    # `ModuleNotFoundError: poetry.mixology.solutions`). The crash returned
+    # non-zero and aborted the image build.
+    #
+    # Cleaner: pip-install SpatialLM's runtime deps directly, mirroring
+    # third_party/SpatialLM/pyproject.toml `[tool.poetry.dependencies]`
+    # with two deliberate omissions — poethepoet (dev/test tool that pulls
+    # poetry back as a transitive dep, recreating the bug) and rerun-sdk
+    # (visualization-only; unused by the pipeline). SpatialLM is used
+    # as a source package via PYTHONPATH, not `pip install .`, so nothing
+    # imports it as an installed distribution.
+    .pip_install("huggingface_hub[cli]")
     .add_local_dir(
         "third_party/SpatialLM",
         remote_path="/opt/spatiallm",
         copy=True,
     )
     .run_commands(
-        "cd /opt/spatiallm && python -m poetry config virtualenvs.create false --local && python -m poetry install --no-interaction",
+        # SpatialLM runtime deps. Torch wheels pulled from pytorch's
+        # cu124 index via --extra-index-url (equivalent to poetry's
+        # supplemental-source setup in the skipped poetry install).
+        "pip install --extra-index-url https://download.pytorch.org/whl/cu124 "
+        "'torch==2.4.1+cu124' 'torchvision==0.19.1+cu124' 'torchaudio==2.4.1+cu124'",
+        "pip install "
+        "'transformers>=4.41.2,<=4.46.1' 'safetensors>=0.4.5,<0.5' "
+        "'pandas>=2.2.3,<3' 'einops>=0.8.1,<0.9' 'numpy>=1.26,<2' "
+        "'scipy>=1.15.2,<2' 'scikit-learn>=1.6.1,<2' 'toml>=0.10.2,<0.11' "
+        "'tokenizers>=0.19.0,<0.20.4' 'huggingface_hub>=0.25.0' "
+        "'shapely>=2.0.7,<3' 'bbox>=0.9.4,<1' 'terminaltables>=3.1.10,<4' "
+        "'open3d>=0.18.0,<0.19' 'addict>=2.4.0,<3' "
+        "'nvidia-cudnn-cu12' 'nvidia-nccl-cu12'",
         # Sonata encoder deps — mirrors third_party/setup_spatiallm.sh.
         "pip install ninja psutil timm",
         # flash-attn is the slow step (~15 min compile against torch 2.4.1+cu124).
@@ -153,7 +178,11 @@ image = (
             "SPATIALLM_DIR": "/opt/spatiallm",
             "SPATIALLM_PY": "/usr/local/bin/cloud_slam_python",
             "SPATIALLM_CODE_TEMPLATE": "/opt/spatiallm/code_template.txt",
-            "PYTHONPATH": "/root/cloud_slam_icp",
+            # /opt/spatiallm is included so `import spatiallm` works when
+            # SpatialLM's inference.py is subprocess-launched from cwd=/opt/spatiallm
+            # (we skipped the poetry install that would have otherwise
+            # registered it as a site-packages distribution).
+            "PYTHONPATH": "/root/cloud_slam_icp:/opt/spatiallm",
             "HF_HUB_OFFLINE": "1",
         }
     )
