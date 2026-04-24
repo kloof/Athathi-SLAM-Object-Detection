@@ -1,0 +1,125 @@
+diff --git a/inference.py b/inference.py
+index bd1b661..c661af5 100644
+--- a/inference.py
++++ b/inference.py
+@@ -62,6 +62,7 @@ def generate_layout(
+     max_new_tokens=4096,
+     detect_type="all",
+     categories=[],
++    repetition_penalty=1.0,
+ ):
+     if seed >= 0:
+         set_seed(seed)
+@@ -105,6 +106,7 @@ def generate_layout(
+         top_p=top_p,
+         top_k=top_k,
+         num_beams=num_beams,
++        repetition_penalty=repetition_penalty,
+     )
+     t = Thread(target=model.generate, kwargs=generate_kwargs)
+     t.start()
+@@ -270,8 +272,29 @@ if __name__ == "__main__":
+         default=-1,
+         help="The seed to use during inference, negative value means no seed",
+     )
++    parser.add_argument(
++        "--repetition_penalty",
++        type=float,
++        default=1.0,
++        help="HuggingFace repetition_penalty for generate(). 1.0 disables. "
++             "1.15 suppresses the Llama window-repetition loop without hurting "
++             "object recall in our tests.",
++    )
++    parser.add_argument(
++        "--seeds",
++        type=str,
++        default=None,
++        help="Comma-separated list of seeds to run sequentially after the "
++             "model loads once. When set, each seed writes "
++             "<output-stem>_seed<N>.txt (overrides -o extension behavior). "
++             "Ignored if empty.",
++    )
+     args = parser.parse_args()
+ 
++    seed_list = None
++    if args.seeds:
++        seed_list = [int(s) for s in args.seeds.split(",") if s.strip()]
++
+     # load the model
+     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+     model = AutoModelForCausalLM.from_pretrained(
+@@ -304,29 +327,49 @@ if __name__ == "__main__":
+         # preprocess the point cloud to tensor features
+         input_pcd = preprocess_point_cloud(points, colors, grid_size, num_bins)
+ 
+-        # generate the layout
+-        layout = generate_layout(
+-            model,
+-            input_pcd,
+-            tokenizer,
+-            args.code_template_file,
+-            top_k=args.top_k,
+-            top_p=args.top_p,
+-            temperature=args.temperature,
+-            num_beams=args.num_beams,
+-            seed=args.seed,
+-            detect_type=args.detect_type,
+-            categories=args.category,
+-        )
+-        layout.translate(min_extent)
+-        pred_language_string = layout.to_language_string()
++        # Decide seed schedule: --seeds wins, else single pass with --seed.
++        effective_seeds = seed_list if seed_list is not None else [args.seed]
++
++        for pass_idx, seed in enumerate(effective_seeds):
++            layout = generate_layout(
++                model,
++                input_pcd,
++                tokenizer,
++                args.code_template_file,
++                top_k=args.top_k,
++                top_p=args.top_p,
++                temperature=args.temperature,
++                num_beams=args.num_beams,
++                seed=seed,
++                detect_type=args.detect_type,
++                categories=args.category,
++                repetition_penalty=args.repetition_penalty,
++            )
++            layout.translate(min_extent)
++            pred_language_string = layout.to_language_string()
+ 
+-        # check if the output path is a file or directory
+-        if os.path.splitext(args.output)[-1]:
+-            with open(args.output, "w") as f:
+-                f.write(pred_language_string)
+-        else:
+-            output_filename = os.path.basename(point_cloud_file).replace(".ply", ".txt")
+-            os.makedirs(args.output, exist_ok=True)
+-            with open(os.path.join(args.output, output_filename), "w") as f:
+-                f.write(pred_language_string)
++            # Output path resolution:
++            #  - Multi-seed mode writes <stem>_seed<N>.txt regardless of -o kind
++            #  - Single-seed mode preserves existing file-or-directory behavior
++            if len(effective_seeds) > 1:
++                base, ext = os.path.splitext(args.output)
++                if not ext:
++                    os.makedirs(args.output, exist_ok=True)
++                    stem = os.path.basename(point_cloud_file).replace(".ply", "")
++                    out_path = os.path.join(
++                        args.output, f"{stem}_seed{seed}.txt")
++                else:
++                    out_path = f"{base}_seed{seed}{ext}"
++                with open(out_path, "w") as f:
++                    f.write(pred_language_string)
++                print(f"\n[inference] wrote pass {pass_idx+1}/"
++                      f"{len(effective_seeds)} (seed={seed}) -> {out_path}")
++            else:
++                if os.path.splitext(args.output)[-1]:
++                    with open(args.output, "w") as f:
++                        f.write(pred_language_string)
++                else:
++                    output_filename = os.path.basename(point_cloud_file).replace(".ply", ".txt")
++                    os.makedirs(args.output, exist_ok=True)
++                    with open(os.path.join(args.output, output_filename), "w") as f:
++                        f.write(pred_language_string)

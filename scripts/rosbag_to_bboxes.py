@@ -67,8 +67,11 @@ def main(argv=None):
     default_calib = str(REPO / "calibration")
     parser.add_argument("--calibration", type=Path, default=default_calib,
                          help=f"Calibration dir (default vendored: {default_calib})")
-    parser.add_argument("--voxel-m", type=float, default=0.01,
-                         help="Voxel size for colored-priority downsample (default 1 cm)")
+    parser.add_argument("--voxel-m", type=float, default=0.025,
+                         help="Voxel size for colored-priority downsample "
+                              "(default 2.5 cm — matches SpatialLM's internal "
+                              "grid_size so we don't double-downsample and "
+                              "lose small objects to bin collisions)")
     parser.add_argument("--interp-k", type=int, default=8)
     parser.add_argument("--interp-radius-m", type=float, default=0.30)
     parser.add_argument("--temperature", type=float, default=0.3,
@@ -79,6 +82,19 @@ def main(argv=None):
                          help="If <output>/slam/colored_map.ply already exists, reuse it")
     parser.add_argument("--skip-llama", action="store_true",
                          help="Use only Qwen (faster, slightly worse object recall)")
+    parser.add_argument("--llama-passes", type=int, default=1,
+                         help="N sequential Llama passes (sharing one model "
+                              "load). When N>1, bboxes are taken as the "
+                              "consensus across passes. Default 1.")
+    parser.add_argument("--llama-min-votes", type=int, default=2,
+                         help="Min consensus votes to keep a bbox when "
+                              "--llama-passes>1. Default 2.")
+    parser.add_argument("--llama-rep-penalty", type=float, default=1.15,
+                         help="Llama repetition_penalty (default 1.15, "
+                              "suppresses window-duplication loop). 1.0 disables.")
+    parser.add_argument("--llama-seed-base", type=int, default=0,
+                         help="First seed for Llama passes. Seeds used: "
+                              "[base, base+1, ..., base+passes-1]. Default 0.")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
@@ -87,8 +103,12 @@ def main(argv=None):
     from cloud_slam.spatiallm_pipeline.manhattan import yaw_align_by_walls
     from cloud_slam.spatiallm_pipeline.voxel import colored_priority_voxel
     from cloud_slam.spatiallm_pipeline.interpolate import interpolate_gray_colors
-    from cloud_slam.spatiallm_pipeline.infer import run_spatiallm, MODEL_QWEN, MODEL_LLAMA
-    from cloud_slam.spatiallm_pipeline.merge import merge_layouts
+    from cloud_slam.spatiallm_pipeline.infer import (
+        run_spatiallm, run_spatiallm_multi_seed, MODEL_QWEN, MODEL_LLAMA,
+    )
+    from cloud_slam.spatiallm_pipeline.merge import (
+        merge_layouts, merge_layouts_consensus,
+    )
     from cloud_slam.spatiallm_pipeline.embed import embed_bboxes_in_ply
 
     output = Path(args.output).resolve()
@@ -130,22 +150,43 @@ def main(argv=None):
     layout_qwen = run_spatiallm(
         sl_input_ply, output / "layout_qwen.txt",
         model=MODEL_QWEN, temperature=args.temperature, top_k=args.top_k,
+        repetition_penalty=args.llama_rep_penalty,
     )
 
+    llama_layouts: list = []
     if args.skip_llama:
-        layout_llama = layout_qwen
-    else:
+        llama_layouts = [layout_qwen]
+    elif args.llama_passes <= 1:
         _stage(f"[5/7] SpatialLM inference (Llama; same sampling)")
-        layout_llama = run_spatiallm(
+        llama_layouts = [run_spatiallm(
             sl_input_ply, output / "layout_llama.txt",
             model=MODEL_LLAMA, temperature=args.temperature, top_k=args.top_k,
+            repetition_penalty=args.llama_rep_penalty,
+            seed=args.llama_seed_base,
+        )]
+    else:
+        _stage(f"[5/7] SpatialLM inference (Llama x{args.llama_passes} "
+               f"passes, shared load; rep_pen={args.llama_rep_penalty})")
+        seeds = list(range(args.llama_seed_base,
+                           args.llama_seed_base + args.llama_passes))
+        llama_layouts = run_spatiallm_multi_seed(
+            sl_input_ply, output, seeds,
+            output_stem="layout_llama",
+            model=MODEL_LLAMA, temperature=args.temperature, top_k=args.top_k,
+            repetition_penalty=args.llama_rep_penalty,
         )
 
     # 6. merge
     _stage("[6/7] Merge layouts")
-    layout_merged = merge_layouts(
-        layout_qwen, layout_llama, output / "layout_merged.txt"
-    )
+    if len(llama_layouts) > 1:
+        layout_merged = merge_layouts_consensus(
+            layout_qwen, llama_layouts, output / "layout_merged.txt",
+            min_votes=args.llama_min_votes,
+        )
+    else:
+        layout_merged = merge_layouts(
+            layout_qwen, llama_layouts[0], output / "layout_merged.txt"
+        )
 
     # 7. embed
     _stage("[7/7] Embed wireframe boxes in PLY")

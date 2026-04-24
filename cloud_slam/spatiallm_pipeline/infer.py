@@ -4,13 +4,14 @@ SpatialLM requires torch/transformers + flash-attn + spconv pinned
 differently from the main rgbd venv; it lives in ~/spatiallm_env. We
 shell out to its python and parse the resulting layout.txt.
 
-Tuned defaults: temperature=0.3, top_k=3 (empirically the setting that
-avoids the hallucination-loop failure mode while keeping class diversity).
+Tuned defaults:
+  temperature=0.3, top_k=3 — empirically avoids the hallucination-loop
+  failure mode while keeping class diversity.
+  repetition_penalty=1.15 — suppresses Llama's window-repetition loop
+  (200+ duplicate window_N=Window(...) lines).
 """
 from __future__ import annotations
 
-import os
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -32,10 +33,12 @@ def run_spatiallm(
     detect_type: str = "all",
     temperature: float = 0.3,
     top_k: int = 3,
+    repetition_penalty: float = 1.15,
+    seed: int = -1,
     timeout_s: int = 900,
     verbose: bool = True,
 ) -> Path:
-    """Run SpatialLM inference on the given PLY and dump layout to TXT."""
+    """Run a single SpatialLM inference pass on the given PLY."""
     input_ply = Path(input_ply).resolve()
     output_txt = Path(output_txt).resolve()
     if not input_ply.is_file():
@@ -55,11 +58,13 @@ def run_spatiallm(
         "-t", str(CODE_TEMPLATE),
         "--temperature", str(temperature),
         "--top_k", str(top_k),
+        "--repetition_penalty", str(repetition_penalty),
+        "--seed", str(seed),
     ]
 
     if verbose:
         print(f"[infer] model={model}  det={detect_type}  t={temperature} "
-              f"top_k={top_k}")
+              f"top_k={top_k}  rep_pen={repetition_penalty}  seed={seed}")
         print(f"        in:  {input_ply}")
         print(f"        out: {output_txt}")
     t0 = time.time()
@@ -73,3 +78,74 @@ def run_spatiallm(
     if not output_txt.is_file():
         raise RuntimeError(f"SpatialLM did not write {output_txt}")
     return output_txt
+
+
+def run_spatiallm_multi_seed(
+    input_ply: Path | str,
+    output_dir: Path | str,
+    seeds: list[int],
+    *,
+    output_stem: str = "layout",
+    model: str = MODEL_LLAMA,
+    detect_type: str = "all",
+    temperature: float = 0.3,
+    top_k: int = 3,
+    repetition_penalty: float = 1.15,
+    timeout_s: int = 1800,
+    verbose: bool = True,
+) -> list[Path]:
+    """Run N SpatialLM passes sharing a single model load.
+
+    Returns paths to the N generated layout files, one per seed, named
+    ``<output_stem>_seed<N>.txt`` inside ``output_dir``.
+    """
+    input_ply = Path(input_ply).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+
+    # Use a temp directory-style "-o" so inference.py's multi-seed branch
+    # writes <ply-stem>_seed<N>.txt; rename to <output_stem>_seed<N>.txt.
+    seeds_str = ",".join(str(s) for s in seeds)
+    cmd = [
+        str(SPATIALLM_PY),
+        "inference.py",
+        "-p", str(input_ply),
+        "-o", str(output_dir),
+        "-m", model,
+        "-d", detect_type,
+        "-t", str(CODE_TEMPLATE),
+        "--temperature", str(temperature),
+        "--top_k", str(top_k),
+        "--repetition_penalty", str(repetition_penalty),
+        "--seeds", seeds_str,
+    ]
+
+    if verbose:
+        print(f"[infer] multi-seed model={model} seeds={seeds} "
+              f"t={temperature} top_k={top_k} rep_pen={repetition_penalty}")
+        print(f"        in:  {input_ply}")
+        print(f"        out: {output_dir}")
+    t0 = time.time()
+    proc = subprocess.run(cmd, cwd=str(SPATIALLM_DIR),
+                          capture_output=True, text=True, timeout=timeout_s)
+    if verbose:
+        print(f"[infer] finished exit={proc.returncode} "
+              f"in {time.time()-t0:.1f}s ({len(seeds)} passes)")
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
+        raise RuntimeError(f"SpatialLM failed (exit {proc.returncode}):\n{tail}")
+
+    ply_stem = input_ply.stem
+    written = []
+    for seed in seeds:
+        src = output_dir / f"{ply_stem}_seed{seed}.txt"
+        dst = output_dir / f"{output_stem}_seed{seed}.txt"
+        if not src.is_file():
+            raise RuntimeError(f"SpatialLM did not write {src}")
+        if src != dst:
+            src.replace(dst)
+        written.append(dst)
+    return written
