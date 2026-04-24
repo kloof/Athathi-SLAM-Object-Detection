@@ -34,6 +34,45 @@ from cloud_slam.slam_backends.post_process import (build_map,
                                                    write_trajectory_csv)
 
 
+def _write_frames_index(out_path: Path,
+                        *,
+                        mcap_path: Path,
+                        topic: str,
+                        level_rotation_matrix,
+                        level_z_shift_m: float) -> None:
+    """Emit slam/frames_index.json for stage 8.
+
+    Scans the rosbag once without decoding image data, records the
+    nanosecond log_time of every camera message, and writes them alongside
+    the leveling transform applied during post-processing.
+
+    Failures are non-fatal: they log a warning so the existing SLAM
+    bundle (colored_map.ply + trajectory.csv + metrics.json) always lands
+    even if the mcap is unexpectedly truncated.
+    """
+    from cloud_slam.mcap_reader import list_camera_frame_times_ns
+
+    try:
+        times = list_camera_frame_times_ns(str(mcap_path), topic=topic)
+    except Exception as exc:
+        print(f"  [post] frames_index: failed to scan mcap: {exc}")
+        return
+
+    if level_rotation_matrix is None:
+        import numpy as _np
+        level_rotation_matrix = _np.eye(3).tolist()
+
+    payload = {
+        "mcap_path": str(mcap_path),
+        "topic": topic,
+        "frames": [{"t_ns": int(t)} for t in times],
+        "level_rotation": level_rotation_matrix,
+        "level_z_shift_m": float(level_z_shift_m),
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+    print(f"  [post] frames_index: {len(times)} camera frames -> {out_path}")
+
+
 def _load_calibration(calib_dir: Path | None):
     if calib_dir is None:
         return None
@@ -114,6 +153,12 @@ def main() -> int:
     metric_block = compute_all(pcd, result.poses)
     cross_section_png(pcd, str(slice_path))
 
+    # Split internal-only fields (prefixed _) out of stats before they land
+    # in metrics.json — keeps metrics.json byte-identical while letting
+    # stage 8 read transforms from slam/frames_index.json.
+    stats_for_metrics = {k: v for k, v in stats.items() if not k.startswith("_")}
+    level_rotation_matrix = stats.get("_level_rotation_matrix")
+
     metrics = {
         "backend": result.backend_name,
         "scan": rosbag.name,
@@ -123,11 +168,23 @@ def main() -> int:
         "read_mcap_s": round(t_read, 2),
         "backend_runtime_s": round(result.runtime_s, 2),
         "voxel_size_m": args.voxel_size,
-        **stats,
+        **stats_for_metrics,
         **metric_block,
         **result.extra,
     }
     metrics_path.write_text(json.dumps(metrics, indent=2))
+
+    # Stage 8 (best-view-per-bbox) reads this to pair camera frames with
+    # bboxes and to undo the raw-SLAM-frame -> leveled-world transform on
+    # trajectory.csv. Written alongside existing artifacts; ignored by
+    # stages 1-7. Additive only.
+    _write_frames_index(
+        outdir / "frames_index.json",
+        mcap_path=rosbag,
+        topic="/camera/image_raw/compressed",
+        level_rotation_matrix=level_rotation_matrix,
+        level_z_shift_m=float(stats.get("level_z_shift_m", 0.0)),
+    )
 
     print(f"\nWrote:")
     print(f"  {ply_path}  ({stats['post_final_points']:,} points)")

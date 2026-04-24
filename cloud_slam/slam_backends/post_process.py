@@ -206,6 +206,11 @@ def build_map(
     leveled = False
     rotation_deg = 0.0
     z_shift = 0.0
+    # Identity is the safe fallback — used as-is if leveling is skipped or
+    # the RANSAC finds no floor plane. Stage 8 reads this back from
+    # slam/frames_index.json to reconcile trajectory.csv (raw SLAM frame)
+    # with the leveled bbox world.
+    level_rotation_matrix = np.eye(3, dtype=np.float64)
     if level_to_floor and len(pcd.points) > 100:
         try:
             pts = np.asarray(pcd.points)
@@ -217,6 +222,12 @@ def build_map(
                 pcd.points = o3d.utility.Vector3dVector(
                     leveled_xyz.astype(np.float64))
                 leveled = True
+                # Recompute the exact 3x3 rotation applied by level_points
+                # (it uses Rotation.align_vectors([0,0,1], normal)).
+                from scipy.spatial.transform import Rotation as _R
+                _rot, _ = _R.align_vectors(
+                    np.array([[0.0, 0.0, 1.0]]), normal.reshape(1, 3))
+                level_rotation_matrix = _rot.as_matrix()
         except Exception as exc:
             print(f"  [post] leveling failed: {exc}")
 
@@ -232,6 +243,10 @@ def build_map(
         "leveled": bool(leveled),
         "level_rotation_deg": float(rotation_deg),
         "level_z_shift_m": float(z_shift),
+        # Not persisted to metrics.json (stripped by the caller) — exposed
+        # purely so stage 0 can write slam/frames_index.json with the
+        # exact 3x3 applied by level_points.
+        "_level_rotation_matrix": level_rotation_matrix.tolist(),
     }
 
     extent = pcd.get_axis_aligned_bounding_box().get_extent()
