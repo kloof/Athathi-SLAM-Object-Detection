@@ -104,10 +104,16 @@ def main(argv=None):
                               "sectional sofa not split). Set to 1 to fall "
                               "back to sampling + --llama-passes consensus.")
     parser.add_argument("--min-bbox-confidence", type=float, default=None,
-                         help="Drop bboxes whose mean token log-prob is below "
-                              "this value (requires inference.py patch v2+). "
-                              "Typical values: -1.5 (mild), -1.0 (strict), "
-                              "-0.5 (very strict). None disables the filter.")
+                         help="Drop Llama bboxes whose mean token log-prob is "
+                              "below this value. Typical values: -1.5 (mild), "
+                              "-1.0 (strict), -0.5 (very strict). None off.")
+    parser.add_argument("--min-door-confidence", type=float, default=None,
+                         help="Drop Qwen doors whose mean token log-prob is "
+                              "below this value. Useful against Qwen's "
+                              "door-hallucination tendency (e.g. -0.5).")
+    parser.add_argument("--min-window-confidence", type=float, default=None,
+                         help="Drop Qwen windows below this mean token "
+                              "log-prob (e.g. -0.5).")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
@@ -203,11 +209,15 @@ def main(argv=None):
             layout_qwen, llama_layouts, output / "layout_merged.txt",
             min_votes=args.llama_min_votes,
             min_bbox_confidence=args.min_bbox_confidence,
+            min_door_confidence=args.min_door_confidence,
+            min_window_confidence=args.min_window_confidence,
         )
     else:
         layout_merged = merge_layouts(
             layout_qwen, llama_layouts[0], output / "layout_merged.txt",
             min_bbox_confidence=args.min_bbox_confidence,
+            min_door_confidence=args.min_door_confidence,
+            min_window_confidence=args.min_window_confidence,
         )
 
     # 7. embed

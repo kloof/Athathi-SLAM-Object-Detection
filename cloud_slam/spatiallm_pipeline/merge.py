@@ -86,16 +86,12 @@ def parse_layout(layout_txt: Path | str) -> dict:
     return dict(walls=walls, doors=doors, windows=windows, bboxes=bboxes)
 
 
-def load_bbox_confidences(layout_txt: Path | str) -> dict[int, float]:
-    """Read the sidecar .conf.json next to a layout txt; empty dict if missing.
-
-    Sidecar produced by the patched SpatialLM inference.py. Keys are bbox
-    ids (int) matching the bbox_N=... identifiers in the layout text;
-    values are mean token log-probabilities (negative; closer to 0 = more
-    confident).
+def load_element_confidences(layout_txt: Path | str) -> dict[str, float]:
+    """Read the sidecar .conf.json; keys are "wall_N"/"door_N"/"window_N"/
+    "bbox_N", values are mean token log-probs (negative; closer to 0 = more
+    confident). Empty dict if missing.
     """
     layout_txt = Path(layout_txt)
-    # layout_foo.txt -> layout_foo.conf.json
     conf_path = layout_txt.with_suffix("").parent / (
         layout_txt.with_suffix("").name + ".conf.json"
     )
@@ -103,9 +99,43 @@ def load_bbox_confidences(layout_txt: Path | str) -> dict[int, float]:
         return {}
     try:
         raw = json.loads(conf_path.read_text())
-        return {int(k): float(v) for k, v in raw.items()}
+        return {str(k): float(v) for k, v in raw.items()}
     except Exception:
         return {}
+
+
+def load_bbox_confidences(layout_txt: Path | str) -> dict[int, float]:
+    """Bbox-only slice of load_element_confidences, keyed by bbox id (int).
+
+    Also accepts legacy sidecars whose keys were bare bbox ids.
+    """
+    raw = load_element_confidences(layout_txt)
+    out: dict[int, float] = {}
+    for k, v in raw.items():
+        if k.startswith("bbox_"):
+            try:
+                out[int(k.split("_", 1)[1])] = float(v)
+            except Exception:
+                continue
+        elif k.isdigit():
+            # legacy schema: keys were bare bbox ids
+            out[int(k)] = float(v)
+    return out
+
+
+def load_opening_confidences(layout_txt: Path | str, kind: str) -> dict[int, float]:
+    """Like load_bbox_confidences but for doors or windows. kind in
+    {'door','window','wall'}."""
+    raw = load_element_confidences(layout_txt)
+    prefix = f"{kind}_"
+    out: dict[int, float] = {}
+    for k, v in raw.items():
+        if k.startswith(prefix):
+            try:
+                out[int(k.split("_", 1)[1])] = float(v)
+            except Exception:
+                continue
+    return out
 
 
 def filter_bboxes_by_confidence(
@@ -135,6 +165,40 @@ def filter_bboxes_by_confidence(
     if verbose and dropped_count:
         print(f"[conf-filter] {Path(layout_txt).name}: dropped "
               f"{dropped_count}/{len(parsed['bboxes'])} bboxes below "
+              f"min_logprob={min_logprob}")
+    return kept
+
+
+def filter_openings_by_confidence(
+    layout_txt: Path | str,
+    kind: str,
+    min_logprob: float,
+    *,
+    verbose: bool = True,
+) -> list[list[float]]:
+    """Return doors or windows whose sidecar confidence >= min_logprob.
+
+    kind is 'door' or 'window'. Fail-open when sidecar is missing.
+    """
+    assert kind in ("door", "window"), kind
+    parsed = parse_layout(layout_txt)
+    key_in = f"{kind}s"  # 'doors' / 'windows' in parse_layout dict
+    items = parsed[key_in]
+    confs = load_opening_confidences(layout_txt, kind)
+    if not confs:
+        return items
+
+    kept = []
+    dropped_count = 0
+    for idx, v in enumerate(items):
+        c = confs.get(idx)
+        if c is None or c >= min_logprob:
+            kept.append(v)
+        else:
+            dropped_count += 1
+    if verbose and dropped_count:
+        print(f"[conf-filter] {Path(layout_txt).name}: dropped "
+              f"{dropped_count}/{len(items)} {kind}s below "
               f"min_logprob={min_logprob}")
     return kept
 
@@ -372,15 +436,30 @@ def merge_layouts(
     *,
     dedup_radius_m: float = 0.20,
     min_bbox_confidence: float | None = None,
+    min_door_confidence: float | None = None,
+    min_window_confidence: float | None = None,
     verbose: bool = True,
 ) -> Path:
     """Combine walls/doors/windows from `structure_layout` and bboxes
     from `objects_layout`, dedup bboxes, write unified layout file.
 
-    When `min_bbox_confidence` is set, bboxes with a sidecar confidence
-    below that threshold (mean token log-prob) are dropped before dedup.
+    Any of the `min_*_confidence` kwargs, when set, drops matching elements
+    whose sidecar confidence (mean token log-prob) is below the threshold.
     """
     s = parse_layout(structure_layout)
+    # Structure-side confidence filtering (Qwen hallucinates doors/windows)
+    if min_door_confidence is not None:
+        s_doors = filter_openings_by_confidence(
+            structure_layout, "door", min_door_confidence, verbose=verbose)
+    else:
+        s_doors = s["doors"]
+    if min_window_confidence is not None:
+        s_windows = filter_openings_by_confidence(
+            structure_layout, "window", min_window_confidence, verbose=verbose)
+    else:
+        s_windows = s["windows"]
+    s = dict(s, doors=s_doors, windows=s_windows)
+
     if min_bbox_confidence is not None:
         raw_bboxes = filter_bboxes_by_confidence(
             objects_layout, min_bbox_confidence, verbose=verbose)
@@ -597,15 +676,31 @@ def merge_layouts_consensus(
     consensus_radius_m: float = 0.30,
     min_votes: int = 2,
     min_bbox_confidence: float | None = None,
+    min_door_confidence: float | None = None,
+    min_window_confidence: float | None = None,
     verbose: bool = True,
 ) -> Path:
     """Same output shape as merge_layouts, but bboxes come from a consensus
     over N Llama passes (kept only when seen in >= min_votes passes).
 
     `min_bbox_confidence` applies a per-bbox confidence threshold on each
-    pass before voting (uses the .conf.json sidecar).
+    pass before voting (uses the .conf.json sidecar). Similarly,
+    `min_door_confidence` / `min_window_confidence` filter Qwen's
+    structural openings by their sidecar confidence.
     """
     s = parse_layout(structure_layout)
+    if min_door_confidence is not None:
+        s_doors = filter_openings_by_confidence(
+            structure_layout, "door", min_door_confidence, verbose=verbose)
+    else:
+        s_doors = s["doors"]
+    if min_window_confidence is not None:
+        s_windows = filter_openings_by_confidence(
+            structure_layout, "window", min_window_confidence, verbose=verbose)
+    else:
+        s_windows = s["windows"]
+    s = dict(s, doors=s_doors, windows=s_windows)
+
     bboxes = consensus_bboxes(
         objects_layouts,
         radius_m=consensus_radius_m,
