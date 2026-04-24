@@ -14,13 +14,14 @@ best-view images. Async execution with HTTP polling.
 
 | Area | Decision |
 |---|---|
-| Upload | Direct `POST /jobs` (binary body, up to 4 GiB). No S3, no presigned URLs. |
-| Execution | Async — submit spawns a background Modal Function; client polls. |
-| Compute | `gpu="A10G"`, `cpu=8`, `memory=32768` MiB (SLAM is CPU-bound; SpatialLM is GPU-bound; one container runs both). |
+| Upload | Direct `POST /jobs` (binary body, up to 4 GiB). No S3, no presigned URLs. Accepts `.mcap`, `.mcap.zst`, `.tar`, or `.tar.zst` (the tar forms carry a ROS2 `rosbag2` directory; server extracts and picks the first `*.mcap` inside). |
+| Execution | Async — submit spawns a background Modal Function; client polls. Recommended polling interval 2–5 s; endpoints emit `Retry-After: 3` while status ≠ `done`/`failed`. |
+| Compute | `gpu="A10G"`, `cpu=8`, `memory=32768` MiB (SLAM is CPU-bound; SpatialLM is GPU-bound; one container runs both). `max_containers=4` caps concurrent GPU spend. |
+| Volume consistency | Runner calls `volume.commit()` after every `status.json`/`result.json` write; endpoints call `volume.reload()` at the top of every `GET /jobs/{id}` to see cross-container writes. This is Modal's canonical footgun — without it the polling UX silently serves stale state. |
 | Orchestration | Monolith — one Modal function wraps `scripts/rosbag_to_bboxes.py` unchanged. |
 | Storage | Modal Volume `slam-jobs` mounted at `/jobs` in the container. |
 | Retention | 7 days; a daily scheduled function deletes `job_id/` dirs older than 7 days. |
-| Auth | Single static API key in header `X-API-Key`, stored in a Modal Secret. |
+| Auth | Single static API key in header `X-API-Key`, stored in a Modal Secret. `job_id` whitelist regex on every path param: `^j_\d{4}-\d{2}-\d{2}_[0-9a-f]{8}$`. |
 | Output | Full JSON inline in the status response once `status="done"`. Also persisted as `/jobs/<id>/result.json` on the volume so it can be re-fetched any time within retention. |
 | Images / PLYs | Served via `GET /jobs/<id>/image/<idx>` and `GET /jobs/<id>/artifact/<name>`. |
 | Compressed input | `.mcap.zst` is auto-detected by filename suffix and stream-decompressed server-side via `zstandard.ZstdDecompressor.copy_stream`. |
@@ -50,11 +51,14 @@ Each is a reasonable v2+ extension; none block v1.
           │    ┌──────────────────────────────────────▼───────────────┐
           │    │ run_pipeline (background Modal Function)             │
           │    │  cpu=8, memory=32G, gpu="A10G", timeout=3600         │
-          │    │  1. decode .zst if needed                            │
-          │    │  2. subprocess: python rosbag_to_bboxes.py … /jobs/<id>/artifacts
+          │    │  max_containers=4                                    │
+          │    │  1. decode .zst / untar if needed                    │
+          │    │  2. subprocess: python rosbag_to_bboxes.py \         │
+          │    │       <input.mcap> <artifacts_dir>                   │
+          │    │     (calibration is the vendored default, no flag)   │
           │    │  3. parse layout_merged.txt + best_views.json        │
-          │    │  4. write /jobs/<id>/result.json                     │
-          │    │  5. update /jobs/<id>/status.json                    │
+          │    │  4. write /jobs/<id>/result.json  +  volume.commit() │
+          │    │  5. update /jobs/<id>/status.json + volume.commit()  │
           │    └──────────────────────────────────────────────────────┘
           │                                           │
           │                                           │ writes
@@ -162,7 +166,7 @@ Immediately removes the job dir. Useful for debugging; not required.
       "url": "https://.../jobs/j_…/image/0",
       "frame_timestamp_ns": 1712345678000,
       "camera_distance_m": 2.14,
-      "visible_fraction": 0.87
+      "pixel_aabb": [x0, y0, x1, y1]
     }
   ],
   "artifacts": {
@@ -219,6 +223,14 @@ Steps:
 
 The image build is expensive (~20 min first run, especially flash-attn). Subsequent cold starts reuse the image layer cache.
 
+Note: `cloud_slam/spatiallm_pipeline/infer.py:79,140` runs the SpatialLM
+inference in a subprocess **without** an explicit `env=` kwarg — so the
+child inherits the Modal function's process env. The image-level `env(...)`
+above therefore propagates through both `infer.py` and its SpatialLM child
+Python without further glue. If a future refactor switches to `env=...`
+in those `subprocess.run` calls, it must explicitly forward `HF_HOME`,
+`SPATIALLM_DIR`, `SPATIALLM_PY`, `CODE_TEMPLATE`.
+
 ## Volume layout
 
 ```
@@ -250,8 +262,9 @@ A sweeper Modal function (`@app.function(schedule=modal.Period(days=1))`) delete
 - **Zstd decode fail** → status=`failed`, error.type=`decode_error`.
 - **MCAP magic-byte validation fail** → status=`failed` before pipeline spawn, so the GPU is never acquired.
 - **`rosbag_to_bboxes.py` non-zero exit** → capture stderr tail (last 4 KB), status=`failed`, error.type=`pipeline_error`, error.stage=last known stage from `status.json`.
-- **Stage 8 failure** → non-fatal per existing pipeline behaviour; result.json omits `best_images` and adds `warnings: ["best_views_failed: <msg>"]`. All other fields populated from stages 0–7.
+- **Stage 8 failure or no camera frames in bag** → non-fatal; result.json sets `best_images: []` and adds `warnings: ["best_views_failed: <msg>"]`. All other fields populated from stages 0–7.
 - **Modal function timeout (>1 h)** → status=`failed`, error.type=`timeout`.
+- **Upload >4 GiB** → Modal's ingress may close the connection rather than returning a clean 413. The submit endpoint catches `ClientDisconnect`/`LimitOverrunError` and maps to a JSON 413 where it can, but clients should also respect the 4 GiB ceiling themselves.
 
 ## Security
 

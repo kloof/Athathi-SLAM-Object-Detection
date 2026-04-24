@@ -39,6 +39,7 @@ CODE_TEMPLATE = Path(os.getenv("SPATIALLM_CODE_TEMPLATE", SPATIALLM_DIR / "code_
 - `tests/test_parse_outputs.py` (new)
 - `tests/fixtures/sample_layout_merged.txt` (new, copied from a prior TEST_SCAN run)
 - `tests/fixtures/sample_best_views.json` (new, ditto)
+- `tests/fixtures/empty_best_views.json` (new, `{"entries": []}` — covers bag-with-no-camera-frames and Stage 8 failure fallback)
 
 **Functions in `parse_outputs.py`:**
 - `parse_layout_merged(path: Path) -> dict` — regexes already exist in
@@ -54,9 +55,12 @@ CODE_TEMPLATE = Path(os.getenv("SPATIALLM_CODE_TEMPLATE", SPATIALLM_DIR / "code_
   serve time.
 
 **Acceptance:**
-- `pytest tests/test_parse_outputs.py -q` passes (≥4 tests: walls, doors,
-  windows, bboxes, and a full envelope roundtrip).
+- `pytest tests/test_parse_outputs.py -q` passes (6 tests: walls, doors,
+  windows, bboxes, full envelope roundtrip, empty-manifest fallback).
 - Fixture files committed; no network or GPU required to run the tests.
+- `best_images[]` schema matches spec (no `visible_fraction`; uses
+  `pixel_aabb` + `camera_distance_m` which *are* in the real manifest
+  at `best_views.py:698-708`).
 
 **Commit message:** `feat(api): parse layout_merged + best_views into result JSON`
 
@@ -74,8 +78,7 @@ CODE_TEMPLATE = Path(os.getenv("SPATIALLM_CODE_TEMPLATE", SPATIALLM_DIR / "code_
 **Image build steps:** exactly as listed in spec §"Modal image build".
 
 **Acceptance:**
-- `modal deploy modal_app/app.py --dry-run` succeeds (or `modal build …`
-  if dry-run unavailable — confirm in Modal CLI docs at this step).
+- `modal build modal_app/app.py` succeeds (canonical preflight; `deploy --dry-run` is not a documented flag).
 - No Function logic yet — just the image + App object.
 
 **Commit message:** `feat(modal): app skeleton with prebuilt SpatialLM image`
@@ -93,14 +96,19 @@ the flash-attn build step (must pin CUDA version).
 - Touches Volume at `/jobs/<id>/`.
 
 **Logic:**
-1. Read `input.mcap[.zst]` from `/jobs/<id>/`.
-2. If `.zst`: stream-decode with `zstandard`.
-3. Validate MCAP magic bytes; raise with error JSON on fail.
-4. Write `status.json` atomically for each stage transition using an
-   in-Python context manager `stage(name)`.
+1. Read `input.mcap[.zst|.tar|.tar.zst]` from `/jobs/<id>/`.
+2. Decode path by suffix: stream-unzstd if `.zst`; extract first `*.mcap` if tar.
+3. Validate MCAP magic bytes on the resolved file; raise with error JSON on fail.
+4. Write `status.json` atomically (tmp → rename) for each stage transition
+   using an in-Python context manager `stage(name)`. **Immediately call
+   `volume.commit()` after every rename** so the status endpoint in another
+   container can see the update.
 5. `subprocess.check_call([sys.executable, "/root/cloud_slam_icp/scripts/rosbag_to_bboxes.py", input_mcap, artifacts_dir])`.
-6. On success: `build_result_json(...)` → write `result.json`, `status="done"`.
-7. On `CalledProcessError`: capture last 4 KB of stderr, write `error.json`, `status="failed"`.
+   Calibration is the vendored default baked into the image — no CLI flag needed.
+6. On success: `build_result_json(...)` → write `result.json`, `status="done"`,
+   `volume.commit()`.
+7. On `CalledProcessError`: capture last 4 KB of stderr, write `error.json`,
+   `status="failed"`, `volume.commit()`.
 
 **Acceptance (local):**
 - `modal run modal_app/app.py::pipeline_runner --job-id test001` against
@@ -119,11 +127,29 @@ subprocess env handling (PYTHONPATH), and timeout behaviour.
 **Files:** `modal_app/app.py` (extend with `@modal.asgi_app()`).
 
 **Endpoints:**
-- `POST /jobs` — header auth, stream body to `/jobs/<id>/input.(mcap|mcap.zst)`, call `pipeline_runner.spawn(job_id)`.
-- `GET /jobs/{id}` — read status.json; if `done`, merge with result.json and rewrite artifact URLs to absolute URLs using request.base_url.
-- `GET /jobs/{id}/image/{idx}` — read best_views.json, return streaming JPEG.
-- `GET /jobs/{id}/artifact/{name}` — whitelisted file streamer.
+- `POST /jobs` — header auth, stream body to `/jobs/<id>/input.(mcap|mcap.zst|tar|tar.zst)`, call `pipeline_runner.spawn(job_id)`.
+- `GET /jobs/{id}` — **call `volume.reload()` first**; read status.json; if
+  `done`, merge with result.json and rewrite artifact URLs to absolute URLs
+  using `request.base_url`. If status ≠ `done`/`failed`, include header
+  `Retry-After: 3` to suggest a polling cadence.
+- `GET /jobs/{id}/image/{idx}` — `volume.reload()`, read best_views.json, stream JPEG.
+- `GET /jobs/{id}/artifact/{name}` — `volume.reload()`, whitelisted file streamer.
 - `DELETE /jobs/{id}` (optional).
+
+**Path-param validation:** every endpoint that takes `{id}` runs the regex
+`^j_\d{4}-\d{2}-\d{2}_[0-9a-f]{8}$` via FastAPI `Path(..., pattern=...)` to
+block path traversal.
+
+**Function decorator:**
+```python
+@app.function(image=..., volumes={"/jobs": volume}, secrets=[api_key_secret],
+              max_containers=4)
+@modal.concurrent(max_inputs=50)
+@modal.asgi_app()
+def web(): ...
+```
+`max_containers=4` caps simultaneous warm ASGI containers; the compute-heavy
+`pipeline_runner` has its own (lower) cap.
 
 **Acceptance:**
 - `curl -X POST -H "X-API-Key: …" --data-binary @small.mcap.zst https://…/jobs` returns `{job_id}`.
@@ -160,8 +186,15 @@ subprocess env handling (PYTHONPATH), and timeout behaviour.
 
 ## M7 — Full smoke on TEST_SCAN
 
-**No code changes.** Upload the canonical TEST_SCAN bag, compare
-`result.json` against expected counts:
+**No code changes.** Upload the canonical TEST_SCAN bag. Note: TEST_SCAN's
+rosbag is a `rosbag2` directory (`metadata.yaml` + `*.mcap`), so the client
+must tar it first:
+```
+tar -C /mnt/c/.../TEST_SCAN -cf - rosbag | zstd -1 > scan.tar.zst
+curl -X POST -H "X-API-Key: $KEY" --data-binary @scan.tar.zst \
+     "https://…/jobs?filename=scan.tar.zst"
+```
+Compare `result.json` against expected counts:
 - 1 sectional sofa
 - 5–6 tables
 - ≥6 dining chairs (out of 8 ground truth — SpatialLM typically merges a couple)
@@ -179,7 +212,7 @@ wrapper (path/env drift).
 
 ## Summary of all files touched
 
-### New (10)
+### New (11)
 - `modal_app/__init__.py`
 - `modal_app/app.py`
 - `modal_app/pipeline_runner.py`
@@ -189,6 +222,7 @@ wrapper (path/env drift).
 - `tests/test_parse_outputs.py`
 - `tests/fixtures/sample_layout_merged.txt`
 - `tests/fixtures/sample_best_views.json`
+- `tests/fixtures/empty_best_views.json`
 - `docs/superpowers/{specs,plans}/2026-04-24-modal-api-*.md` (this file + spec)
 
 ### Modified (2)
