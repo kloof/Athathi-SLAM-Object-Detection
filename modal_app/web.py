@@ -132,17 +132,33 @@ def _pick_suffix(filename: str) -> str | None:
     return None
 
 
-def _safe_reload(volume: Any) -> None:
-    """Best-effort ``volume.reload()`` — tests pass duck-typed doubles."""
+async def _safe_reload(volume: Any) -> None:
+    """Best-effort ``volume.reload()`` — tests pass duck-typed doubles.
+
+    Prefers the async ``.reload.aio(...)`` variant when running on real
+    Modal (Modal warns when a blocking reload() is called from an async
+    FastAPI handler). Tests pass a simple object with a sync ``reload``
+    method; the fallback handles that case.
+    """
     reload = getattr(volume, "reload", None)
-    if callable(reload):
+    if reload is None:
+        return
+    aio = getattr(reload, "aio", None)
+    if callable(aio):
+        await aio()
+    elif callable(reload):
         reload()
 
 
-def _safe_commit(volume: Any) -> None:
-    """Best-effort ``volume.commit()`` — tests pass duck-typed doubles."""
+async def _safe_commit(volume: Any) -> None:
+    """Best-effort ``volume.commit()`` — same sync/async dispatch as reload."""
     commit = getattr(volume, "commit", None)
-    if callable(commit):
+    if commit is None:
+        return
+    aio = getattr(commit, "aio", None)
+    if callable(aio):
+        await aio()
+    elif callable(commit):
         commit()
 
 
@@ -282,7 +298,7 @@ def build_web_app(
         # Idempotency short-circuit — do this BEFORE writing any bytes
         # so retried POSTs don't even consume bandwidth we'll throw away.
         if x_idempotency_key:
-            _safe_reload(volume)
+            await _safe_reload(volume)
             # Use a provisional job_id for the record; it's only
             # written if no prior record exists.
             provisional = _generate_job_id()
@@ -356,7 +372,7 @@ def build_web_app(
             "filename": filename,
         }
         _write_json_atomic(job_dir / "status.json", status_payload)
-        _safe_commit(volume)
+        await _safe_commit(volume)
 
         # Spawn the background runner. ``call.object_id`` is Modal's
         # FunctionCall handle; we persist it so DELETE can cancel.
@@ -383,7 +399,7 @@ def build_web_app(
                     (job_dir / "function_call_id.txt").write_text(
                         str(object_id), encoding="utf-8"
                     )
-                    _safe_commit(volume)
+                    await _safe_commit(volume)
             except AttributeError:
                 # Tests mock .spawn() without an object_id — fine.
                 pass
@@ -405,7 +421,7 @@ def build_web_app(
         request: Request,
         job_id: str = FPath(..., pattern=JOB_ID_PATTERN),
     ) -> Response:
-        _safe_reload(volume)
+        await _safe_reload(volume)
         job_dir = _jobs_root() / job_id
         if not job_dir.is_dir():
             raise HTTPException(status_code=404, detail="job not found")
@@ -451,7 +467,7 @@ def build_web_app(
         job_id: str = FPath(..., pattern=JOB_ID_PATTERN),
         idx: int = FPath(...),
     ) -> Response:
-        _safe_reload(volume)
+        await _safe_reload(volume)
         job_dir = _jobs_root() / job_id
         if not job_dir.is_dir():
             raise HTTPException(status_code=404, detail="job not found")
@@ -502,7 +518,7 @@ def build_web_app(
         job_id: str = FPath(..., pattern=JOB_ID_PATTERN),
         name: str = FPath(...),
     ) -> Response:
-        _safe_reload(volume)
+        await _safe_reload(volume)
         rel = _ARTIFACT_WHITELIST.get(name)
         if rel is None:
             # Do NOT return 403 — we must not leak existence info.
@@ -527,7 +543,7 @@ def build_web_app(
         job_id: str = FPath(..., pattern=JOB_ID_PATTERN),
         _auth: None = Depends(auth_dep),
     ) -> JSONResponse:
-        _safe_reload(volume)
+        await _safe_reload(volume)
         job_dir = _jobs_root() / job_id
         if not job_dir.is_dir():
             raise HTTPException(status_code=404, detail="job not found")
@@ -547,7 +563,7 @@ def build_web_app(
                     pass
 
         shutil.rmtree(job_dir, ignore_errors=True)
-        _safe_commit(volume)
+        await _safe_commit(volume)
         return JSONResponse(status_code=200, content={"status": "deleted"})
 
     # ------------------------------------------------------------------
