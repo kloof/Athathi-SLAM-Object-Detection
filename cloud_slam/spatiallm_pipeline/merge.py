@@ -341,6 +341,186 @@ def merge_layouts(
     return out_txt
 
 
+def _normalize_wall_endpoints(w: list[float]) -> tuple[tuple, tuple]:
+    """Return endpoints sorted lexicographically so direction doesn't matter."""
+    a = (round(w[0], 3), round(w[1], 3), round(w[2], 3))
+    b = (round(w[3], 3), round(w[4], 3), round(w[5], 3))
+    return (a, b) if a <= b else (b, a)
+
+
+def consensus_walls(
+    layouts: Sequence[Path | str],
+    *,
+    endpoint_tol_m: float = 0.40,
+    min_votes: int = 2,
+    verbose: bool = True,
+) -> list[list[float]]:
+    """Consensus vote over wall segments across N SpatialLM layouts.
+
+    Two walls are treated as the same segment when BOTH sorted endpoints
+    are within endpoint_tol_m. Clusters with >=min_votes survive. The
+    surviving wall takes the median of contributing endpoints + median
+    height + thickness.
+    """
+    per_layout: list[list[list[float]]] = [parse_layout(p)["walls"] for p in layouts]
+
+    clusters: list[dict] = []  # {norm_a, norm_b, walls:[full], layouts:set}
+    for layout_idx, walls in enumerate(per_layout):
+        for w in walls:
+            a, b = _normalize_wall_endpoints(w)
+            picked = None
+            best_d = float("inf")
+            for c in clusters:
+                if layout_idx in c["layouts"]:
+                    continue
+                # distance = max of the two endpoint distances, after matching
+                # (a1<->a2, b1<->b2) vs (a1<->b2, b1<->a2).
+                d_aa = math.dist(a, c["norm_a"])
+                d_bb = math.dist(b, c["norm_b"])
+                d1 = max(d_aa, d_bb)
+                d_ab = math.dist(a, c["norm_b"])
+                d_ba = math.dist(b, c["norm_a"])
+                d2 = max(d_ab, d_ba)
+                d = min(d1, d2)
+                if d < endpoint_tol_m and d < best_d:
+                    picked = c
+                    best_d = d
+            if picked is None:
+                clusters.append({
+                    "norm_a": a, "norm_b": b,
+                    "walls": [w],
+                    "layouts": {layout_idx},
+                })
+            else:
+                picked["walls"].append(w)
+                picked["layouts"].add(layout_idx)
+
+    out = []
+    for c in clusters:
+        if len(c["layouts"]) < min_votes:
+            continue
+        arr = np.array(c["walls"])  # (k, 8)
+        # Re-orient each contributing wall so endpoint A sorts first.
+        reoriented = []
+        for w in c["walls"]:
+            a, b = _normalize_wall_endpoints(w)
+            reoriented.append(list(a) + list(b) + [w[6], w[7]])
+        arr2 = np.array(reoriented)  # (k, 8) — [ax,ay,az,bx,by,bz,height,thickness]
+        med = np.median(arr2, axis=0)
+        out.append([float(x) for x in med])
+
+    if verbose:
+        print(f"[consensus-walls] {len(layouts)} passes, "
+              f"{sum(len(x) for x in per_layout)} raw -> "
+              f"{len(clusters)} clusters -> {len(out)} kept "
+              f"(>={min_votes} votes, tol={endpoint_tol_m}m)")
+    return out
+
+
+def consensus_openings(
+    layouts: Sequence[Path | str],
+    kind: str,
+    *,
+    pos_tol_m: float = 0.35,
+    min_votes: int = 2,
+    verbose: bool = True,
+) -> list[list[float]]:
+    """Same voting logic, but for doors or windows (kind in {'doors','windows'}).
+
+    Clusters by (position_x, position_y, position_z) within pos_tol_m.
+    Returns list of [pos_x, pos_y, pos_z, width, height] entries.
+    """
+    assert kind in ("doors", "windows")
+    per_layout = [parse_layout(p)[kind] for p in layouts]
+
+    clusters: list[dict] = []
+    for layout_idx, openings in enumerate(per_layout):
+        for v in openings:
+            px, py, pz = v[0], v[1], v[2]
+            picked = None
+            best_d2 = float("inf")
+            for c in clusters:
+                if layout_idx in c["layouts"]:
+                    continue
+                mc = np.mean(c["centers"], axis=0)
+                d2 = (px - mc[0])**2 + (py - mc[1])**2 + (pz - mc[2])**2
+                if d2 < pos_tol_m * pos_tol_m and d2 < best_d2:
+                    picked = c
+                    best_d2 = d2
+            if picked is None:
+                clusters.append({
+                    "centers": [[px, py, pz]],
+                    "vs": [v],
+                    "layouts": {layout_idx},
+                })
+            else:
+                picked["centers"].append([px, py, pz])
+                picked["vs"].append(v)
+                picked["layouts"].add(layout_idx)
+
+    out = []
+    for c in clusters:
+        if len(c["layouts"]) < min_votes:
+            continue
+        arr = np.array(c["vs"])  # (k, 5) — [px, py, pz, width, height]
+        med = np.median(arr, axis=0)
+        out.append([float(x) for x in med])
+
+    if verbose:
+        print(f"[consensus-{kind[:-1]}] {len(layouts)} passes, "
+              f"{sum(len(x) for x in per_layout)} raw -> "
+              f"{len(clusters)} clusters -> {len(out)} kept "
+              f"(>={min_votes} votes, tol={pos_tol_m}m)")
+    return out
+
+
+def merge_layouts_full_consensus(
+    structure_layouts: Sequence[Path | str],
+    objects_layouts: Sequence[Path | str],
+    out_txt: Path | str,
+    *,
+    struct_min_votes: int = 2,
+    object_min_votes: int = 2,
+    object_consensus_radius_m: float = 0.30,
+    verbose: bool = True,
+) -> Path:
+    """Consensus over BOTH Qwen structure and Llama objects.
+
+    Qwen runs N times, walls/doors/windows each voted; surviving elements
+    take the median of their contributors. Llama runs N times, bboxes
+    voted via consensus_bboxes.
+    """
+    walls   = consensus_walls(structure_layouts, min_votes=struct_min_votes,
+                              verbose=verbose)
+    doors   = consensus_openings(structure_layouts, "doors",
+                                 min_votes=struct_min_votes, verbose=verbose)
+    windows = consensus_openings(structure_layouts, "windows",
+                                 min_votes=struct_min_votes, verbose=verbose)
+    bboxes = consensus_bboxes(objects_layouts,
+                              radius_m=object_consensus_radius_m,
+                              min_votes=object_min_votes,
+                              verbose=verbose)
+    if verbose:
+        print(f"[merge] struct: {len(walls)}w {len(doors)}d {len(windows)}win  "
+              f"| consensus bboxes: {len(bboxes)}")
+
+    out_lines = []
+    for i, w in enumerate(walls):
+        out_lines.append(f"wall_{i}=Wall({','.join(str(x) for x in w)})")
+    for i, d in enumerate(doors):
+        out_lines.append(f"door_{i}=Door(wall_0,{','.join(str(x) for x in d)})")
+    for i, d in enumerate(windows):
+        out_lines.append(f"window_{i}=Window(wall_0,{','.join(str(x) for x in d)})")
+    for i, (cls, v) in enumerate(bboxes):
+        out_lines.append(f"bbox_{i}=Bbox({cls},{','.join(str(x) for x in v)})")
+
+    out_txt = Path(out_txt)
+    out_txt.write_text("\n".join(out_lines) + "\n")
+    if verbose:
+        print(f"[merge] wrote {out_txt}")
+    return out_txt
+
+
 def merge_layouts_consensus(
     structure_layout: Path | str,
     objects_layouts: Sequence[Path | str],
