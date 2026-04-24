@@ -132,6 +132,17 @@ image = (
         remote_path="/root/cloud_slam_icp/calibration",
         copy=True,
     )
+    # modal_app/ itself — pipeline_runner / web / decode / status /
+    # idempotency are imported by the @app.function bodies at runtime.
+    # Without this, Modal's container has only /root/app.py (the deploy
+    # script) and `from modal_app.web import build_web_app` fails with
+    # ModuleNotFoundError. PYTHONPATH already includes /root/cloud_slam_icp
+    # so the package is importable as `modal_app`.
+    .add_local_dir(
+        "modal_app",
+        remote_path="/root/cloud_slam_icp/modal_app",
+        copy=True,
+    )
     .add_local_file(
         "cloud_slam/requirements.txt",
         remote_path="/root/cloud_slam_icp/requirements.txt",
