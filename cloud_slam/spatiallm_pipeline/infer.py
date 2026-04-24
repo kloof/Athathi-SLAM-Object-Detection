@@ -35,10 +35,16 @@ def run_spatiallm(
     top_k: int = 3,
     repetition_penalty: float = 1.15,
     seed: int = -1,
+    num_beams: int = 1,
     timeout_s: int = 900,
     verbose: bool = True,
 ) -> Path:
-    """Run a single SpatialLM inference pass on the given PLY."""
+    """Run a single SpatialLM inference pass on the given PLY.
+
+    When num_beams>1 the worker uses deterministic beam search
+    (do_sample=False) instead of sampling — trades multi-pass consensus
+    for a single deterministic pass that explores num_beams hypotheses.
+    """
     input_ply = Path(input_ply).resolve()
     output_txt = Path(output_txt).resolve()
     if not input_ply.is_file():
@@ -60,11 +66,13 @@ def run_spatiallm(
         "--top_k", str(top_k),
         "--repetition_penalty", str(repetition_penalty),
         "--seed", str(seed),
+        "--num_beams", str(num_beams),
     ]
 
     if verbose:
-        print(f"[infer] model={model}  det={detect_type}  t={temperature} "
-              f"top_k={top_k}  rep_pen={repetition_penalty}  seed={seed}")
+        mode = f"beam(n={num_beams})" if num_beams > 1 else f"sample(t={temperature} k={top_k})"
+        print(f"[infer] model={model}  det={detect_type}  mode={mode}  "
+              f"rep_pen={repetition_penalty}  seed={seed}")
         print(f"        in:  {input_ply}")
         print(f"        out: {output_txt}")
     t0 = time.time()

@@ -97,6 +97,11 @@ def main(argv=None):
     parser.add_argument("--llama-seed-base", type=int, default=0,
                          help="First seed for Llama passes. Seeds used: "
                               "[base, base+1, ..., base+passes-1]. Default 0.")
+    parser.add_argument("--beam-size", type=int, default=1,
+                         help="If >1, use deterministic beam search for "
+                              "Llama + Qwen (one pass explores N hypotheses), "
+                              "overrides --llama-passes to 1. Default 1 "
+                              "(sampling).")
     args = parser.parse_args(argv)
 
     # Defer heavy imports until the CLI has parsed args
@@ -148,23 +153,30 @@ def main(argv=None):
     )
 
     # 5. infer
-    _stage(f"[5/7] SpatialLM inference (Qwen; temp={args.temperature} topk={args.top_k})")
+    use_beam = args.beam_size > 1
+    if use_beam:
+        _stage(f"[5/7] SpatialLM inference (Qwen; BEAM n={args.beam_size})")
+    else:
+        _stage(f"[5/7] SpatialLM inference (Qwen; temp={args.temperature} topk={args.top_k})")
     layout_qwen = run_spatiallm(
         sl_input_ply, output / "layout_qwen.txt",
         model=MODEL_QWEN, temperature=args.temperature, top_k=args.top_k,
         repetition_penalty=args.llama_rep_penalty,
+        num_beams=args.beam_size,
     )
 
     llama_layouts: list = []
     if args.skip_llama:
         llama_layouts = [layout_qwen]
-    elif args.llama_passes <= 1:
-        _stage(f"[5/7] SpatialLM inference (Llama; same sampling)")
+    elif use_beam or args.llama_passes <= 1:
+        mode = f"BEAM n={args.beam_size}" if use_beam else "same sampling"
+        _stage(f"[5/7] SpatialLM inference (Llama; {mode})")
         llama_layouts = [run_spatiallm(
             sl_input_ply, output / "layout_llama.txt",
             model=MODEL_LLAMA, temperature=args.temperature, top_k=args.top_k,
             repetition_penalty=args.llama_rep_penalty,
             seed=args.llama_seed_base,
+            num_beams=args.beam_size,
         )]
     else:
         _stage(f"[5/7] SpatialLM inference (Llama x{args.llama_passes} "
