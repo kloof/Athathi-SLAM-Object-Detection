@@ -18,8 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-from shapely.geometry import Point as ShapelyPoint
-from shapely.prepared import prep
+import shapely
 
 
 def crop_to_floorplan(
@@ -92,18 +91,23 @@ def crop_to_floorplan(
     z_ok = (pts[:, 2] >= floor_z - z_margin_m) & (pts[:, 2] <= ceiling_z + z_margin_m)
 
     # --- polygon containment (vectorized with bbox prefilter) ---
-    prepared = prep(room_poly)
     minx, miny, maxx, maxy = room_poly.bounds
     xy = pts[:, :2]
     bbox_ok = (xy[:, 0] >= minx) & (xy[:, 0] <= maxx) & \
               (xy[:, 1] >= miny) & (xy[:, 1] <= maxy)
 
     t0 = time.time()
-    candidate = np.flatnonzero(z_ok & bbox_ok)
+    candidate_mask = z_ok & bbox_ok
     poly_ok = np.zeros(len(pts), dtype=bool)
-    for i in candidate:
-        if prepared.contains(ShapelyPoint(xy[i, 0], xy[i, 1])):
-            poly_ok[i] = True
+    if candidate_mask.any():
+        # shapely.vectorized.contains runs the point-in-polygon test as a
+        # single GEOS call over numpy arrays. Replaces a Python per-point
+        # loop that was O(N) in Python overhead and dominated stage 1
+        # wall time for large scans (~50 s on 4.3M candidates).
+        cand_xy = xy[candidate_mask]
+        contained = shapely.contains_xy(
+            room_poly, cand_xy[:, 0], cand_xy[:, 1])
+        poly_ok[np.flatnonzero(candidate_mask)] = contained
     if verbose:
         print(f"[crop] polygon point-in {time.time()-t0:.1f}s  "
               f"kept {int(poly_ok.sum()):,} / {int(bbox_ok.sum()):,} candidates")
