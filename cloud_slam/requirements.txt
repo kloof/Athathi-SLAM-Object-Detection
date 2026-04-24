@@ -13,3 +13,4 @@ matplotlib>=3.7.0
 shapely>=2.0.0
 modal>=1.4.0
 zstandard>=0.22.0
+kiss-icp>=1.0.0
