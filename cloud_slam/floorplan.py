@@ -271,13 +271,24 @@ def _voxel_downsample(pcd, voxel_size=0.03, sor_neighbors=20, sor_std=2.0):
 
 
 def extract_ceiling_points(pts, ceiling_z, band=0.15, floor_z=None,
-                            ceiling_plane=None):
+                            ceiling_plane=None,
+                            first_peak_above=None,
+                            peak_margin_below=0.30,
+                            peak_bin_width=0.05,
+                            verbose=False):
     """Extract ceiling-level points projected to XY.
 
-    If `ceiling_plane` is provided (the RANSAC ceiling plane from
-    detect_room), use point-to-plane distance — robust to residual leveling
-    tilt and correct when the plane's normal is not exactly [0, 0, 1].
-    Otherwise fall back to a tight Z-band centred on `ceiling_z`.
+    Three modes, tried in order:
+      1. `first_peak_above` set  -> histogram-peak mode (preferred when the
+         scan has been leveled and the ceiling is roughly planar in Z):
+         take Z>threshold points, find the FIRST histogram peak (lowest z,
+         using scipy find_peaks — NOT argmax/tallest-bar), keep everything
+         within `peak_margin_below` m below that peak and above. This isolates
+         the ceiling while rejecting furniture tops (cabinets/shelves) that
+         may have more points than the ceiling itself.
+      2. `ceiling_plane` provided -> point-to-plane distance (robust to
+         residual leveling tilt).
+      3. fallback -> tight Z-band centred on `ceiling_z`.
 
     The previous implementation used a 70 %-of-room-height cutoff, which
     produced a ~1 m thick band that included tops of tall furniture
@@ -285,18 +296,50 @@ def extract_ceiling_points(pts, ceiling_z, band=0.15, floor_z=None,
     is intentionally removed.
 
     Args:
-        pts:            (N, 3) cloud points.
-        ceiling_z:      ceiling height along gravity (for the Z-band fallback).
-        band:           half-thickness of the mask in meters. Default 0.15.
-        floor_z:        unused in the current implementation; kept for
-                        backwards compatibility.
-        ceiling_plane:  Plane object from room_structure.detect_room with
-                        `normal` and `centroid` attributes. Optional.
+        pts:                (N, 3) cloud points.
+        ceiling_z:          ceiling height along gravity (for the Z-band fallback).
+        band:               half-thickness of the mask in meters. Default 0.15.
+        floor_z:            unused in the current implementation; kept for
+                            backwards compatibility.
+        ceiling_plane:      Plane object from room_structure.detect_room with
+                            `normal` and `centroid` attributes. Optional.
+        first_peak_above:   Z threshold (m). When set, enables histogram-peak
+                            mode (see above). Typical: 1.5. Default None.
+        peak_margin_below:  meters to include below the first peak. Default 0.30.
+        peak_bin_width:     Z-histogram bin width (m). Default 0.05.
+        verbose:            print chosen peak / cutoff for diagnostics.
 
     Returns:
         (M, 2) XY coordinates of the masked points.
     """
     del floor_z  # unused; retained for backwards compatibility
+
+    if first_peak_above is not None:
+        z = pts[:, 2]
+        high = z[z >= float(first_peak_above)]
+        if high.size >= 100:
+            z_lo, z_hi = float(high.min()), float(high.max())
+            nbins = max(8, int(np.ceil((z_hi - z_lo) / peak_bin_width)))
+            hist, edges = np.histogram(high, bins=nbins)
+            min_peak_height = max(3.0, 0.15 * float(hist.max()))
+            pks, _ = find_peaks(hist, height=min_peak_height)
+            if pks.size > 0:
+                peak_idx = int(pks[0])  # first = lowest-Z peak
+                source = "first-peak"
+            else:
+                peak_idx = int(np.argmax(hist))
+                source = "argmax-fallback"
+            peak_z = 0.5 * (float(edges[peak_idx]) + float(edges[peak_idx + 1]))
+            cutoff = peak_z - float(peak_margin_below)
+            mask = z >= cutoff
+            if verbose:
+                print(f"[ceiling-peak] {source}: peak_z={peak_z:.3f}m, "
+                      f"cutoff={cutoff:.3f}m, kept {int(mask.sum())}/{len(z)} "
+                      f"({100 * mask.mean():.1f}%)")
+            return pts[mask][:, :2]
+        if verbose:
+            print(f"[ceiling-peak] only {high.size} pts above "
+                  f"{first_peak_above}m — falling back to plane/Z-band")
 
     if ceiling_plane is not None:
         # Point-to-plane distance (preferred path).
@@ -1651,11 +1694,16 @@ def generate_floorplan(pcd, output_dir, name="floorplan", *,
         print(f"Loaded: {n_raw} -> {len(pts)} pts")
         print(f"Floor: {floor_z:.2f}m, Ceiling: {ceiling_z:.2f}m, Height: {h:.2f}m")
 
-    # Mask is a tight band around the ceiling only (no more 70%-of-room
-    # cutoff — that included furniture tops). Uses point-to-plane distance
-    # when a RANSAC ceiling plane is available; falls back to a Z-band.
+    # Ceiling-only slice. Preferred: find the FIRST Z-histogram peak above
+    # 1.5 m and keep everything within 30 cm below it and above — isolates
+    # just the ceiling, robust against tall-furniture tops dominating the
+    # RANSAC plane or Z-band mask. Plane/Z-band modes remain as fallbacks
+    # inside extract_ceiling_points if <100 pts exist above 1.5 m.
     ceil_xy = extract_ceiling_points(pts, ceiling_z, band=ceil_band,
-                                     ceiling_plane=ceiling_plane)
+                                     ceiling_plane=ceiling_plane,
+                                     first_peak_above=1.5,
+                                     peak_margin_below=0.30,
+                                     verbose=verbose)
     if verbose:
         print(f"Ceiling points: {len(ceil_xy)}")
 
