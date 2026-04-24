@@ -108,6 +108,7 @@ def render_floorplan(
     min_label_area=0.2,
     wall_lw=3.5,
     opening_lw=5.0,
+    show_wall_lengths=True,
 ):
     layout = parse_layout(layout_txt)
     walls   = layout["walls"]
@@ -153,6 +154,33 @@ def render_floorplan(
         ax.plot([a[0], b[0]], [a[1], b[1]],
                 color="black", linewidth=wall_lw,
                 solid_capstyle="round", zorder=2.0)
+
+    if show_wall_lengths:
+        for (a, b) in segs:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            length_m = math.hypot(dx, dy)
+            if length_m < 0.2:
+                continue
+            mx, my = 0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])
+            angle_deg = math.degrees(math.atan2(dy, dx))
+            # Flip text so it reads left-to-right (never upside down).
+            if angle_deg > 90:
+                angle_deg -= 180
+            elif angle_deg < -90:
+                angle_deg += 180
+            # Perpendicular offset outward (small).
+            seg_len = max(length_m, 1e-6)
+            nx, ny = -dy / seg_len, dx / seg_len
+            off = 0.12
+            ax.text(mx + off * nx, my + off * ny,
+                    f"{length_m:.2f} m",
+                    ha="center", va="center",
+                    fontsize=7, color="black",
+                    rotation=angle_deg, rotation_mode="anchor",
+                    zorder=2.5,
+                    bbox=dict(boxstyle="round,pad=0.15",
+                              facecolor="white",
+                              edgecolor="none", alpha=0.8))
 
     for d in doors:
         px, py, _pz, wdt, _ht = d
@@ -208,6 +236,8 @@ def main():
     p.add_argument("--min-label-area", type=float, default=0.2,
                    help="Skip labels for bboxes with XY area (m^2) below "
                         "this (default 0.2; hides pillows/curtains).")
+    p.add_argument("--no-wall-lengths", action="store_true",
+                   help="Omit wall-length labels on each wall segment.")
     args = p.parse_args()
 
     if not args.layout.is_file():
@@ -223,6 +253,7 @@ def main():
         dpi=args.dpi,
         show_labels=not args.no_labels,
         min_label_area=args.min_label_area,
+        show_wall_lengths=not args.no_wall_lengths,
     )
     print(f"wrote {path}")
 
