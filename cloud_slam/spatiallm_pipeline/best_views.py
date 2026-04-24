@@ -55,6 +55,12 @@ CROP_PAD_FRAC = 0.10   # 10% of AABB width/height each side
 # "object is everywhere" instead of "object is a subject". Buffer is a
 # few cm so frames right on the bbox surface are also filtered.
 CAMERA_INSIDE_BBOX_BUFFER_M = 0.05
+# Require at least this fraction of the projected-AABB area to fall
+# within the image. A camera that is too close — or sitting inside the
+# object's footprint while elevated above it — produces an AABB much
+# larger than the image, with only a small "window" of it visible. Those
+# frames are bad viewpoints even though the area score saturates at 1.0.
+MIN_AABB_VISIBLE_FRACTION = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -555,9 +561,29 @@ def run_best_views(output_dir: Path,
                 corners, T_cw, K, D)
             if not in_front.any():
                 continue
+            # Require most corners in front of camera. If fewer than 5 of
+            # 8 are in front, the camera is near or inside the bbox and
+            # the projected AABB will be wildly distorted.
+            if int(in_front.sum()) < 5:
+                continue
             pixels_valid = pixels[in_front]
             overlaps, aabb = _aabb_intersects_image(pixels_valid, image_size)
             if not overlaps:
+                continue
+            # Visible-fraction filter: the image-clipped projection must
+            # cover a reasonable share of the raw projected AABB. This
+            # catches the "camera hovering inside the footprint" case
+            # where the raw AABB is multiple image-widths across but
+            # only a small slice is actually on-screen.
+            x0, y0, x1, y1 = aabb
+            raw_w = max(1.0, x1 - x0)
+            raw_h = max(1.0, y1 - y0)
+            raw_area = raw_w * raw_h
+            W, H = image_size
+            cw = max(0.0, min(W, x1)) - max(0.0, min(W, x0))
+            ch = max(0.0, min(H, y1)) - max(0.0, min(H, y0))
+            clipped_area = max(0.0, cw) * max(0.0, ch)
+            if clipped_area / raw_area < MIN_AABB_VISIBLE_FRACTION:
                 continue
             a = _area_score(aabb, image_size)
             c = _centering_score(aabb, image_size)
