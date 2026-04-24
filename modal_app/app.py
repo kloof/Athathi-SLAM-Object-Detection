@@ -330,3 +330,83 @@ def web():
         runner_fn=pipeline_runner,
         api_key_secret_value=os.environ.get("API_KEY"),
     )
+
+
+# ---------------------------------------------------------------------------
+# retention_sweeper — daily cleanup of aged job dirs (M6)
+# ---------------------------------------------------------------------------
+#
+# Deletes any /jobs/<job_id>/ directory whose status.json mtime is older
+# than 7 days. Idempotency records under /jobs/_idempotency/ are swept by
+# the same rule (their mtime reflects last write, not last read — a client
+# retrying under an old idempotency key is the only way to keep a record
+# alive, which is exactly the correct TTL semantics).
+#
+# Runs on CPU only (no GPU attached), so the cost is negligible —
+# order of $0.001 per daily run. retries=0 because a one-day miss is
+# harmless; the next run will pick up what this one missed.
+@app.function(
+    volumes={"/jobs": volume},
+    schedule=modal.Period(days=1),
+    retries=0,
+    timeout=600,
+)
+def retention_sweeper() -> dict:
+    """Remove /jobs/<id>/ dirs older than RETENTION_DAYS.
+
+    Returns a summary dict for observability via `modal app logs`.
+    """
+    import shutil
+    import time
+    from pathlib import Path
+
+    RETENTION_DAYS = 7
+    cutoff = time.time() - RETENTION_DAYS * 86400
+
+    jobs_root = Path("/jobs")
+    volume.reload()
+
+    removed: list[str] = []
+    kept: list[str] = []
+    errors: list[dict] = []
+
+    for entry in sorted(jobs_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        # Consider both real job dirs (j_YYYY-MM-DD_xxxxxxxx) and the
+        # idempotency bookkeeping dir. We key on status.json if present,
+        # otherwise on the dir's own mtime.
+        status_file = entry / "status.json"
+        try:
+            mtime = (
+                status_file.stat().st_mtime
+                if status_file.is_file()
+                else entry.stat().st_mtime
+            )
+        except OSError as e:
+            errors.append({"path": str(entry), "error": str(e)})
+            continue
+
+        if mtime >= cutoff:
+            kept.append(entry.name)
+            continue
+
+        try:
+            shutil.rmtree(entry)
+            removed.append(entry.name)
+        except OSError as e:
+            errors.append({"path": str(entry), "error": str(e)})
+
+    if removed or errors:
+        volume.commit()
+
+    summary = {
+        "retention_days": RETENTION_DAYS,
+        "removed_count": len(removed),
+        "kept_count": len(kept),
+        "errors_count": len(errors),
+        "removed": removed[:100],     # cap log size
+        "errors": errors[:20],
+    }
+    print(f"[retention_sweeper] {summary}")
+    return summary
