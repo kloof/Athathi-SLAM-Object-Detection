@@ -23,6 +23,42 @@ _WIN_RX = re.compile(r"window_\d+=Window\(wall_\d+,([-0-9.,]+)\)")
 _BBOX_RX = re.compile(r"bbox_\d+=Bbox\(([A-Za-z_\-]+),([-0-9.,]+)\)")
 
 
+# Class alias groups for consensus clustering.
+#
+# SpatialLM flips between near-synonym class names for the same physical
+# object across seeds — e.g. 8 dining chairs labeled "chair" by seed 0 and
+# "dining_chair" by seed 1 fail to consensus because our clustering requires
+# exact class match. Each entry lists members from MOST SPECIFIC to LEAST
+# SPECIFIC; when a cluster receives votes from multiple members, it keeps
+# the most-specific name. Groups are deliberately conservative — only labels
+# SpatialLM actually confuses for the same visual object are grouped.
+_ALIAS_GROUPS: dict[str, list[str]] = {
+    # seating with a back
+    "chairs":       ["dining_chair", "bar_chair", "chair"],
+    # small tables next to a sofa/bed
+    "side_tables":  ["nightstand", "side_table"],
+    # All cabinet/storage types in one group — SpatialLM flips between
+    # cupboard/sideboard/cabinet for the same physical object. Spatial
+    # clustering (0.3 m radius) keeps genuinely different cabinets apart.
+    "cabinets":     ["tv_cabinet", "wardrobe", "bookcase",
+                     "shoe_cabinet", "entrance_cabinet",
+                     "decorative_cabinet", "bathroom_cabinet",
+                     "washing_cabinet", "wall_cabinet", "wine_cabinet",
+                     "sideboard", "cupboard", "cabinet"],
+}
+
+
+def _alias_info(cls_name: str) -> tuple[str, int]:
+    """Return (group_key, specificity_rank). Smaller rank = more specific.
+
+    Classes not in any alias group are their own singleton group.
+    """
+    for key, members in _ALIAS_GROUPS.items():
+        if cls_name in members:
+            return key, members.index(cls_name)
+    return cls_name, 0
+
+
 def parse_layout(layout_txt: Path | str) -> dict:
     """Return a dict with `walls`, `doors`, `windows`, `bboxes` lists of tuples."""
     text = Path(layout_txt).read_text().strip().splitlines()
@@ -209,14 +245,14 @@ def consensus_bboxes(
     for layout_idx, bboxes in enumerate(per_layout):
         for cls, v in bboxes:
             cx, cy, cz = v[0], v[1], v[2]
+            group, rank = _alias_info(cls)
             picked = None
             best_d2 = float("inf")
             for c in clusters:
-                if c["cls"] != cls:
+                if c["group"] != group:
                     continue
                 if layout_idx in c["layouts"]:
                     continue
-                # distance to cluster centroid
                 mc = np.mean(c["centers"], axis=0)
                 d2 = (cx - mc[0])**2 + (cy - mc[1])**2 + (cz - mc[2])**2
                 if d2 < radius_m * radius_m and d2 < best_d2:
@@ -224,7 +260,9 @@ def consensus_bboxes(
                     best_d2 = d2
             if picked is None:
                 clusters.append({
+                    "group": group,
                     "cls": cls,
+                    "rank": rank,
                     "centers": [[cx, cy, cz]],
                     "scales": [v[3:]],   # [yaw, sx, sy, sz]
                     "layouts": {layout_idx},
@@ -233,6 +271,11 @@ def consensus_bboxes(
                 picked["centers"].append([cx, cy, cz])
                 picked["scales"].append(v[3:])
                 picked["layouts"].add(layout_idx)
+                # Keep the MOST SPECIFIC name that any seed emitted for
+                # this cluster (lower rank wins).
+                if rank < picked["rank"]:
+                    picked["cls"] = cls
+                    picked["rank"] = rank
 
     survivors: list[tuple[str, list[float]]] = []
     for c in clusters:
