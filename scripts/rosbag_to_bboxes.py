@@ -169,14 +169,24 @@ def main(argv=None):
     )
 
     # 5. infer
+    # When Llama is running, Qwen only produces structure (walls/doors/windows)
+    # — we throw away Qwen's objects anyway. This collapses Qwen output from
+    # ~130 lines to ~10 lines and cuts its autoregressive decode time
+    # (O(N_out^2) in KV-cache growth) by an order of magnitude. If the user
+    # passes --skip-llama, Qwen is the only detector so it has to do "all".
     use_beam = args.beam_size > 1
+    qwen_detect = "all" if args.skip_llama else "arch"
+    llama_detect = "object"  # Llama only needs to supply bboxes
     if use_beam:
-        _stage(f"[5/7] SpatialLM inference (Qwen; BEAM n={args.beam_size})")
+        _stage(f"[5/7] SpatialLM inference (Qwen; BEAM n={args.beam_size}; "
+               f"det={qwen_detect})")
     else:
-        _stage(f"[5/7] SpatialLM inference (Qwen; temp={args.temperature} topk={args.top_k})")
+        _stage(f"[5/7] SpatialLM inference (Qwen; temp={args.temperature} "
+               f"topk={args.top_k}; det={qwen_detect})")
     layout_qwen = run_spatiallm(
         sl_input_ply, output / "layout_qwen.txt",
-        model=MODEL_QWEN, temperature=args.temperature, top_k=args.top_k,
+        model=MODEL_QWEN, detect_type=qwen_detect,
+        temperature=args.temperature, top_k=args.top_k,
         repetition_penalty=args.llama_rep_penalty,
         num_beams=args.beam_size,
     )
@@ -186,23 +196,26 @@ def main(argv=None):
         llama_layouts = [layout_qwen]
     elif use_beam or args.llama_passes <= 1:
         mode = f"BEAM n={args.beam_size}" if use_beam else "same sampling"
-        _stage(f"[5/7] SpatialLM inference (Llama; {mode})")
+        _stage(f"[5/7] SpatialLM inference (Llama; {mode}; det={llama_detect})")
         llama_layouts = [run_spatiallm(
             sl_input_ply, output / "layout_llama.txt",
-            model=MODEL_LLAMA, temperature=args.temperature, top_k=args.top_k,
+            model=MODEL_LLAMA, detect_type=llama_detect,
+            temperature=args.temperature, top_k=args.top_k,
             repetition_penalty=args.llama_rep_penalty,
             seed=args.llama_seed_base,
             num_beams=args.beam_size,
         )]
     else:
         _stage(f"[5/7] SpatialLM inference (Llama x{args.llama_passes} "
-               f"passes, shared load; rep_pen={args.llama_rep_penalty})")
+               f"passes, shared load; rep_pen={args.llama_rep_penalty}; "
+               f"det={llama_detect})")
         seeds = list(range(args.llama_seed_base,
                            args.llama_seed_base + args.llama_passes))
         llama_layouts = run_spatiallm_multi_seed(
             sl_input_ply, output, seeds,
             output_stem="layout_llama",
-            model=MODEL_LLAMA, temperature=args.temperature, top_k=args.top_k,
+            model=MODEL_LLAMA, detect_type=llama_detect,
+            temperature=args.temperature, top_k=args.top_k,
             repetition_penalty=args.llama_rep_penalty,
         )
 
