@@ -158,17 +158,16 @@ def run(*, volume: Any, job_id: str) -> None:
     # --parallel-infer: run Qwen + Llama concurrently on the same H100.
     #   Safe on 80 GB VRAM; would OOM on the local 4070 Ti which is why
     #   it's off by default in rosbag_to_bboxes.py.
-    # --beam-size 8: wider beam search. 4 was the local tuned default
-    #   (chosen to balance 4070 Ti runtime vs quality); H100 has the
-    #   headroom for 8 which gives cleaner detections, especially on
-    #   clustered objects (dining chairs around a table).
+    # beam-size is left at the script's default (4) — empirically tuned
+    # and user-chosen. An earlier experiment with 8 slightly changed
+    # detection counts (more curtains/plants, fewer over-split sofas)
+    # but the user prefers the 4 defaults.
     cmd = [
         sys.executable,
         "/root/cloud_slam_icp/scripts/rosbag_to_bboxes.py",
         str(input_mcap),
         str(artifacts_dir),
         "--parallel-infer",
-        "--beam-size", "8",
     ]
 
     try:
