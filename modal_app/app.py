@@ -147,6 +147,19 @@ image = (
     # runtime will look for them. Modal's .env() applies to subsequent
     # build steps in the same chain.
     .env({"HF_HOME": "/root/.cache/hf"})
+    # The verification probe is written as its own Python file and baked
+    # into the image as a local file, then run by absolute path. Earlier
+    # attempt used a `cat <<'PY' … PY` heredoc inside `run_commands` — but
+    # Modal passes each `run_commands` arg as a single Dockerfile RUN line,
+    # and the embedded newlines made the Dockerfile parser choke:
+    #   could not parse Dockerfile:  --> 6:19
+    #     from transformers import AutoTokenizer, AutoConfig
+    # File-based probe avoids the whole quoting/newline surface.
+    .add_local_file(
+        "modal_app/verify_cache_probe.py",
+        remote_path="/opt/verify_cache_probe.py",
+        copy=True,
+    )
     .run_commands(
         "mkdir -p /root/.cache/hf",
         "huggingface-cli download manycore-research/SpatialLM1.1-Qwen-0.5B",
@@ -155,19 +168,8 @@ image = (
         # model-cache verification (see spec §Model-cache verification).
         # Runs offline (HF_HUB_OFFLINE=1, local_files_only=True); if either
         # checkpoint's tokenizer/config is not loadable from the on-disk
-        # cache, the shell exits non-zero and Modal aborts the image build.
-        # Written to a file first so we don't have to battle shell-quote
-        # rules for a multi-line python -c "..." arg.
-        (
-            "cat > /tmp/verify_cache.py <<'PY'\n"
-            "from transformers import AutoTokenizer, AutoConfig\n"
-            "for m in ['manycore-research/SpatialLM1.1-Qwen-0.5B','manycore-research/SpatialLM1.1-Llama-1B']:\n"
-            "    AutoTokenizer.from_pretrained(m, local_files_only=True)\n"
-            "    AutoConfig.from_pretrained(m, local_files_only=True)\n"
-            "print('cache verified')\n"
-            "PY"
-        ),
-        "HF_HUB_OFFLINE=1 python /tmp/verify_cache.py",
+        # cache, the script exits non-zero and Modal aborts the image build.
+        "HF_HUB_OFFLINE=1 python /opt/verify_cache_probe.py",
     )
     # Capture the resolved python path at a stable absolute location so
     # cloud_slam/spatiallm_pipeline/infer.py can launch SpatialLM via
