@@ -82,16 +82,18 @@ def main(argv=None):
                          help="If <output>/slam/colored_map.ply already exists, reuse it")
     parser.add_argument("--skip-llama", action="store_true",
                          help="Use only Qwen (faster, slightly worse object recall)")
-    parser.add_argument("--llama-passes", type=int, default=1,
+    parser.add_argument("--llama-passes", type=int, default=3,
                          help="N sequential Llama passes (sharing one model "
                               "load). When N>1, bboxes are taken as the "
-                              "consensus across passes. Default 1.")
+                              "consensus across passes. Default 3 — "
+                              "empirically the recall/precision sweet spot.")
     parser.add_argument("--llama-min-votes", type=int, default=2,
                          help="Min consensus votes to keep a bbox when "
-                              "--llama-passes>1. Default 2.")
-    parser.add_argument("--llama-rep-penalty", type=float, default=1.15,
-                         help="Llama repetition_penalty (default 1.15, "
-                              "suppresses window-duplication loop). 1.0 disables.")
+                              "--llama-passes>1. Default 2 (67%% of 3).")
+    parser.add_argument("--llama-rep-penalty", type=float, default=1.20,
+                         help="Llama repetition_penalty (default 1.20, "
+                              "kills the window-duplication loop bulletproof; "
+                              "1.15 was leaky, 1.0 disables).")
     parser.add_argument("--llama-seed-base", type=int, default=0,
                          help="First seed for Llama passes. Seeds used: "
                               "[base, base+1, ..., base+passes-1]. Default 0.")
