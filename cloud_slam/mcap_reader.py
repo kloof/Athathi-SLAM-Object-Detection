@@ -92,15 +92,31 @@ def _mcap_files(mcap_path):
     return files
 
 
-def list_camera_frame_times_ns(mcap_path, topic="/camera/image_raw/compressed"):
-    """Iterate the mcap(s) and return per-camera-message ``log_time`` in ns.
+def _header_stamp_ns(ros_msg) -> int:
+    """Extract header.stamp as nanoseconds since epoch.
 
-    Does not decode image data — only scans message metadata. Used by
-    stage 0 to emit ``slam/frames_index.json`` so stage 8 can reopen the
-    rosbag and fetch winning frames by timestamp.
+    Matches the timestamp convention used by ``read_mcap`` (which stores
+    ``stamp = sec + nanosec * 1e-9`` for clouds and cameras) and by
+    ``trajectory.csv`` (written from cloud header stamps). This is the
+    authoritative capture-time clock; ``msg.log_time`` (when the message
+    was written to the rosbag) is a different, later clock we do not use.
+    """
+    s = ros_msg.header.stamp
+    return int(s.sec) * 1_000_000_000 + int(s.nanosec)
+
+
+def list_camera_frame_times_ns(mcap_path, topic="/camera/image_raw/compressed"):
+    """Iterate the mcap(s) and return per-camera-message header-stamp ns.
+
+    Used by stage 0 to emit ``slam/frames_index.json`` so stage 8 can
+    reopen the rosbag and fetch winning frames by timestamp. Uses the
+    ROS header stamp (capture time), matching the convention in
+    ``read_mcap`` and ``trajectory.csv`` so the emitted timestamps
+    interpolate correctly against SLAM poses.
 
     Returns:
-        list[int]: sorted ascending log-time ns values; duplicates preserved.
+        list[int]: sorted ascending header-stamp ns values; duplicates
+        preserved.
     """
     from mcap_ros2.reader import read_ros2_messages
 
@@ -108,7 +124,7 @@ def list_camera_frame_times_ns(mcap_path, topic="/camera/image_raw/compressed"):
     for mcap_file in _mcap_files(mcap_path):
         for msg in read_ros2_messages(str(mcap_file), topics=[topic]):
             if msg.channel.topic == topic:
-                times.append(int(msg.log_time))
+                times.append(_header_stamp_ns(msg.ros_msg))
     times.sort()
     return times
 
@@ -117,26 +133,29 @@ def read_frames_by_time_ns(mcap_path,
                            topic,
                            t_ns_list,
                            *,
-                           window_ns=1):
-    """Fetch compressed-image messages by ``log_time`` nanoseconds.
+                           window_ns=250_000_000):
+    """Fetch compressed-image messages by header-stamp nanoseconds.
 
-    Decodes no image data — just returns the compressed bytes + format
-    string per matched message so callers can cv2.imdecode only what they
-    need. Requests are de-duplicated internally; missing frames are
-    skipped with a warning.
+    Returns compressed bytes + format string per matched message so
+    callers can ``cv2.imdecode`` only what they need. Requests are
+    de-duplicated internally; missing frames are skipped with a warning.
+
+    The request `t_ns` values are ROS header-stamp nanoseconds (matching
+    ``list_camera_frame_times_ns``). The mcap library seeks by log_time
+    internally, which is ≥ header_stamp by the rosbag recording latency.
+    We use a wide time window around each request, then pick the message
+    whose *header stamp* is nearest to the target. The default 250 ms
+    window comfortably covers typical rosbag latency.
 
     Args:
         mcap_path:   Path to .mcap file or directory.
         topic:       Camera topic, e.g. ``/camera/image_raw/compressed``.
-        t_ns_list:   Iterable of log-time ns values to fetch.
-        window_ns:   Widening half-window (ns) around each target time.
-                     Default 1 (the ns is the exact log_time emitted by
-                     ``list_camera_frame_times_ns`` so a window of 1 is
-                     enough; supports slop if a caller rounds).
+        t_ns_list:   Iterable of header-stamp ns values to fetch.
+        window_ns:   Half-window (ns) to scan around each target.
 
     Returns:
-        list[tuple[int, bytes, str]]: ``(t_ns, compressed_bytes, format)``
-        per successfully matched request, in input order.
+        list[tuple[int, bytes, str]]: ``(header_ns, compressed_bytes,
+        format)`` per successfully matched request, in input order.
     """
     from mcap_ros2.reader import read_ros2_messages
 
@@ -161,10 +180,11 @@ def read_frames_by_time_ns(mcap_path,
             ):
                 if msg.channel.topic != topic:
                     continue
-                dt = abs(int(msg.log_time) - t_ns)
+                ros_msg = msg.ros_msg
+                msg_t_ns = _header_stamp_ns(ros_msg)
+                dt = abs(msg_t_ns - t_ns)
                 if best is None or dt < best_dt:
-                    ros_msg = msg.ros_msg
-                    best = (int(msg.log_time), bytes(ros_msg.data), ros_msg.format)
+                    best = (msg_t_ns, bytes(ros_msg.data), ros_msg.format)
                     best_dt = dt
         if best is None:
             print(f"[read_frames_by_time_ns] warning: no message near "
