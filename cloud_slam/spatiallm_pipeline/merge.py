@@ -9,6 +9,7 @@ Also provides a same-class proximity deduplicator for bboxes.
 """
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Sequence
@@ -67,11 +68,123 @@ def dedup_bboxes(bboxes: Sequence[tuple[str, list[float]]],
     return kept
 
 
+def _bbox_footprint(cx, cy, yaw, sx, sy):
+    """Return shapely Polygon for the 2D footprint of a rotated bbox."""
+    from shapely.geometry import Polygon
+    hx, hy = 0.5 * sx, 0.5 * sy
+    local = np.array([[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]])
+    c, s = math.cos(yaw), math.sin(yaw)
+    R = np.array([[c, -s], [s, c]])
+    world = local @ R.T + np.array([cx, cy])
+    return Polygon(world)
+
+
+def merge_overlapping_bboxes(
+    bboxes: Sequence[tuple[str, list[float]]],
+    *,
+    iou_thresh: float = 0.15,
+    yaw_tol_deg: float = 15.0,
+    size_ratio_tol: float = 2.5,
+    verbose: bool = True,
+) -> list[tuple[str, list[float]]]:
+    """Collapse same-class bboxes whose 2D footprints overlap significantly.
+
+    Two bboxes merge when ALL hold:
+      - same class
+      - 2D rotated-rect IoU  >= iou_thresh
+      - |yaw diff| mod pi    <= yaw_tol_deg  (handles 180° symmetry)
+      - per-axis size ratio  <= size_ratio_tol (prevents merging a small
+        nightstand that happens to overlap a big sofa)
+
+    Merged bbox takes median center and median extents; yaw is the circular
+    mean of the contributors (restricted to [-pi/2, pi/2) to stay symmetric).
+    """
+    n = len(bboxes)
+    if n < 2:
+        return list(bboxes)
+
+    # precompute footprints + extract scale arrays
+    polys = []
+    for cls, v in bboxes:
+        cx, cy, _cz, yaw, sx, sy, _sz = v
+        polys.append(_bbox_footprint(cx, cy, yaw, sx, sy))
+
+    # union-find over pairs meeting the merge predicate
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    yaw_tol = math.radians(yaw_tol_deg)
+
+    for i in range(n):
+        cls_i, v_i = bboxes[i]
+        yaw_i = v_i[3]; sx_i, sy_i = v_i[4], v_i[5]
+        for j in range(i + 1, n):
+            cls_j, v_j = bboxes[j]
+            if cls_i != cls_j:
+                continue
+            yaw_j = v_j[3]; sx_j, sy_j = v_j[4], v_j[5]
+            dyaw = abs(yaw_i - yaw_j) % math.pi
+            dyaw = min(dyaw, math.pi - dyaw)
+            if dyaw > yaw_tol:
+                continue
+            # size sanity — if one is >N× the other along any axis, not the same object
+            if max(sx_i, sx_j) > size_ratio_tol * max(1e-6, min(sx_i, sx_j)):
+                continue
+            if max(sy_i, sy_j) > size_ratio_tol * max(1e-6, min(sy_i, sy_j)):
+                continue
+            if not polys[i].intersects(polys[j]):
+                continue
+            inter = polys[i].intersection(polys[j]).area
+            if inter <= 0:
+                continue
+            union_area = polys[i].union(polys[j]).area
+            iou = inter / union_area if union_area > 0 else 0.0
+            if iou >= iou_thresh:
+                union(i, j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    merged: list[tuple[str, list[float]]] = []
+    for members in groups.values():
+        if len(members) == 1:
+            merged.append(bboxes[members[0]])
+            continue
+        cls = bboxes[members[0]][0]
+        arr = np.array([bboxes[i][1] for i in members])  # (k, 7)
+        center = np.median(arr[:, :3], axis=0)
+        # circular mean of yaws folded into [-pi/2, pi/2) (180°-symmetric rects)
+        yaws = ((arr[:, 3] + math.pi / 2) % math.pi) - math.pi / 2
+        mean_yaw = float(math.atan2(np.mean(np.sin(2 * yaws)),
+                                     np.mean(np.cos(2 * yaws))) / 2.0)
+        scale = np.median(arr[:, 4:], axis=0)
+        merged.append((cls, [float(center[0]), float(center[1]), float(center[2]),
+                              mean_yaw,
+                              float(scale[0]), float(scale[1]), float(scale[2])]))
+
+    if verbose and len(merged) < n:
+        print(f"[merge-overlap] {n} -> {len(merged)} "
+              f"(iou>={iou_thresh}, yaw_tol={yaw_tol_deg}°, "
+              f"size_ratio<={size_ratio_tol})")
+    return merged
+
+
 def consensus_bboxes(
     layouts: Sequence[Path | str],
     *,
     radius_m: float = 0.30,
     min_votes: int = 2,
+    overlap_iou_thresh: float = 0.15,
+    overlap_yaw_tol_deg: float = 15.0,
     verbose: bool = True,
 ) -> list[tuple[str, list[float]]]:
     """Merge bboxes across N layout files, keep those seen in >=min_votes.
@@ -137,6 +250,16 @@ def consensus_bboxes(
         print(f"[consensus] {len(layouts)} passes, {total_raw} raw bboxes -> "
               f"{len(clusters)} clusters -> {len(survivors)} kept "
               f"(>={min_votes} votes, r={radius_m}m)")
+
+    # Post-consensus overlap merge: catches the "long sofa split into two
+    # overlapping halves" case that center-distance clustering misses.
+    if overlap_iou_thresh > 0 and len(survivors) > 1:
+        survivors = merge_overlapping_bboxes(
+            survivors,
+            iou_thresh=overlap_iou_thresh,
+            yaw_tol_deg=overlap_yaw_tol_deg,
+            verbose=verbose,
+        )
     return survivors
 
 
