@@ -310,11 +310,12 @@ def pipeline_runner(job_id: str) -> None:
 #   returns None and the endpoint code treats every request as "no
 #   auth configured yet" — accepts any non-empty X-API-Key header.
 #   See modal_app/web.py module docstring for the full rule.
+# NOTE: Modal rejects `retries=0` on web endpoints ("Web endpoints do not
+# support retries"). Retry behaviour for an ASGI app is the client's job.
 @app.function(
     image=image,
     volumes={"/jobs": volume},
     secrets=[api_key_secret],
-    retries=0,
     timeout=900,
     max_containers=4,
 )
