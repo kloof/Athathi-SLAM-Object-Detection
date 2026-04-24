@@ -51,26 +51,41 @@ def interpolate_gray_colors(
         print(f"[interp] colored: {n-n_gray:,}  gray: {n_gray:,} "
               f"({100*n_gray/n:.1f}%)")
 
-    colored = o3d.geometry.PointCloud()
-    colored.points = o3d.utility.Vector3dVector(pts[~is_gray])
-    colored.colors = o3d.utility.Vector3dVector(cols[~is_gray])
-    tree = o3d.geometry.KDTreeFlann(colored)
-    colored_cols = np.asarray(colored.colors)
+    colored_pts = pts[~is_gray]
+    colored_cols = cols[~is_gray]
 
     new_cols = cols.copy()
     gray_idx = np.flatnonzero(is_gray)
     n_filled = 0
     t0 = time.time()
-    for gi in gray_idx:
-        p = pts[gi]
-        k_found, idxs, dists2 = tree.search_hybrid_vector_3d(p, radius_m, k)
-        if k_found < 2:
-            continue
-        nb = colored_cols[idxs[:k_found]]
-        w = 1.0 / (np.sqrt(dists2[:k_found]) + 1e-3)
-        w /= w.sum()
-        new_cols[gi] = (w[:, None] * nb).sum(axis=0)
-        n_filled += 1
+    if len(gray_idx) > 0 and len(colored_pts) > 0:
+        # Batched KNN: scipy cKDTree runs the whole query (N_gray x k) in a
+        # single C call instead of a Python loop over per-point searches.
+        # Unreached neighbors are returned as (inf, n_colored) — mask those
+        # out before IDW-averaging.
+        from scipy.spatial import cKDTree
+        tree = cKDTree(colored_pts)
+        gray_pts = pts[gray_idx]
+        dists, idxs = tree.query(
+            gray_pts, k=k, distance_upper_bound=radius_m, workers=-1)
+        if k == 1:  # scipy collapses trailing dim when k=1; keep 2D contract
+            dists = dists[:, None]
+            idxs = idxs[:, None]
+        valid = np.isfinite(dists)
+        n_found = valid.sum(axis=1)
+        fillable = n_found >= 2
+        if fillable.any():
+            # Replace OOR indices with 0 (harmless; weight will be zero too).
+            safe_idxs = np.where(valid, idxs, 0)
+            neighbor_cols = colored_cols[safe_idxs]           # (N_gray, k, 3)
+            w = np.where(valid, 1.0 / (dists + 1e-3), 0.0)   # (N_gray, k)
+            w_sum = w.sum(axis=1, keepdims=True)
+            w_sum[w_sum == 0] = 1.0
+            w = w / w_sum                                     # (N_gray, k)
+            filled = (w[..., None] * neighbor_cols).sum(axis=1)  # (N_gray, 3)
+            fi = gray_idx[fillable]
+            new_cols[fi] = filled[fillable]
+            n_filled = int(fillable.sum())
     if verbose:
         print(f"[interp] K={k} r={radius_m}m  filled {n_filled:,}/{n_gray:,} "
               f"({100*n_filled/max(1,n_gray):.1f}%)  "
