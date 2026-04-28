@@ -139,15 +139,26 @@ async def _safe_reload(volume: Any) -> None:
     Modal (Modal warns when a blocking reload() is called from an async
     FastAPI handler). Tests pass a simple object with a sync ``reload``
     method; the fallback handles that case.
+
+    Modal raises ``RuntimeError: there are open files preventing the
+    operation`` when any container on the same Volume is holding a file
+    open (e.g. a runner streaming ``input.mcap.zst``). That makes the
+    reload itself failable through no fault of the caller — and we'd
+    rather serve slightly stale status than 500 every status/DELETE
+    while a job is running. Swallow it; the next reload will succeed
+    once the runner closes the file.
     """
     reload = getattr(volume, "reload", None)
     if reload is None:
         return
     aio = getattr(reload, "aio", None)
-    if callable(aio):
-        await aio()
-    elif callable(reload):
-        reload()
+    try:
+        if callable(aio):
+            await aio()
+        elif callable(reload):
+            reload()
+    except RuntimeError as e:
+        print(f"[_safe_reload] swallowed: {e}")
 
 
 async def _safe_commit(volume: Any) -> None:
@@ -156,10 +167,13 @@ async def _safe_commit(volume: Any) -> None:
     if commit is None:
         return
     aio = getattr(commit, "aio", None)
-    if callable(aio):
-        await aio()
-    elif callable(commit):
-        commit()
+    try:
+        if callable(aio):
+            await aio()
+        elif callable(commit):
+            commit()
+    except RuntimeError as e:
+        print(f"[_safe_commit] swallowed: {e}")
 
 
 def _read_json(path: Path) -> dict:
