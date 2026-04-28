@@ -84,6 +84,19 @@ curl -X POST \
      "https://<workspace>--cloud-slam-icp-web.modal.run/jobs?filename=scan.mcap.zst"
 ```
 
+### Slow-network clients (Pi, residential uplink)
+
+`curl` can mishandle Modal's "delayed response" 303/307 redirect that
+fires when a slow upload exceeds Modal's synchronous-response timeout —
+it re-POSTs the body to the result URL and gets `400 modal-http: bad
+redirect method`. Use the bundled stdlib uploader instead, which GETs
+the redirect target as Modal expects:
+
+```bash
+python3 scripts/upload_scan.py scan.mcap.zst --poll
+# Reads ~/.cloud_slam_icp_api_key by default; --api / --key override.
+```
+
 ### ROS2 rosbag2 directory
 
 If your recorder emits a `metadata.yaml + *.mcap` directory (e.g.
